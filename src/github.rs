@@ -24,6 +24,8 @@ pub struct RepoWithReadme {
     pub topics: Vec<String>,
     pub fork: bool,
     pub readme: Option<String>,
+    pub pushed_at: Option<String>,
+    pub created_at: Option<String>,
 }
 
 /// README content response
@@ -192,6 +194,8 @@ struct GraphQLRepo {
     primary_language: Option<PrimaryLanguage>,
     repository_topics: RepositoryTopics,
     is_fork: bool,
+    pushed_at: Option<String>,
+    created_at: Option<String>,
     readme: Option<BlobContent>,
     readme_lower: Option<BlobContent>,
     readme_rst: Option<BlobContent>,
@@ -242,6 +246,8 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
           nodes { topic { name } }
         }
         isFork
+        pushedAt
+        createdAt
         readme: object(expression: "HEAD:README.md") {
           ... on Blob { text }
         }
@@ -365,6 +371,8 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                             .collect(),
                         fork: repo.is_fork,
                         readme,
+                        pushed_at: repo.pushed_at,
+                        created_at: repo.created_at,
                     })
                 })
                 .collect();

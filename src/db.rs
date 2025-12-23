@@ -16,6 +16,8 @@ pub struct Repo {
     pub url: String,
     pub stars: u64,
     pub language: Option<String>,
+    pub pushed_at: Option<String>,
+    pub created_at: Option<String>,
 }
 
 pub struct Database {
@@ -62,6 +64,8 @@ impl Database {
                 topics TEXT,
                 readme_excerpt TEXT,
                 embedded_text TEXT,
+                pushed_at TEXT,
+                created_at TEXT,
                 last_indexed TEXT NOT NULL
             );
 
@@ -138,8 +142,8 @@ impl Database {
         let topics_json = serde_json::to_string(&repo.topics)?;
 
         self.conn.execute(
-            "INSERT INTO repos (full_name, description, url, stars, language, topics, readme_excerpt, embedded_text, last_indexed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO repos (full_name, description, url, stars, language, topics, readme_excerpt, embedded_text, pushed_at, created_at, last_indexed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(full_name) DO UPDATE SET
                  description = ?2,
                  url = ?3,
@@ -148,7 +152,9 @@ impl Database {
                  topics = ?6,
                  readme_excerpt = ?7,
                  embedded_text = ?8,
-                 last_indexed = ?9",
+                 pushed_at = ?9,
+                 created_at = ?10,
+                 last_indexed = ?11",
             params![
                 repo.full_name,
                 repo.description,
@@ -158,6 +164,8 @@ impl Database {
                 topics_json,
                 readme_excerpt,
                 embedded_text,
+                repo.pushed_at,
+                repo.created_at,
                 now,
             ],
         )?;
@@ -206,7 +214,7 @@ impl Database {
     /// Get repo by ID
     pub fn get_repo_by_id(&self, id: i64) -> Result<Option<Repo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT full_name, description, url, stars, language FROM repos WHERE id = ?",
+            "SELECT full_name, description, url, stars, language, pushed_at, created_at FROM repos WHERE id = ?",
         )?;
 
         let result = stmt
@@ -217,6 +225,8 @@ impl Database {
                     url: row.get(2)?,
                     stars: row.get::<_, i64>(3)? as u64,
                     language: row.get(4)?,
+                    pushed_at: row.get(5)?,
+                    created_at: row.get(6)?,
                 })
             })
             .optional()?;
@@ -351,7 +361,7 @@ impl Database {
     pub fn find_by_name(&self, pattern: &str, limit: usize) -> Result<Vec<Repo>> {
         let pattern = format!("%{}%", pattern);
         let mut stmt = self.conn.prepare(
-            "SELECT full_name, description, url, stars, language
+            "SELECT full_name, description, url, stars, language, pushed_at, created_at
              FROM repos
              WHERE full_name LIKE ?1 COLLATE NOCASE
              ORDER BY stars DESC
@@ -365,7 +375,119 @@ impl Database {
                 url: row.get(2)?,
                 stars: row.get::<_, i64>(3)? as u64,
                 language: row.get(4)?,
+                pushed_at: row.get(5)?,
+                created_at: row.get(6)?,
             })
+        })?;
+
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Keyword search for hybrid search (searches embedded_text only, not name)
+    pub fn find_by_keywords(&self, query: &str, limit: usize) -> Result<Vec<i64>> {
+        // Split query into words and search for any match in embedded_text
+        let words: Vec<&str> = query.split_whitespace().collect();
+        if words.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Build OR conditions for each word (embedded_text only)
+        let conditions: Vec<String> = words
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("embedded_text LIKE ?{} COLLATE NOCASE", i + 1))
+            .collect();
+
+        let sql = format!(
+            "SELECT id FROM repos WHERE {} ORDER BY stars DESC LIMIT ?",
+            conditions.join(" OR ")
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+
+        let patterns: Vec<String> = words.iter().map(|w| format!("%{}%", w)).collect();
+
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> = patterns
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let limit_i64 = limit as i64;
+        params_vec.push(&limit_i64);
+
+        let results = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+            row.get::<_, i64>(0)
+        })?;
+
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Find repos by name match (strongest signal for hybrid search)
+    /// Prioritizes: exact repo name > word boundary matches > substring matches
+    pub fn find_by_name_match(&self, query: &str, limit: usize) -> Result<Vec<i64>> {
+        let words: Vec<&str> = query.split_whitespace().collect();
+        if words.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let n = words.len();
+
+        // Param layout (1-indexed for SQL):
+        // [1..n]: exact patterns (%/word)
+        // [n+1..2n]: starts-with patterns (%/word%)
+        // [2n+1..3n]: anywhere patterns (%word%) - used for WHERE
+        // [3n+1]: limit
+
+        // Build conditions using the "anywhere" patterns (third set)
+        let conditions: Vec<String> = (0..n)
+            .map(|i| format!("full_name LIKE ?{} COLLATE NOCASE", 2 * n + i + 1))
+            .collect();
+
+        // Scoring: heavily favor when repo name (after /) matches the query word
+        let score_parts: Vec<String> = (0..n)
+            .flat_map(|i| {
+                let exact_idx = i + 1;
+                let start_idx = n + i + 1;
+                let any_idx = 2 * n + i + 1;
+                vec![
+                    // Exact repo name match: /raft -> huge boost
+                    format!("(CASE WHEN full_name LIKE ?{} COLLATE NOCASE THEN 100 ELSE 0 END)", exact_idx),
+                    // Repo name starts with word: /raft- -> big boost
+                    format!("(CASE WHEN full_name LIKE ?{} COLLATE NOCASE THEN 50 ELSE 0 END)", start_idx),
+                    // Word anywhere in path: small boost
+                    format!("(CASE WHEN full_name LIKE ?{} COLLATE NOCASE THEN 1 ELSE 0 END)", any_idx),
+                ]
+            })
+            .collect();
+
+        let sql = format!(
+            "SELECT id, ({}) as match_score FROM repos WHERE {} ORDER BY match_score DESC, stars DESC LIMIT ?",
+            score_parts.join(" + "),
+            conditions.join(" OR ")
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+
+        // Build patterns in order: exact, starts-with, anywhere
+        let mut patterns: Vec<String> = Vec::new();
+        for w in &words {
+            patterns.push(format!("%/{}", w)); // exact
+        }
+        for w in &words {
+            patterns.push(format!("%/{}%", w)); // starts-with
+        }
+        for w in &words {
+            patterns.push(format!("%{}%", w)); // anywhere
+        }
+
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> = patterns
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let limit_i64 = limit as i64;
+        params_vec.push(&limit_i64);
+
+        let results = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+            row.get::<_, i64>(0)
         })?;
 
         results.collect::<Result<Vec<_>, _>>().map_err(Into::into)

@@ -6,6 +6,7 @@ mod github;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::stream::{self, StreamExt};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -130,7 +131,7 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Semantic search in local index
+/// Hybrid search (semantic + keyword + name match with RRF fusion)
 fn search(query: &str, limit: usize, db: &Database) -> Result<()> {
     let (_total, indexed) = db.stats()?;
 
@@ -140,51 +141,68 @@ fn search(query: &str, limit: usize, db: &Database) -> Result<()> {
         std::process::exit(1);
     }
 
-    let dots = Dots::start(&format!("Searching {} repos", indexed));
+    let dots = Dots::start(&format!("Searching {} repos (hybrid)", indexed));
 
-    // Embed query
+    // 1. Semantic search via embeddings
     let query_embedding = embed_text(query)?;
+    let vector_results = db.find_similar(&query_embedding, limit * 3)?;
 
-    // Find similar
-    let results = db.find_similar(&query_embedding, limit * 2)?;
+    // 2. Name match search (strongest signal - repos with query in name)
+    let name_results = db.find_by_name_match(query, limit * 3)?;
+
+    // 3. Content keyword search via LIKE on embedded_text
+    let keyword_results = db.find_by_keywords(query, limit * 3)?;
 
     dots.stop();
 
-    if results.is_empty() {
+    // RRF (Reciprocal Rank Fusion) with weighted signals
+    // Lower k = higher weight for top ranks
+    let k_name = 20.0;    // Strong boost for name matches
+    let k_vector = 60.0;  // Standard weight for semantic
+    let k_keyword = 80.0; // Lower weight for keyword (often noisy)
+
+    let mut scores: HashMap<i64, f32> = HashMap::new();
+
+    // Add name match scores (strongest signal)
+    for (rank, repo_id) in name_results.iter().enumerate() {
+        *scores.entry(*repo_id).or_default() += 1.0 / (k_name + rank as f32 + 1.0);
+    }
+
+    // Add vector search scores
+    for (rank, (repo_id, _distance)) in vector_results.iter().enumerate() {
+        *scores.entry(*repo_id).or_default() += 1.0 / (k_vector + rank as f32 + 1.0);
+    }
+
+    // Add keyword search scores (weakest signal)
+    for (rank, repo_id) in keyword_results.iter().enumerate() {
+        *scores.entry(*repo_id).or_default() += 1.0 / (k_keyword + rank as f32 + 1.0);
+    }
+
+    if scores.is_empty() {
         eprintln!("\x1b[31mx\x1b[0m No matching repositories found.");
         return Ok(());
     }
 
-    // Apply boosting and display
-    let query_lower = query.to_lowercase();
+    // Sort by combined RRF score
+    let mut combined: Vec<_> = scores.into_iter().collect();
+    combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut boosted: Vec<_> = results
-        .into_iter()
-        .filter_map(|(id, distance)| {
-            let repo = db.get_repo_by_id(id).ok()??;
-            let base_score = (1.0 / (1.0 + distance)) * 100.0;
+    // Display results
+    // Max theoretical score: 1/21 + 1/61 + 1/81 ≈ 0.072
+    let max_score = 1.0 / (k_name + 1.0) + 1.0 / (k_vector + 1.0) + 1.0 / (k_keyword + 1.0);
 
-            // Boost for name match
-            let name_lower = repo.full_name.to_lowercase();
-            let boosted_score = if name_lower.contains(&query_lower) {
-                (base_score + 20.0).min(100.0)
-            } else if query_lower.split_whitespace().all(|w| name_lower.contains(w)) {
-                (base_score + 15.0).min(100.0)
-            } else {
-                base_score
-            };
+    for (i, (repo_id, rrf_score)) in combined.iter().take(limit).enumerate() {
+        let repo = match db.get_repo_by_id(*repo_id)? {
+            Some(r) => r,
+            None => continue,
+        };
 
-            Some((repo, boosted_score))
-        })
-        .collect();
-
-    boosted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    for (i, (repo, score)) in boosted.iter().take(limit).enumerate() {
         let lang = repo.language.as_deref().unwrap_or("?");
         let stars = format_stars(repo.stars);
         let desc = repo.description.as_deref().unwrap_or("No description");
         let desc_truncated = truncate_str(desc, 60);
+
+        let display_score = (rrf_score / max_score * 100.0).min(100.0);
 
         eprintln!(
             "\x1b[35m{:>2}.\x1b[0m \x1b[1m{}\x1b[0m \x1b[33m{}\x1b[0m \x1b[90m[{}]\x1b[0m \x1b[90m({:.0}%)\x1b[0m",
@@ -192,7 +210,7 @@ fn search(query: &str, limit: usize, db: &Database) -> Result<()> {
             repo.full_name,
             stars,
             lang,
-            score
+            display_score
         );
         eprintln!("    \x1b[90m{}\x1b[0m", desc_truncated);
         eprintln!("    {}", repo.url);
