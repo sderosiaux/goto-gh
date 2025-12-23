@@ -322,7 +322,7 @@ async fn index_repos(client: &GitHubClient, db: &Database, query: &Option<String
             }
 
             cursor = next_cursor;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 

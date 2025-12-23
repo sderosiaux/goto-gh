@@ -325,62 +325,93 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
             },
         };
 
-        let response = self.client
-            .post("https://api.github.com/graphql")
-            .header("Authorization", format!("Bearer {}", token))
-            .header("User-Agent", "goto-gh/0.1.0")
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send GraphQL request")?;
+        // Retry with exponential backoff for transient errors (502, 504, etc.)
+        let mut last_error = None;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                let delay = std::time::Duration::from_millis(500 * (1 << attempt));
+                tokio::time::sleep(delay).await;
+            }
 
-        if !response.status().is_success() {
+            let response = match self.client
+                .post("https://api.github.com/graphql")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("User-Agent", "goto-gh/0.1.0")
+                .json(&request)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = Some(format!("Request failed: {}", e));
+                    continue;
+                }
+            };
+
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("GraphQL error {}: {}", status, body);
-        }
+            if status == reqwest::StatusCode::BAD_GATEWAY
+                || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            {
+                last_error = Some(format!("GitHub API error {}", status));
+                continue;
+            }
 
-        let gql_response: GraphQLResponse = response.json().await
-            .context("Failed to parse GraphQL response")?;
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                anyhow::bail!("GraphQL error {}: {}", status, body);
+            }
 
-        if let Some(errors) = gql_response.errors {
-            let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
-            anyhow::bail!("GraphQL errors: {}", msgs.join(", "));
-        }
+            let gql_response: GraphQLResponse = match response.json().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = Some(format!("Parse error: {}", e));
+                    continue;
+                }
+            };
 
-        let data = gql_response.data
-            .ok_or_else(|| anyhow::anyhow!("No data in GraphQL response"))?;
+            if let Some(errors) = gql_response.errors {
+                let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
+                anyhow::bail!("GraphQL errors: {}", msgs.join(", "));
+            }
 
-        let repos: Vec<RepoWithReadme> = data.search.nodes
-            .into_iter()
-            .filter_map(|node| {
-                let repo = node?;
+            let data = gql_response.data
+                .ok_or_else(|| anyhow::anyhow!("No data in GraphQL response"))?;
 
-                // Get README from any of the common locations
-                let readme = repo.readme
-                    .and_then(|b| b.text)
-                    .or_else(|| repo.readme_lower.and_then(|b| b.text))
-                    .or_else(|| repo.readme_rst.and_then(|b| b.text));
+            let repos: Vec<RepoWithReadme> = data.search.nodes
+                .into_iter()
+                .filter_map(|node| {
+                    let repo = node?;
 
-                Some(RepoWithReadme {
-                    full_name: repo.name_with_owner,
-                    description: repo.description,
-                    html_url: repo.url,
-                    stars: repo.stargazer_count,
-                    language: repo.primary_language.map(|l| l.name),
-                    topics: repo.repository_topics.nodes
-                        .into_iter()
-                        .map(|t| t.topic.name)
-                        .collect(),
-                    fork: repo.is_fork,
-                    readme,
+                    // Get README from any of the common locations
+                    let readme = repo.readme
+                        .and_then(|b| b.text)
+                        .or_else(|| repo.readme_lower.and_then(|b| b.text))
+                        .or_else(|| repo.readme_rst.and_then(|b| b.text));
+
+                    Some(RepoWithReadme {
+                        full_name: repo.name_with_owner,
+                        description: repo.description,
+                        html_url: repo.url,
+                        stars: repo.stargazer_count,
+                        language: repo.primary_language.map(|l| l.name),
+                        topics: repo.repository_topics.nodes
+                            .into_iter()
+                            .map(|t| t.topic.name)
+                            .collect(),
+                        fork: repo.is_fork,
+                        readme,
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        let has_next = data.search.page_info.has_next_page;
-        let cursor = data.search.page_info.end_cursor;
+            let has_next = data.search.page_info.has_next_page;
+            let cursor = data.search.page_info.end_cursor;
 
-        Ok((repos, cursor, has_next))
+            return Ok((repos, cursor, has_next));
+        }
+
+        // All retries failed
+        anyhow::bail!("GraphQL request failed after 5 retries: {}", last_error.unwrap_or_default())
     }
 }
