@@ -11,8 +11,6 @@ pub struct GitHubRepo {
     pub stargazers_count: u64,
     pub language: Option<String>,
     pub topics: Vec<String>,
-    #[serde(default)]
-    pub fork: bool,
 }
 
 /// Repository with README included (from GraphQL)
@@ -26,13 +24,6 @@ pub struct RepoWithReadme {
     pub topics: Vec<String>,
     pub fork: bool,
     pub readme: Option<String>,
-}
-
-/// Search results from GitHub API
-#[derive(Debug, Deserialize)]
-pub struct SearchResults {
-    pub total_count: u64,
-    pub items: Vec<GitHubRepo>,
 }
 
 /// README content response
@@ -66,33 +57,6 @@ impl GitHubClient {
         }
         req.header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
-    }
-
-    /// Search repositories by query
-    pub async fn search_repos(&self, query: &str, per_page: u32, page: u32) -> Result<SearchResults> {
-        let url = format!(
-            "https://api.github.com/search/repositories?q={}&sort=stars&order=desc&per_page={}&page={}",
-            urlencoded(query),
-            per_page.min(100),
-            page
-        );
-
-        let response = self
-            .request(&url)
-            .send()
-            .await
-            .context("Failed to send search request")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("GitHub API error {}: {}", status, body);
-        }
-
-        response
-            .json::<SearchResults>()
-            .await
-            .context("Failed to parse search results")
     }
 
     /// Get repository details
@@ -173,17 +137,6 @@ struct RateLimitResponse {
     rate: RateLimit,
 }
 
-/// Simple URL encoding for query parameters
-fn urlencoded(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            ' ' => "+".to_string(),
-            '&' | '=' | '?' | '/' | ':' | '#' | '+' => format!("%{:02X}", c as u8),
-            _ => c.to_string(),
-        })
-        .collect()
-}
-
 // === GraphQL Types ===
 
 #[derive(Serialize)]
@@ -218,7 +171,6 @@ struct GraphQLData {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphQLSearch {
-    repository_count: u64,
     page_info: PageInfo,
     nodes: Vec<Option<GraphQLRepo>>,
 }
@@ -275,7 +227,6 @@ impl GitHubClient {
     const GRAPHQL_QUERY: &'static str = r#"
 query SearchRepos($query: String!, $first: Int!, $after: String) {
   search(query: $query, type: REPOSITORY, first: $first, after: $after) {
-    repositoryCount
     pageInfo {
       hasNextPage
       endCursor
@@ -327,9 +278,9 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
 
         // Retry with exponential backoff for transient errors (502, 504, etc.)
         let mut last_error = None;
-        for attempt in 0..5 {
+        for attempt in 0..8 {
             if attempt > 0 {
-                let delay = std::time::Duration::from_millis(500 * (1 << attempt));
+                let delay = std::time::Duration::from_millis(1000 * (1 << attempt.min(4)));
                 tokio::time::sleep(delay).await;
             }
 
@@ -349,12 +300,25 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
             };
 
             let status = response.status();
+            // Retry on transient errors (502, 503, 504)
             if status == reqwest::StatusCode::BAD_GATEWAY
                 || status == reqwest::StatusCode::GATEWAY_TIMEOUT
                 || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
             {
                 last_error = Some(format!("GitHub API error {}", status));
                 continue;
+            }
+
+            // Retry on secondary rate limit (403) with longer backoff
+            if status == reqwest::StatusCode::FORBIDDEN {
+                let body = response.text().await.unwrap_or_default();
+                if body.contains("secondary rate limit") {
+                    last_error = Some(format!("Secondary rate limit hit"));
+                    // Extra delay for rate limit
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+                anyhow::bail!("GraphQL error {}: {}", status, body);
             }
 
             if !status.is_success() {

@@ -5,19 +5,25 @@ mod github;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use futures::stream::{self, StreamExt};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 use config::Config;
 use db::Database;
-use embedding::{build_embedding_text, embed_text};
+use embedding::{build_embedding_text, embed_text, embed_texts};
 use github::GitHubClient;
 
 #[derive(Parser)]
 #[command(name = "goto-gh")]
 #[command(about = "Semantic search for GitHub repositories")]
+#[command(after_help = "\x1b[36mExamples:\x1b[0m
+  goto-gh index              # Index top repos by stars
+  goto-gh \"vector database\"  # Semantic search
+  goto-gh find qdrant        # Fuzzy search by name")]
 struct Cli {
     /// Search query (semantic search)
     #[arg(trailing_var_arg = true)]
@@ -42,6 +48,14 @@ enum Commands {
         /// Number of repos to index (default: 50000)
         #[arg(short, long, default_value = "50000")]
         count: u32,
+
+        /// Start fresh (ignore checkpoint, re-index from beginning)
+        #[arg(long)]
+        full: bool,
+
+        /// Number of parallel API workers (default: 1, max: 3 to avoid rate limits)
+        #[arg(short, long, default_value = "1")]
+        workers: usize,
     },
 
     /// Add a specific repository by name
@@ -52,6 +66,16 @@ enum Commands {
 
     /// Show index statistics
     Stats,
+
+    /// Fuzzy search by repo name only (no semantic search)
+    Find {
+        /// Pattern to search for in repo names
+        pattern: String,
+
+        /// Number of results to show
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
 
     /// Check GitHub API rate limit
     RateLimit,
@@ -75,18 +99,21 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Some(Commands::Index { query, count }) => {
+        Some(Commands::Index { query, count, full, workers }) => {
             if token.is_none() {
                 eprintln!("\x1b[33m..\x1b[0m No GitHub token found. Rate limit: 60 req/hour");
                 eprintln!("  Set GITHUB_TOKEN or run: gh auth login");
             }
-            index_repos(&client, &db, &query, count).await
+            index_repos(&client, &db, &query, count, full, workers).await
         }
         Some(Commands::Add { repo }) => {
             add_repo(&client, &db, &repo).await
         }
         Some(Commands::Stats) => {
             show_stats(&db)
+        }
+        Some(Commands::Find { pattern, limit }) => {
+            find_by_name(&db, &pattern, limit)
         }
         Some(Commands::RateLimit) => {
             check_rate_limit(&client).await
@@ -95,18 +122,17 @@ async fn main() -> Result<()> {
             revectorize(&db)
         }
         None => {
-            eprintln!("\x1b[33mUsage:\x1b[0m goto-gh <query> or goto-gh --help");
-            eprintln!("\nTo get started:");
-            eprintln!("  1. goto-gh index              # Index top repos by stars");
-            eprintln!("  2. goto-gh \"vector database\"  # Semantic search");
-            std::process::exit(1);
+            use clap::CommandFactory;
+            Cli::command().print_help()?;
+            eprintln!();
+            std::process::exit(0);
         }
     }
 }
 
 /// Semantic search in local index
 fn search(query: &str, limit: usize, db: &Database) -> Result<()> {
-    let (total, indexed) = db.stats()?;
+    let (_total, indexed) = db.stats()?;
 
     if indexed == 0 {
         eprintln!("\x1b[31mx\x1b[0m No repositories indexed yet.");
@@ -158,11 +184,7 @@ fn search(query: &str, limit: usize, db: &Database) -> Result<()> {
         let lang = repo.language.as_deref().unwrap_or("?");
         let stars = format_stars(repo.stars);
         let desc = repo.description.as_deref().unwrap_or("No description");
-        let desc_truncated = if desc.len() > 60 {
-            format!("{}...", &desc[..57])
-        } else {
-            desc.to_string()
-        };
+        let desc_truncated = truncate_str(desc, 60);
 
         eprintln!(
             "\x1b[35m{:>2}.\x1b[0m \x1b[1m{}\x1b[0m \x1b[33m{}\x1b[0m \x1b[90m[{}]\x1b[0m \x1b[90m({:.0}%)\x1b[0m",
@@ -181,16 +203,9 @@ fn search(query: &str, limit: usize, db: &Database) -> Result<()> {
 }
 
 /// Index repos from GitHub using GraphQL (efficient: repo + README in one call)
-async fn index_repos(client: &GitHubClient, db: &Database, query: &Option<String>, count: u32) -> Result<()> {
-    eprintln!("\x1b[36m..\x1b[0m Fetching top {} repos (GraphQL)", count);
-
-    let search_query = match query {
-        Some(q) => q.clone(),
-        None => "stars:>20".to_string(), // Top repos by stars
-    };
-
+async fn index_repos(client: &GitHubClient, db: &Database, query: &Option<String>, count: u32, full: bool, workers: usize) -> Result<()> {
     // Star ranges for pagination (GraphQL has same 1000 limit per query)
-    let star_ranges = [
+    let star_ranges: Vec<&str> = vec![
         "stars:>100000",
         "stars:50000..100000",
         "stars:30000..50000",
@@ -239,61 +254,173 @@ async fn index_repos(client: &GitHubClient, db: &Database, query: &Option<String
         "stars:20..25",
     ];
 
-    let mut indexed = 0;
-    let mut skipped = 0;
-    let mut total_fetched = 0;
-
-    // Use query if provided, otherwise iterate through star ranges
-    let ranges: Vec<&str> = if query.is_some() {
-        vec![&search_query]
+    // Check for checkpoint (only for default star-based indexing)
+    let (start_range_idx, _start_cursor, initial_fetched) = if query.is_none() && !full {
+        if let Some((range_idx, cursor, fetched)) = db.get_checkpoint()? {
+            eprintln!("\x1b[36m..\x1b[0m Resuming from checkpoint: {} (fetched: {})", star_ranges.get(range_idx).unwrap_or(&"?"), fetched);
+            (range_idx, cursor, fetched)
+        } else {
+            // No checkpoint - try to infer from existing repos
+            let repo_count = db.get_repo_count()?;
+            if repo_count > 0 {
+                if let Some(min_stars) = db.get_min_stars()? {
+                    let inferred_idx = infer_star_range_idx(&star_ranges, min_stars);
+                    eprintln!(
+                        "\x1b[36m..\x1b[0m No checkpoint found, but {} repos exist (min stars: {})",
+                        repo_count, min_stars
+                    );
+                    eprintln!(
+                        "\x1b[36m..\x1b[0m Inferring resume point: {} (idx: {})",
+                        star_ranges.get(inferred_idx).unwrap_or(&"?"), inferred_idx
+                    );
+                    db.save_checkpoint(inferred_idx, None, repo_count)?;
+                    (inferred_idx, None, repo_count)
+                } else {
+                    (0, None, 0)
+                }
+            } else {
+                (0, None, 0)
+            }
+        }
     } else {
-        star_ranges.iter().map(|s| *s).collect()
+        if full && query.is_none() {
+            db.clear_checkpoint()?;
+            eprintln!("\x1b[36m..\x1b[0m Starting fresh index (checkpoint cleared)");
+        }
+        (0, None, 0)
     };
 
-    'outer: for range in ranges {
-        if total_fetched >= count as usize {
+    let workers = workers.max(1).min(3); // Clamp between 1-3 (avoid secondary rate limit)
+    eprintln!("\x1b[36m..\x1b[0m Fetching top {} repos (GraphQL, {} workers)", count, workers);
+
+    // Shared state for parallel fetching
+    let total_fetched = Arc::new(std::sync::atomic::AtomicUsize::new(initial_fetched));
+    let indexed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let skipped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Embedding batch accumulator (shared across workers)
+    const EMBED_BATCH_SIZE: usize = 1000;
+    let pending_embed: Arc<Mutex<Vec<(github::RepoWithReadme, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Helper to flush pending embeddings
+    async fn flush_embeddings(
+        pending: &Arc<Mutex<Vec<(github::RepoWithReadme, String)>>>,
+        db: &Database,
+        indexed: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<()> {
+        let mut pending_guard = pending.lock().await;
+        if pending_guard.is_empty() {
+            return Ok(());
+        }
+        let texts: Vec<String> = pending_guard.iter().map(|(_, t)| t.clone()).collect();
+        let batch_len = texts.len();
+        let repos_to_embed: Vec<_> = pending_guard.drain(..).collect();
+        drop(pending_guard); // Release lock before expensive embedding
+
+        let embeddings = embed_texts(&texts)?;
+
+        for ((repo, text), embedding) in repos_to_embed.into_iter().zip(embeddings) {
+            let repo_id = db.upsert_repo_with_readme(&repo, repo.readme.as_deref(), &text)?;
+            db.upsert_embedding(repo_id, &embedding)?;
+            indexed.fetch_add(1, Ordering::Relaxed);
+        }
+        let total = indexed.load(Ordering::Relaxed);
+        eprintln!("  ... embedded {} repos (total: {})", batch_len, total);
+        Ok(())
+    }
+
+    // Build list of ranges to process
+    let ranges_to_process: Vec<(usize, &str)> = if query.is_some() {
+        vec![(0, query.as_ref().unwrap().as_str())]
+    } else {
+        star_ranges.iter().enumerate()
+            .skip(start_range_idx)
+            .map(|(i, s)| (i, *s))
+            .collect()
+    };
+
+    let use_checkpoint = query.is_none();
+    let count_usize = count as usize;
+
+    // Process ranges in parallel batches of `workers` size
+    let client = Arc::new(client);
+    let db = Arc::new(db);
+
+    for chunk in ranges_to_process.chunks(workers) {
+        if total_fetched.load(Ordering::Relaxed) >= count_usize {
             break;
         }
 
-        let mut cursor: Option<String> = None;
+        // Fetch multiple ranges in parallel
+        let fetch_tasks: Vec<_> = chunk.iter().map(|(range_idx, range)| {
+            let client = Arc::clone(&client);
+            let range = range.to_string();
+            let range_idx = *range_idx;
+            let total_fetched = Arc::clone(&total_fetched);
+            let count_usize = count_usize;
 
-        loop {
-            if total_fetched >= count as usize {
-                break 'outer;
-            }
+            async move {
+                let mut results: Vec<github::RepoWithReadme> = Vec::new();
+                let mut cursor: Option<String> = None;
 
-            let batch_size = 100.min(count - total_fetched as u32);
-            let (repos, next_cursor, has_next) = match client
-                .search_repos_graphql(range, batch_size, cursor)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("  {} - error: {}", range, e);
-                    break;
+                loop {
+                    if total_fetched.load(Ordering::Relaxed) >= count_usize {
+                        break;
+                    }
+
+                    let batch_size = 100;
+                    match client.search_repos_graphql(&range, batch_size, cursor.clone()).await {
+                        Ok((repos, next_cursor, has_next)) => {
+                            if repos.is_empty() {
+                                break;
+                            }
+                            results.extend(repos);
+
+                            if !has_next {
+                                break;
+                            }
+                            cursor = next_cursor;
+                        }
+                        Err(e) => {
+                            eprintln!("  {} - error: {}", range, e);
+                            break;
+                        }
+                    }
+
+                    // Limit pages per range to avoid one range hogging everything
+                    if results.len() >= 500 {
+                        break;
+                    }
                 }
-            };
 
+                (range_idx, range, results)
+            }
+        }).collect();
+
+        // Wait for all parallel fetches
+        let fetch_results: Vec<_> = stream::iter(fetch_tasks)
+            .buffer_unordered(workers)
+            .collect()
+            .await;
+
+        // Process results and accumulate for embedding
+        for (_range_idx, range, repos) in fetch_results {
             if repos.is_empty() {
-                break;
+                continue;
             }
 
-            eprintln!("  {} ({} repos)", range, repos.len());
-
+            let mut page_new = 0;
             for repo in repos {
                 if repo.fork {
                     continue;
                 }
+                total_fetched.fetch_add(1, Ordering::Relaxed);
 
-                total_fetched += 1;
-
-                // Skip if already fresh
                 if db.is_fresh(&repo.full_name, 7)? {
-                    skipped += 1;
+                    skipped.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 
-                // Build embedding text (README already included!)
                 let text = build_embedding_text(
                     &repo.full_name,
                     repo.description.as_deref(),
@@ -302,33 +429,42 @@ async fn index_repos(client: &GitHubClient, db: &Database, query: &Option<String
                     repo.readme.as_deref(),
                 );
 
-                // Generate embedding
-                let embedding = embed_text(&text)?;
-
-                // Store in database
-                let repo_id = db.upsert_repo_with_readme(&repo, repo.readme.as_deref(), &text)?;
-                db.upsert_embedding(repo_id, &embedding)?;
-
-                indexed += 1;
-
-                // Progress
-                if indexed % 100 == 0 {
-                    eprintln!("  ... indexed {}", indexed);
-                }
+                pending_embed.lock().await.push((repo, text));
+                page_new += 1;
             }
+            eprintln!("  {} +{} new", range, page_new);
 
-            if !has_next {
-                break;
+            // Flush if we have enough pending
+            if pending_embed.lock().await.len() >= EMBED_BATCH_SIZE {
+                flush_embeddings(&pending_embed, &db, &indexed).await?;
             }
-
-            cursor = next_cursor;
-            tokio::time::sleep(Duration::from_millis(200)).await;
         }
+
+        // Save checkpoint after each batch of parallel ranges
+        if use_checkpoint {
+            let last_range_idx = chunk.last().map(|(i, _)| *i).unwrap_or(0);
+            let fetched = total_fetched.load(Ordering::Relaxed);
+            db.save_checkpoint(last_range_idx + 1, None, fetched)?;
+        }
+
+        // Small delay between batches to avoid secondary rate limit
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
+    // Flush any remaining pending embeddings
+    flush_embeddings(&pending_embed, &db, &indexed).await?;
+
+    // Clear checkpoint when done (reached count target)
+    let final_fetched = total_fetched.load(Ordering::Relaxed);
+    if use_checkpoint && final_fetched >= count_usize {
+        db.clear_checkpoint()?;
+    }
+
+    let final_indexed = indexed.load(Ordering::Relaxed);
+    let final_skipped = skipped.load(Ordering::Relaxed);
     eprintln!(
         "\x1b[32mok\x1b[0m Indexed {} new repos ({} skipped as fresh)",
-        indexed, skipped
+        final_indexed, final_skipped
     );
 
     Ok(())
@@ -360,6 +496,45 @@ async fn add_repo(client: &GitHubClient, db: &Database, full_name: &str) -> Resu
     }
 
     Ok(())
+}
+
+/// Fuzzy search by repo name
+fn find_by_name(db: &Database, pattern: &str, limit: usize) -> Result<()> {
+    let repos = db.find_by_name(pattern, limit)?;
+
+    if repos.is_empty() {
+        eprintln!("\x1b[31mx\x1b[0m No repos matching '{}'", pattern);
+        return Ok(());
+    }
+
+    eprintln!("\x1b[36m{} repos matching '{}'\x1b[0m\n", repos.len(), pattern);
+
+    for repo in repos {
+        let lang = repo.language.as_deref().unwrap_or("?");
+        let stars = format_stars(repo.stars);
+        let desc = repo.description.as_deref().unwrap_or("");
+        let desc_truncated = truncate_str(desc, 60);
+
+        eprintln!(
+            "\x1b[1m{}\x1b[0m \x1b[33m{}\x1b[0m \x1b[90m[{}]\x1b[0m",
+            repo.full_name, stars, lang
+        );
+        if !desc_truncated.is_empty() {
+            eprintln!("  \x1b[90m{}\x1b[0m", desc_truncated);
+        }
+    }
+
+    Ok(())
+}
+
+/// Truncate string safely at char boundary
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars - 3).collect();
+        format!("{}...", truncated)
+    }
 }
 
 /// Show statistics
@@ -448,6 +623,35 @@ fn revectorize(db: &Database) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Infer which star range index to resume from based on minimum stars in DB
+fn infer_star_range_idx(star_ranges: &[&str], min_stars: u64) -> usize {
+    // Parse star ranges to find where min_stars falls
+    // Ranges are like "stars:>100000", "stars:50000..100000", etc.
+    for (idx, range) in star_ranges.iter().enumerate() {
+        if let Some(lower) = parse_star_range_lower(range) {
+            if min_stars >= lower {
+                return idx;
+            }
+        }
+    }
+    // Default to last range if not found
+    star_ranges.len().saturating_sub(1)
+}
+
+/// Parse the lower bound of a star range
+fn parse_star_range_lower(range: &str) -> Option<u64> {
+    let range = range.strip_prefix("stars:")?;
+    if range.starts_with('>') {
+        // "stars:>100000" -> lower bound is 100001
+        range[1..].parse().ok()
+    } else if let Some((lower, _)) = range.split_once("..") {
+        // "stars:50000..100000" -> lower bound is 50000
+        lower.parse().ok()
+    } else {
+        None
+    }
 }
 
 /// Format star count (e.g., 1.2k, 15k)

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rusqlite::{ffi::sqlite3_auto_extension, params, Connection, OptionalExtension};
 use sqlite_vec::sqlite3_vec_init;
 use zerocopy::AsBytes;
@@ -11,15 +11,11 @@ use crate::github::{GitHubRepo, RepoWithReadme};
 /// Stored repository with metadata
 #[derive(Debug, Clone)]
 pub struct Repo {
-    pub id: i64,
     pub full_name: String,
     pub description: Option<String>,
     pub url: String,
     pub stars: u64,
     pub language: Option<String>,
-    pub topics: Vec<String>,
-    pub readme_excerpt: Option<String>,
-    pub last_indexed: DateTime<Utc>,
 }
 
 pub struct Database {
@@ -71,6 +67,14 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_repos_name ON repos(full_name);
             CREATE INDEX IF NOT EXISTS idx_repos_stars ON repos(stars DESC);
+
+            CREATE TABLE IF NOT EXISTS index_checkpoints (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_star_range_idx INTEGER NOT NULL,
+                last_cursor TEXT,
+                total_fetched INTEGER DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
             ",
         )?;
 
@@ -202,27 +206,17 @@ impl Database {
     /// Get repo by ID
     pub fn get_repo_by_id(&self, id: i64) -> Result<Option<Repo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, full_name, description, url, stars, language, topics, readme_excerpt, last_indexed
-             FROM repos WHERE id = ?",
+            "SELECT full_name, description, url, stars, language FROM repos WHERE id = ?",
         )?;
 
         let result = stmt
             .query_row([id], |row| {
-                let topics_json: String = row.get(6)?;
-                let topics: Vec<String> = serde_json::from_str(&topics_json).unwrap_or_default();
-
                 Ok(Repo {
-                    id: row.get(0)?,
-                    full_name: row.get(1)?,
-                    description: row.get(2)?,
-                    url: row.get(3)?,
-                    stars: row.get::<_, i64>(4)? as u64,
-                    language: row.get(5)?,
-                    topics,
-                    readme_excerpt: row.get(7)?,
-                    last_indexed: DateTime::parse_from_rfc3339(&row.get::<_, String>(8)?)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now()),
+                    full_name: row.get(0)?,
+                    description: row.get(1)?,
+                    url: row.get(2)?,
+                    stars: row.get::<_, i64>(3)? as u64,
+                    language: row.get(4)?,
                 })
             })
             .optional()?;
@@ -254,19 +248,6 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok((total, indexed))
-    }
-
-    /// Get embedded_text for boosting
-    pub fn get_embedded_text(&self, full_name: &str) -> Result<Option<String>> {
-        let result = self
-            .conn
-            .query_row(
-                "SELECT embedded_text FROM repos WHERE full_name = ?",
-                [full_name],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(result)
     }
 
     /// Get all repos for revectorization (returns raw stored data)
@@ -307,5 +288,86 @@ impl Database {
         )?;
 
         Ok(())
+    }
+
+    /// Get index checkpoint (star range index, cursor, total fetched)
+    pub fn get_checkpoint(&self) -> Result<Option<(usize, Option<String>, usize)>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT last_star_range_idx, last_cursor, total_fetched FROM index_checkpoints WHERE id = 1",
+                [],
+                |row| Ok((
+                    row.get::<_, i64>(0)? as usize,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)? as usize,
+                )),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Save index checkpoint
+    pub fn save_checkpoint(&self, star_range_idx: usize, cursor: Option<&str>, total_fetched: usize) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO index_checkpoints (id, last_star_range_idx, last_cursor, total_fetched, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                 last_star_range_idx = ?1,
+                 last_cursor = ?2,
+                 total_fetched = ?3,
+                 updated_at = ?4",
+            params![star_range_idx as i64, cursor, total_fetched as i64, now],
+        )?;
+        Ok(())
+    }
+
+    /// Clear checkpoint (for fresh indexing)
+    pub fn clear_checkpoint(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM index_checkpoints WHERE id = 1", [])?;
+        Ok(())
+    }
+
+    /// Get minimum stars count from existing repos (for checkpoint inference)
+    pub fn get_min_stars(&self) -> Result<Option<u64>> {
+        let result = self
+            .conn
+            .query_row("SELECT MIN(stars) FROM repos", [], |row| row.get::<_, Option<i64>>(0))
+            .optional()?
+            .flatten();
+        Ok(result.map(|s| s as u64))
+    }
+
+    /// Get count of existing repos
+    pub fn get_repo_count(&self) -> Result<usize> {
+        let count: usize = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM repos", [], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// Fuzzy search repos by name (case-insensitive LIKE)
+    pub fn find_by_name(&self, pattern: &str, limit: usize) -> Result<Vec<Repo>> {
+        let pattern = format!("%{}%", pattern);
+        let mut stmt = self.conn.prepare(
+            "SELECT full_name, description, url, stars, language
+             FROM repos
+             WHERE full_name LIKE ?1 COLLATE NOCASE
+             ORDER BY stars DESC
+             LIMIT ?2",
+        )?;
+
+        let results = stmt.query_map(params![pattern, limit as i64], |row| {
+            Ok(Repo {
+                full_name: row.get(0)?,
+                description: row.get(1)?,
+                url: row.get(2)?,
+                stars: row.get::<_, i64>(3)? as u64,
+                language: row.get(4)?,
+            })
+        })?;
+
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 }
