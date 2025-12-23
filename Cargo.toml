@@ -1,0 +1,47 @@
+[package]
+name = "goto-gh"
+version = "0.1.0"
+edition = "2021"
+description = "Semantic search for GitHub repositories"
+authors = ["sderosiaux"]
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Vector search (sqlite-vec extension)
+sqlite-vec = "0.1"
+zerocopy = { version = "0.7", features = ["derive"] }
+
+# Embeddings (ONNX-based, offline)
+fastembed = "5"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# File system / paths
+directories = "5"
+dirs = "5"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Base64 (for README decoding)
+base64 = "0.22"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
