@@ -16,6 +16,17 @@ use db::Database;
 use embedding::{build_embedding_text, embed_text, embed_texts};
 use github::GitHubClient;
 
+/// Format repo name as clickable hyperlink (only if stdout is a TTY)
+fn format_repo_link(name: &str, url: &str) -> String {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        // OSC 8 hyperlink: \x1b]8;;URL\x1b\\TEXT\x1b]8;;\x1b\\
+        format!("\x1b]8;;{}\x1b\\\x1b[1m{}\x1b[0m\x1b]8;;\x1b\\", url, name)
+    } else {
+        name.to_string()
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "goto-gh")]
 #[command(about = "Semantic search for GitHub repositories")]
@@ -233,13 +244,12 @@ fn search(query: &str, limit: usize, semantic_only: bool, db: &Database) -> Resu
         let desc_truncated = truncate_str(desc, 60);
 
         let display_score = (rrf_score / max_score * 100.0).min(100.0);
+        let repo_link = format_repo_link(&repo.full_name, &repo.url);
 
-        // OSC 8 hyperlink: \x1b]8;;URL\x1b\\TEXT\x1b]8;;\x1b\\
-        eprintln!(
-            "\x1b[35m{:>2}.\x1b[0m \x1b]8;;{}\x1b\\\x1b[1m{}\x1b[0m\x1b]8;;\x1b\\ \x1b[33m{}\x1b[0m \x1b[90m[{}]\x1b[0m \x1b[90m({:.0}%)\x1b[0m \x1b[90m{}\x1b[0m",
+        println!(
+            "\x1b[35m{:>2}.\x1b[0m {} \x1b[33m{}\x1b[0m \x1b[90m[{}]\x1b[0m \x1b[90m({:.0}%)\x1b[0m \x1b[90m{}\x1b[0m",
             i + 1,
-            repo.url,
-            repo.full_name,
+            repo_link,
             stars,
             lang,
             display_score,
@@ -270,9 +280,9 @@ async fn add_repo(client: &GitHubClient, db: &Database, full_name: &str) -> Resu
     let repo_id = db.upsert_repo(&repo, readme.as_deref(), &text)?;
     db.upsert_embedding(repo_id, &embedding)?;
 
-    eprintln!("\x1b[32mok\x1b[0m Added \x1b[1m{}\x1b[0m", repo.full_name);
+    println!("\x1b[32mok\x1b[0m Added \x1b[1m{}\x1b[0m", repo.full_name);
     if let Some(desc) = &repo.description {
-        eprintln!("  {}", desc);
+        println!("  {}", desc);
     }
 
     Ok(())
@@ -287,18 +297,18 @@ fn find_by_name(db: &Database, pattern: &str, limit: usize) -> Result<()> {
         return Ok(());
     }
 
-    eprintln!("\x1b[36m{} repos matching '{}'\x1b[0m\n", repos.len(), pattern);
+    println!("\x1b[36m{} repos matching '{}'\x1b[0m\n", repos.len(), pattern);
 
     for repo in repos {
         let lang = repo.language.as_deref().unwrap_or("?");
         let stars = format_stars(repo.stars);
         let desc = repo.description.as_deref().unwrap_or("");
         let desc_truncated = truncate_str(desc, 60);
+        let repo_link = format_repo_link(&repo.full_name, &repo.url);
 
-        // OSC 8 hyperlink: \x1b]8;;URL\x1b\\TEXT\x1b]8;;\x1b\\
-        eprintln!(
-            "\x1b]8;;{}\x1b\\\x1b[1m{}\x1b[0m\x1b]8;;\x1b\\ \x1b[33m{}\x1b[0m \x1b[90m[{}]\x1b[0m \x1b[90m{}\x1b[0m",
-            repo.url, repo.full_name, stars, lang, desc_truncated
+        println!(
+            "{} \x1b[33m{}\x1b[0m \x1b[90m[{}]\x1b[0m \x1b[90m{}\x1b[0m",
+            repo_link, stars, lang, desc_truncated
         );
     }
 
@@ -322,21 +332,21 @@ fn show_stats(db: &Database) -> Result<()> {
     let without_embeddings = db.count_repos_without_embeddings()?;
     let gone = db.count_gone()?;
 
-    eprintln!("\x1b[36mIndex Statistics\x1b[0m\n");
-    eprintln!("  \x1b[90mTotal repos:\x1b[0m        {}", total);
-    eprintln!("  \x1b[90mWith metadata:\x1b[0m      {}", total - without_metadata - gone);
-    eprintln!("  \x1b[90mWith embeddings:\x1b[0m    {}", indexed);
-    eprintln!();
-    eprintln!("  \x1b[90mNeed metadata:\x1b[0m      {}", without_metadata);
-    eprintln!("  \x1b[90mNeed embeddings:\x1b[0m    {}", without_embeddings);
+    println!("\x1b[36mIndex Statistics\x1b[0m\n");
+    println!("  \x1b[90mTotal repos:\x1b[0m        {}", total);
+    println!("  \x1b[90mWith metadata:\x1b[0m      {}", total - without_metadata - gone);
+    println!("  \x1b[90mWith embeddings:\x1b[0m    {}", indexed);
+    println!();
+    println!("  \x1b[90mNeed metadata:\x1b[0m      {}", without_metadata);
+    println!("  \x1b[90mNeed embeddings:\x1b[0m    {}", without_embeddings);
     if gone > 0 {
-        eprintln!("  \x1b[90mGone (deleted):\x1b[0m     {}", gone);
+        println!("  \x1b[90mGone (deleted):\x1b[0m     {}", gone);
     }
 
     if without_metadata > 0 {
-        eprintln!("\n  \x1b[33mTip:\x1b[0m Run: goto-gh fetch");
+        println!("\n  \x1b[33mTip:\x1b[0m Run: goto-gh fetch");
     } else if without_embeddings > 0 {
-        eprintln!("\n  \x1b[33mTip:\x1b[0m Run: goto-gh embed");
+        println!("\n  \x1b[33mTip:\x1b[0m Run: goto-gh embed");
     }
 
     Ok(())
@@ -350,10 +360,10 @@ async fn check_rate_limit(client: &GitHubClient) -> Result<()> {
         .map(|dt| dt.format("%H:%M:%S").to_string())
         .unwrap_or_else(|| "?".to_string());
 
-    eprintln!("\x1b[36mGitHub API Rate Limit\x1b[0m\n");
-    eprintln!("  \x1b[90mLimit:\x1b[0m     {}/hour", rate.limit);
-    eprintln!("  \x1b[90mRemaining:\x1b[0m {}", rate.remaining);
-    eprintln!("  \x1b[90mResets at:\x1b[0m {}", reset_time);
+    println!("\x1b[36mGitHub API Rate Limit\x1b[0m\n");
+    println!("  \x1b[90mLimit:\x1b[0m     {}/hour", rate.limit);
+    println!("  \x1b[90mRemaining:\x1b[0m {}", rate.remaining);
+    println!("  \x1b[90mResets at:\x1b[0m {}", reset_time);
 
     Ok(())
 }
