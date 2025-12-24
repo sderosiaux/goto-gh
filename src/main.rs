@@ -40,25 +40,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Index top repositories by stars (default) or by search query
-    Index {
-        /// Optional search query (default: top repos by stars)
-        #[arg(short, long)]
-        query: Option<String>,
-
-        /// Number of repos to index (default: 50000)
-        #[arg(short, long, default_value = "50000")]
-        count: u32,
-
-        /// Start fresh (ignore checkpoint, re-index from beginning)
-        #[arg(long)]
-        full: bool,
-
-        /// Number of parallel API workers (default: 1, max: 3 to avoid rate limits)
-        #[arg(short, long, default_value = "1")]
-        workers: usize,
-    },
-
     /// Add a specific repository by name (fetches from GitHub)
     Add {
         /// Repository full name (e.g., "qdrant/qdrant")
@@ -90,16 +71,6 @@ enum Commands {
     /// Re-generate embeddings from stored data (no API calls)
     #[command(hide = true)]
     Revectorize,
-
-    /// Crawl awesome-list repos to discover and index linked repositories
-    Crawl {
-        /// Awesome-list repo (e.g., "sindresorhus/awesome" or a URL)
-        source: String,
-
-        /// Maximum repos to index from the list
-        #[arg(short, long, default_value = "1000")]
-        limit: usize,
-    },
 
     /// Import repositories from a file (one "owner/repo" per line)
     Import {
@@ -155,13 +126,6 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Some(Commands::Index { query, count, full, workers }) => {
-            if token.is_none() {
-                eprintln!("\x1b[33m..\x1b[0m No GitHub token found. Rate limit: 60 req/hour");
-                eprintln!("  Set GITHUB_TOKEN or run: gh auth login");
-            }
-            index_repos(&client, &db, &query, count, full, workers).await
-        }
         Some(Commands::Add { repo }) => {
             add_repo(&client, &db, &repo).await
         }
@@ -179,9 +143,6 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Revectorize) => {
             revectorize(&db)
-        }
-        Some(Commands::Crawl { source, limit }) => {
-            crawl_awesome_list(&client, &db, &source, limit).await
         }
         Some(Commands::Import { file, limit, skip }) => {
             import_from_file(&client, &db, &file, limit, skip).await
