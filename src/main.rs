@@ -76,8 +76,8 @@ enum Commands {
         #[arg(short, long)]
         limit: Option<usize>,
 
-        /// Batch size for GraphQL queries (default: 500)
-        #[arg(short, long, default_value = "500")]
+        /// Batch size for GraphQL queries (default: 300, = 10 API chunks of 30)
+        #[arg(short, long, default_value = "300")]
         batch_size: usize,
     },
 
@@ -462,7 +462,7 @@ fn load_repo_stubs(db: &Database, file_path: &str) -> Result<()> {
     // Show next steps
     let need_fetch = db.count_repos_without_metadata()?;
     eprintln!("\x1b[36m..\x1b[0m {} repos now awaiting metadata fetch", need_fetch);
-    eprintln!("    Run: goto-gh fetch --batch-size 500");
+    eprintln!("    Run: goto-gh fetch --batch-size 300");
 
     Ok(())
 }

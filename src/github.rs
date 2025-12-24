@@ -309,8 +309,10 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
         // Build search query with multiple repo: filters (limit to ~30 per query to avoid URL length issues)
         let chunk_size = 30;
         let mut all_repos = Vec::new();
+        let batch_start = std::time::Instant::now();
+        let total_chunks = (repo_names.len() + chunk_size - 1) / chunk_size;
 
-        for chunk in repo_names.chunks(chunk_size) {
+        for (chunk_idx, chunk) in repo_names.chunks(chunk_size).enumerate() {
             let query = chunk.iter()
                 .map(|name| format!("repo:{}", name))
                 .collect::<Vec<_>>()
@@ -327,12 +329,18 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
 
             // Retry with exponential backoff
             let mut last_error = None;
+            let chunk_start = std::time::Instant::now();
             for attempt in 0..5 {
                 if attempt > 0 {
-                    let delay = std::time::Duration::from_millis(500 * (1 << attempt.min(3)));
+                    let delay_ms = 500 * (1 << attempt.min(3));
+                    let delay = std::time::Duration::from_millis(delay_ms);
+                    eprintln!("  \x1b[33m⟳ Retry {}/5 for chunk {}/{} after {}ms ({})\x1b[0m",
+                        attempt + 1, chunk_idx + 1, total_chunks, delay_ms,
+                        last_error.as_deref().unwrap_or("unknown"));
                     tokio::time::sleep(delay).await;
                 }
 
+                let req_start = std::time::Instant::now();
                 let response = match self.client
                     .post("https://api.github.com/graphql")
                     .header("Authorization", format!("Bearer {}", token))
@@ -347,18 +355,20 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                         continue;
                     }
                 };
+                let req_elapsed = req_start.elapsed();
 
                 let status = response.status();
                 if status == reqwest::StatusCode::BAD_GATEWAY
                     || status == reqwest::StatusCode::GATEWAY_TIMEOUT
                     || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
                 {
-                    last_error = Some(format!("GitHub API error {}", status));
+                    last_error = Some(format!("GitHub API error {} ({}ms)", status, req_elapsed.as_millis()));
                     continue;
                 }
 
                 if status == reqwest::StatusCode::FORBIDDEN {
-                    last_error = Some("Rate limited (403)".to_string());
+                    last_error = Some(format!("Rate limited (403) after {}ms", req_elapsed.as_millis()));
+                    eprintln!("  \x1b[31m⚠ Rate limited, waiting 2s...\x1b[0m");
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     continue;
                 }
@@ -375,6 +385,14 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                         continue;
                     }
                 };
+
+                // Log chunk timing (only if slow or had retries)
+                let chunk_elapsed = chunk_start.elapsed();
+                if attempt > 0 || chunk_elapsed.as_millis() > 2000 {
+                    eprintln!("  \x1b[90m✓ Chunk {}/{} completed in {}ms (req: {}ms{})\x1b[0m",
+                        chunk_idx + 1, total_chunks, chunk_elapsed.as_millis(), req_elapsed.as_millis(),
+                        if attempt > 0 { format!(", {} retries", attempt) } else { String::new() });
+                }
 
                 if let Some(errors) = gql_response.errors {
                     let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
@@ -423,6 +441,14 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
             if chunk_size < repo_names.len() {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
+        }
+
+        // Log batch summary (only if took more than 5s or we had multiple chunks)
+        let batch_elapsed = batch_start.elapsed();
+        if batch_elapsed.as_secs() >= 5 || total_chunks > 1 {
+            let avg_per_chunk = batch_elapsed.as_millis() / total_chunks as u128;
+            eprintln!("  \x1b[90m⏱ GraphQL batch: {} repos in {:.1}s ({} chunks, ~{}ms/chunk)\x1b[0m",
+                repo_names.len(), batch_elapsed.as_secs_f32(), total_chunks, avg_per_chunk);
         }
 
         Ok(all_repos)
