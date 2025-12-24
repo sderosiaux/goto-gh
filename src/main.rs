@@ -234,17 +234,17 @@ fn search(query: &str, limit: usize, semantic_only: bool, db: &Database) -> Resu
 
         let display_score = (rrf_score / max_score * 100.0).min(100.0);
 
+        // OSC 8 hyperlink: \x1b]8;;URL\x1b\\TEXT\x1b]8;;\x1b\\
         eprintln!(
-            "\x1b[35m{:>2}.\x1b[0m \x1b[1m{}\x1b[0m \x1b[33m{}\x1b[0m \x1b[90m[{}]\x1b[0m \x1b[90m({:.0}%)\x1b[0m",
+            "\x1b[35m{:>2}.\x1b[0m \x1b]8;;{}\x1b\\\x1b[1m{}\x1b[0m\x1b]8;;\x1b\\ \x1b[33m{}\x1b[0m \x1b[90m[{}]\x1b[0m \x1b[90m({:.0}%)\x1b[0m \x1b[90m{}\x1b[0m",
             i + 1,
+            repo.url,
             repo.full_name,
             stars,
             lang,
-            display_score
+            display_score,
+            desc_truncated
         );
-        eprintln!("    \x1b[90m{}\x1b[0m", desc_truncated);
-        eprintln!("    {}", repo.url);
-        eprintln!();
     }
 
     Ok(())
@@ -295,13 +295,11 @@ fn find_by_name(db: &Database, pattern: &str, limit: usize) -> Result<()> {
         let desc = repo.description.as_deref().unwrap_or("");
         let desc_truncated = truncate_str(desc, 60);
 
+        // OSC 8 hyperlink: \x1b]8;;URL\x1b\\TEXT\x1b]8;;\x1b\\
         eprintln!(
-            "\x1b[1m{}\x1b[0m \x1b[33m{}\x1b[0m \x1b[90m[{}]\x1b[0m",
-            repo.full_name, stars, lang
+            "\x1b]8;;{}\x1b\\\x1b[1m{}\x1b[0m\x1b]8;;\x1b\\ \x1b[33m{}\x1b[0m \x1b[90m[{}]\x1b[0m \x1b[90m{}\x1b[0m",
+            repo.url, repo.full_name, stars, lang, desc_truncated
         );
-        if !desc_truncated.is_empty() {
-            eprintln!("  \x1b[90m{}\x1b[0m", desc_truncated);
-        }
     }
 
     Ok(())
