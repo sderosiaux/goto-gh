@@ -575,4 +575,36 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// Get distinct owners from repos that haven't been explored yet
+    pub fn get_unexplored_owners(&self, limit: Option<usize>) -> Result<Vec<String>> {
+        let sql = match limit {
+            Some(lim) => format!(
+                "SELECT DISTINCT LOWER(substr(full_name, 1, instr(full_name, '/') - 1)) as owner
+                 FROM repos
+                 WHERE owner NOT IN (SELECT owner FROM explored_owners)
+                 LIMIT {}",
+                lim
+            ),
+            None => "SELECT DISTINCT LOWER(substr(full_name, 1, instr(full_name, '/') - 1)) as owner
+                     FROM repos
+                     WHERE owner NOT IN (SELECT owner FROM explored_owners)".to_string(),
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let results = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Count unexplored owners
+    pub fn count_unexplored_owners(&self) -> Result<usize> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(DISTINCT LOWER(substr(full_name, 1, instr(full_name, '/') - 1)))
+             FROM repos
+             WHERE LOWER(substr(full_name, 1, instr(full_name, '/') - 1)) NOT IN (SELECT owner FROM explored_owners)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
 }

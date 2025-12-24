@@ -110,6 +110,21 @@ enum Commands {
         #[arg(short, long, default_value = "5")]
         delay: u64,
     },
+
+    /// Print database file path
+    DbPath,
+
+    /// Discover more repos by exploring owners of existing repos
+    #[command(name = "discover")]
+    Discover {
+        /// Maximum owners to explore (default: all)
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Number of concurrent requests (default: 5)
+        #[arg(short, long, default_value = "5")]
+        concurrency: usize,
+    },
 }
 
 #[tokio::main]
@@ -149,6 +164,13 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Embed { batch_size, limit, delay }) => {
             embed_missing(&db, batch_size, limit, delay)
+        }
+        Some(Commands::DbPath) => {
+            println!("{}", Config::db_path()?.display());
+            Ok(())
+        }
+        Some(Commands::Discover { limit, concurrency }) => {
+            discover_from_owners(&client, &db, limit, concurrency).await
         }
         None => {
             use clap::CommandFactory;
@@ -322,6 +344,83 @@ async fn discover_owner_repos(client: &GitHubClient, db: &Database, full_name: &
             // Don't fail the add if discovery fails, just log it
             eprintln!("  \x1b[33m⚠\x1b[0m Could not discover repos from {}: {}", owner, e);
         }
+    }
+
+    Ok(())
+}
+
+/// Discover more repos by exploring owners of existing repos
+async fn discover_from_owners(
+    client: &GitHubClient,
+    db: &Database,
+    limit: Option<usize>,
+    concurrency: usize,
+) -> Result<()> {
+    let total_unexplored = db.count_unexplored_owners()?;
+
+    if total_unexplored == 0 {
+        println!("\x1b[32mok\x1b[0m All owners already explored");
+        return Ok(());
+    }
+
+    let owners = db.get_unexplored_owners(limit)?;
+    let to_explore = owners.len();
+
+    eprintln!(
+        "\x1b[36m..\x1b[0m Discovering repos from {} owners ({} total unexplored, {} concurrent)",
+        to_explore, total_unexplored, concurrency
+    );
+
+    let mut total_discovered = 0;
+    let mut total_explored = 0;
+    let mut batch_num = 0;
+
+    for chunk in owners.chunks(concurrency) {
+        batch_num += 1;
+        let futures: Vec<_> = chunk
+            .iter()
+            .map(|owner| {
+                let owner = owner.clone();
+                let client = client;
+                async move { (owner.clone(), client.list_owner_repos(&owner).await) }
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+
+        let mut batch_discovered = 0;
+        for (owner, result) in results {
+            total_explored += 1;
+            match result {
+                Ok(repos) => {
+                    let count = repos.len();
+                    let (inserted, _) = db.add_repo_stubs_bulk(&repos)?;
+                    db.mark_owner_explored(&owner, count)?;
+                    batch_discovered += inserted;
+                    total_discovered += inserted;
+                }
+                Err(_) => {
+                    db.mark_owner_explored(&owner, 0)?;
+                }
+            }
+        }
+
+        if batch_discovered > 0 || batch_num % 10 == 0 {
+            eprintln!(
+                "  ... batch {}: explored {} owners, +{} repos (total: {})",
+                batch_num, total_explored, total_discovered, total_explored
+            );
+        }
+    }
+
+    println!(
+        "\x1b[32mok\x1b[0m Explored {} owners, discovered {} new repos",
+        total_explored, total_discovered
+    );
+
+    let still_unexplored = db.count_unexplored_owners()?;
+    if still_unexplored > 0 {
+        eprintln!("\x1b[36m..\x1b[0m {} owners still unexplored", still_unexplored);
     }
 
     Ok(())
