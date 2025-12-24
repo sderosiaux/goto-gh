@@ -104,6 +104,16 @@ impl Database {
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_repos_gone ON repos(gone)", [])?;
         }
 
+        // Table to track explored owners (users/orgs) - avoid re-fetching their repos
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS explored_owners (
+                owner TEXT PRIMARY KEY,
+                repo_count INTEGER DEFAULT 0,
+                explored_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
         Ok(())
     }
 
@@ -544,5 +554,25 @@ impl Database {
         })?;
 
         results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Check if an owner (user/org) has already been explored
+    pub fn is_owner_explored(&self, owner: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM explored_owners WHERE owner = ?1",
+            params![owner.to_lowercase()],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Mark an owner as explored
+    pub fn mark_owner_explored(&self, owner: &str, repo_count: usize) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO explored_owners (owner, repo_count, explored_at) VALUES (?1, ?2, ?3)",
+            params![owner.to_lowercase(), repo_count as i64, now],
+        )?;
+        Ok(())
     }
 }

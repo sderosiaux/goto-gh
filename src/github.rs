@@ -168,6 +168,133 @@ impl GitHubClient {
         let data: RateLimitResponse = response.json().await?;
         Ok(data.rate)
     }
+
+    /// List all public repos for a user or org (paginated, with retry)
+    pub async fn list_owner_repos(&self, owner: &str) -> Result<Vec<String>> {
+        // Try as user first
+        match self.list_repos_paginated(&format!(
+            "https://api.github.com/users/{}/repos?per_page=100&page={{page}}&type=owner",
+            owner
+        )).await {
+            Ok(repos) => return Ok(repos),
+            Err(e) => {
+                // If user not found, try as org
+                let err_str = e.to_string();
+                if err_str.contains("404") {
+                    return self.list_repos_paginated(&format!(
+                        "https://api.github.com/orgs/{}/repos?per_page=100&page={{page}}&type=public",
+                        owner
+                    )).await;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    /// Paginated repo listing with retry logic for transient errors
+    async fn list_repos_paginated(&self, url_template: &str) -> Result<Vec<String>> {
+        let mut all_repos = Vec::new();
+        let mut page = 1;
+        let per_page = 100;
+
+        loop {
+            let url = url_template.replace("{page}", &page.to_string());
+
+            // Retry with exponential backoff for transient errors
+            let mut last_error = None;
+            let mut repos_page: Option<Vec<OwnerRepoInfo>> = None;
+
+            for attempt in 0..5 {
+                if attempt > 0 {
+                    let delay = std::time::Duration::from_millis(500 * (1 << attempt.min(3)));
+                    tokio::time::sleep(delay).await;
+                }
+
+                let response = match self.request(&url).send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        last_error = Some(format!("Request failed: {}", e));
+                        continue;
+                    }
+                };
+
+                let status = response.status();
+
+                // 404 = user/org not found (on first page only)
+                if status == reqwest::StatusCode::NOT_FOUND && page == 1 {
+                    anyhow::bail!("404 not found");
+                }
+
+                // Retry on transient errors (502, 503, 504)
+                if status == reqwest::StatusCode::BAD_GATEWAY
+                    || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+                    || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                {
+                    last_error = Some(format!("GitHub API error {}", status));
+                    continue;
+                }
+
+                // Retry on rate limit (403) with extra delay
+                if status == reqwest::StatusCode::FORBIDDEN {
+                    last_error = Some("Rate limited (403)".to_string());
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+
+                // Other errors: if we have partial results, return them; otherwise fail
+                if !status.is_success() {
+                    if !all_repos.is_empty() {
+                        return Ok(all_repos);
+                    }
+                    anyhow::bail!("GitHub API error {}", status);
+                }
+
+                match response.json::<Vec<OwnerRepoInfo>>().await {
+                    Ok(repos) => {
+                        repos_page = Some(repos);
+                        break;
+                    }
+                    Err(e) => {
+                        last_error = Some(format!("JSON parse error: {}", e));
+                        continue;
+                    }
+                }
+            }
+
+            // All retries exhausted
+            let repos = match repos_page {
+                Some(r) => r,
+                None => {
+                    if !all_repos.is_empty() {
+                        return Ok(all_repos);
+                    }
+                    anyhow::bail!("Failed after 5 retries: {}", last_error.unwrap_or_default());
+                }
+            };
+
+            if repos.is_empty() {
+                break;
+            }
+
+            for repo in &repos {
+                all_repos.push(repo.full_name.clone());
+            }
+
+            if repos.len() < per_page {
+                break;
+            }
+
+            page += 1;
+        }
+
+        Ok(all_repos)
+    }
+}
+
+/// Minimal repo info for listing
+#[derive(Debug, Deserialize)]
+struct OwnerRepoInfo {
+    full_name: String,
 }
 
 #[derive(Debug, Deserialize)]

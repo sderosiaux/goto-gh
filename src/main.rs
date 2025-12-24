@@ -285,6 +285,45 @@ async fn add_repo(client: &GitHubClient, db: &Database, full_name: &str) -> Resu
         println!("  {}", desc);
     }
 
+    // Discover other repos from the same owner (if not already explored)
+    discover_owner_repos(client, db, full_name).await?;
+
+    Ok(())
+}
+
+/// Discover and queue all repos from an owner (user/org) for later fetching
+async fn discover_owner_repos(client: &GitHubClient, db: &Database, full_name: &str) -> Result<()> {
+    let owner = full_name.split('/').next().unwrap_or("");
+    if owner.is_empty() {
+        return Ok(());
+    }
+
+    // Skip if already explored
+    if db.is_owner_explored(owner)? {
+        return Ok(());
+    }
+
+    eprintln!("\x1b[36m..\x1b[0m Discovering repos from {}", owner);
+
+    match client.list_owner_repos(owner).await {
+        Ok(repos) => {
+            let count = repos.len();
+            let (inserted, _skipped) = db.add_repo_stubs_bulk(&repos)?;
+            db.mark_owner_explored(owner, count)?;
+
+            if inserted > 0 {
+                eprintln!(
+                    "  \x1b[90m+{} new repos queued from {} ({} total)\x1b[0m",
+                    inserted, owner, count
+                );
+            }
+        }
+        Err(e) => {
+            // Don't fail the add if discovery fails, just log it
+            eprintln!("  \x1b[33m⚠\x1b[0m Could not discover repos from {}: {}", owner, e);
+        }
+    }
+
     Ok(())
 }
 
