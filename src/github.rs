@@ -82,34 +82,78 @@ impl GitHubClient {
             .context("Failed to parse repo details")
     }
 
-    /// Get README content (decoded)
+    /// Get README content (decoded) with retry logic
     pub async fn get_readme(&self, full_name: &str) -> Result<Option<String>> {
         let url = format!("https://api.github.com/repos/{}/readme", full_name);
 
-        let response = self.request(&url).send().await?;
+        // Retry with exponential backoff for transient errors
+        let mut last_error = None;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                let delay = std::time::Duration::from_millis(500 * (1 << attempt.min(3)));
+                tokio::time::sleep(delay).await;
+            }
 
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
+            let response = match self.request(&url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = Some(format!("Request failed: {}", e));
+                    continue;
+                }
+            };
+
+            let status = response.status();
+
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+
+            // Retry on transient errors (502, 503, 504)
+            if status == reqwest::StatusCode::BAD_GATEWAY
+                || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            {
+                last_error = Some(format!("GitHub API error {}", status));
+                continue;
+            }
+
+            // Retry on rate limit (403) with extra delay
+            if status == reqwest::StatusCode::FORBIDDEN {
+                last_error = Some("Rate limited (403)".to_string());
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+
+            if !status.is_success() {
+                anyhow::bail!("GitHub API error {}: failed to fetch README", status);
+            }
+
+            let readme: ReadmeResponse = match response.json().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = Some(format!("JSON parse error: {}", e));
+                    continue;
+                }
+            };
+
+            if readme.encoding != "base64" {
+                return Ok(None);
+            }
+
+            // Decode base64 content (GitHub sends it with newlines)
+            let cleaned = readme.content.replace('\n', "");
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&cleaned)
+                .context("Failed to decode base64 README")?;
+
+            let text = String::from_utf8(decoded)
+                .context("README is not valid UTF-8")?;
+
+            return Ok(Some(text));
         }
 
-        if !response.status().is_success() {
-            return Ok(None);
-        }
-
-        let readme: ReadmeResponse = response.json().await?;
-
-        if readme.encoding != "base64" {
-            return Ok(None);
-        }
-
-        // Decode base64 content (GitHub sends it with newlines)
-        let cleaned = readme.content.replace('\n', "");
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&cleaned)
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok());
-
-        Ok(decoded)
+        // All retries failed
+        anyhow::bail!("Failed to fetch README after 5 retries: {}", last_error.unwrap_or_default())
     }
 
     /// Check rate limit status
@@ -385,5 +429,138 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
 
         // All retries failed
         anyhow::bail!("GraphQL request failed after 5 retries: {}", last_error.unwrap_or_default())
+    }
+
+    /// Fetch multiple repos by owner/name using GraphQL (batched, efficient)
+    /// Uses the search API with "repo:" filters to fetch up to 100 repos in one call
+    pub async fn fetch_repos_batch(&self, repo_names: &[String]) -> Result<Vec<RepoWithReadme>> {
+        if repo_names.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let token = self.token.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("GraphQL requires authentication"))?;
+
+        // Build search query with multiple repo: filters (limit to ~30 per query to avoid URL length issues)
+        let chunk_size = 30;
+        let mut all_repos = Vec::new();
+
+        for chunk in repo_names.chunks(chunk_size) {
+            let query = chunk.iter()
+                .map(|name| format!("repo:{}", name))
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            let request = GraphQLRequest {
+                query: Self::GRAPHQL_QUERY.to_string(),
+                variables: GraphQLVariables {
+                    query,
+                    first: 100,
+                    after: None,
+                },
+            };
+
+            // Retry with exponential backoff
+            let mut last_error = None;
+            for attempt in 0..5 {
+                if attempt > 0 {
+                    let delay = std::time::Duration::from_millis(500 * (1 << attempt.min(3)));
+                    tokio::time::sleep(delay).await;
+                }
+
+                let response = match self.client
+                    .post("https://api.github.com/graphql")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("User-Agent", "goto-gh/0.1.0")
+                    .json(&request)
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        last_error = Some(format!("Request failed: {}", e));
+                        continue;
+                    }
+                };
+
+                let status = response.status();
+                if status == reqwest::StatusCode::BAD_GATEWAY
+                    || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+                    || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                {
+                    last_error = Some(format!("GitHub API error {}", status));
+                    continue;
+                }
+
+                if status == reqwest::StatusCode::FORBIDDEN {
+                    last_error = Some("Rate limited (403)".to_string());
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    anyhow::bail!("GraphQL error {}: {}", status, body);
+                }
+
+                let gql_response: GraphQLResponse = match response.json().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        last_error = Some(format!("Parse error: {}", e));
+                        continue;
+                    }
+                };
+
+                if let Some(errors) = gql_response.errors {
+                    let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
+                    // Don't fail on partial errors - some repos might not exist
+                    eprintln!("  \x1b[90mGraphQL warnings: {}\x1b[0m", msgs.join(", "));
+                }
+
+                if let Some(data) = gql_response.data {
+                    let repos: Vec<RepoWithReadme> = data.search.nodes
+                        .into_iter()
+                        .filter_map(|node| {
+                            let repo = node?;
+                            let readme = repo.readme
+                                .and_then(|b| b.text)
+                                .or_else(|| repo.readme_lower.and_then(|b| b.text))
+                                .or_else(|| repo.readme_rst.and_then(|b| b.text));
+
+                            Some(RepoWithReadme {
+                                full_name: repo.name_with_owner,
+                                description: repo.description,
+                                html_url: repo.url,
+                                stars: repo.stargazer_count,
+                                language: repo.primary_language.map(|l| l.name),
+                                topics: repo.repository_topics.nodes
+                                    .into_iter()
+                                    .map(|t| t.topic.name)
+                                    .collect(),
+                                fork: repo.is_fork,
+                                readme,
+                                pushed_at: repo.pushed_at,
+                                created_at: repo.created_at,
+                            })
+                        })
+                        .collect();
+
+                    all_repos.extend(repos);
+                }
+
+                break;
+            }
+
+            if last_error.is_some() && all_repos.is_empty() {
+                anyhow::bail!("Failed to fetch repos: {}", last_error.unwrap_or_default());
+            }
+
+            // Small delay between chunks to avoid secondary rate limits
+            if chunk_size < repo_names.len() {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        Ok(all_repos)
     }
 }

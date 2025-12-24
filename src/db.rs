@@ -66,7 +66,8 @@ impl Database {
                 embedded_text TEXT,
                 pushed_at TEXT,
                 created_at TEXT,
-                last_indexed TEXT NOT NULL
+                last_indexed TEXT NOT NULL,
+                gone INTEGER DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_repos_name ON repos(full_name);
@@ -93,6 +94,17 @@ impl Database {
             ),
             [],
         )?;
+
+        // Migration: add gone column if it doesn't exist
+        let has_gone: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('repos') WHERE name = 'gone'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_gone {
+            self.conn.execute("ALTER TABLE repos ADD COLUMN gone INTEGER DEFAULT 0", [])?;
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_repos_gone ON repos(gone)", [])?;
+        }
 
         Ok(())
     }
@@ -419,6 +431,175 @@ impl Database {
         })?;
 
         results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Get repos that have no embeddings yet (for separate embedding step)
+    /// Returns (repo_id, embedded_text) pairs
+    pub fn get_repos_without_embeddings(&self, limit: Option<usize>) -> Result<Vec<(i64, String)>> {
+        let sql = match limit {
+            Some(lim) => format!(
+                "SELECT r.id, r.embedded_text FROM repos r
+                 LEFT JOIN repo_embeddings e ON r.id = e.repo_id
+                 WHERE e.repo_id IS NULL AND r.embedded_text IS NOT NULL
+                 LIMIT {}",
+                lim
+            ),
+            None => "SELECT r.id, r.embedded_text FROM repos r
+                     LEFT JOIN repo_embeddings e ON r.id = e.repo_id
+                     WHERE e.repo_id IS NULL AND r.embedded_text IS NOT NULL".to_string(),
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let results = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Upsert repo metadata only (no embedding) - for fetch-only mode
+    pub fn upsert_repo_metadata_only(&self, repo: &RepoWithReadme, embedded_text: &str) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        let topics_json = serde_json::to_string(&repo.topics)?;
+
+        self.conn.execute(
+            "INSERT INTO repos (full_name, description, url, stars, language, topics, readme_excerpt, embedded_text, pushed_at, created_at, last_indexed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(full_name) DO UPDATE SET
+                 description = ?2,
+                 url = ?3,
+                 stars = ?4,
+                 language = ?5,
+                 topics = ?6,
+                 readme_excerpt = ?7,
+                 embedded_text = ?8,
+                 pushed_at = ?9,
+                 created_at = ?10,
+                 last_indexed = ?11",
+            params![
+                repo.full_name,
+                repo.description,
+                repo.html_url,
+                repo.stars as i64,
+                repo.language,
+                topics_json,
+                repo.readme.as_deref(),
+                embedded_text,
+                repo.pushed_at,
+                repo.created_at,
+                now,
+            ],
+        )?;
+
+        let id = self.conn.query_row(
+            "SELECT id FROM repos WHERE full_name = ?",
+            [&repo.full_name],
+            |row| row.get(0),
+        )?;
+
+        Ok(id)
+    }
+
+    /// Count repos without embeddings
+    pub fn count_repos_without_embeddings(&self) -> Result<usize> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM repos r
+             LEFT JOIN repo_embeddings e ON r.id = e.repo_id
+             WHERE e.repo_id IS NULL AND r.embedded_text IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Add a repo stub (just the name) - no metadata, no embedding
+    /// Used for bulk loading repo names before fetching metadata
+    pub fn add_repo_stub(&self, full_name: &str) -> Result<bool> {
+        // Only insert if not exists - don't update existing repos
+        let result = self.conn.execute(
+            "INSERT OR IGNORE INTO repos (full_name, url, last_indexed)
+             VALUES (?1, ?2, ?3)",
+            params![
+                full_name,
+                format!("https://github.com/{}", full_name),
+                "1970-01-01T00:00:00Z", // Ancient date = needs fetch
+            ],
+        )?;
+        Ok(result > 0) // true if inserted, false if already existed
+    }
+
+    /// Bulk add repo stubs (optimized for large imports)
+    pub fn add_repo_stubs_bulk(&self, names: &[String]) -> Result<(usize, usize)> {
+        let mut inserted = 0;
+        let mut skipped = 0;
+
+        for name in names {
+            if self.add_repo_stub(name)? {
+                inserted += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+
+        Ok((inserted, skipped))
+    }
+
+    /// Get repos that need metadata fetch (have no embedded_text = never fetched, and not gone)
+    pub fn get_repos_without_metadata(&self, limit: Option<usize>) -> Result<Vec<String>> {
+        let sql = match limit {
+            Some(lim) => format!(
+                "SELECT full_name FROM repos WHERE embedded_text IS NULL AND gone = 0 LIMIT {}",
+                lim
+            ),
+            None => "SELECT full_name FROM repos WHERE embedded_text IS NULL AND gone = 0".to_string(),
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let results = stmt.query_map([], |row| row.get::<_, String>(0))?;
+
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Count repos without metadata (excluding gone repos)
+    pub fn count_repos_without_metadata(&self) -> Result<usize> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM repos WHERE embedded_text IS NULL AND gone = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Mark a repo as gone (deleted/renamed on GitHub)
+    pub fn mark_as_gone(&self, full_name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE repos SET gone = 1 WHERE full_name = ?",
+            [full_name],
+        )?;
+        Ok(())
+    }
+
+    /// Mark multiple repos as gone (batch)
+    pub fn mark_as_gone_bulk(&self, names: &[String]) -> Result<usize> {
+        let mut count = 0;
+        for name in names {
+            self.conn.execute(
+                "UPDATE repos SET gone = 1 WHERE full_name = ?",
+                [name],
+            )?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Count repos marked as gone
+    pub fn count_gone(&self) -> Result<usize> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM repos WHERE gone = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
     }
 
     /// Find repos by name match (strongest signal for hybrid search)

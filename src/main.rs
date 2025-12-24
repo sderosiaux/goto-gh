@@ -59,10 +59,16 @@ enum Commands {
         workers: usize,
     },
 
-    /// Add a specific repository by name
+    /// Add a specific repository by name (fetches from GitHub)
     Add {
         /// Repository full name (e.g., "qdrant/qdrant")
         repo: String,
+    },
+
+    /// Load repo names from file into DB (no GitHub fetch, just stores names)
+    Load {
+        /// Path to file containing repo names (one per line)
+        file: String,
     },
 
     /// Show index statistics
@@ -84,6 +90,52 @@ enum Commands {
     /// Re-generate embeddings from stored data (no API calls)
     #[command(hide = true)]
     Revectorize,
+
+    /// Crawl awesome-list repos to discover and index linked repositories
+    Crawl {
+        /// Awesome-list repo (e.g., "sindresorhus/awesome" or a URL)
+        source: String,
+
+        /// Maximum repos to index from the list
+        #[arg(short, long, default_value = "1000")]
+        limit: usize,
+    },
+
+    /// Import repositories from a file (one "owner/repo" per line)
+    Import {
+        /// Path to file containing repo names (one per line)
+        file: String,
+
+        /// Number of repos to process (default: all)
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Skip first N repos (for resuming)
+        #[arg(short, long, default_value = "0")]
+        skip: usize,
+    },
+
+    /// Fetch metadata from GitHub for repos in DB that don't have it yet
+    Fetch {
+        /// Number of repos to fetch (default: all pending)
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Batch size for GraphQL queries (default: 500)
+        #[arg(short, long, default_value = "500")]
+        batch_size: usize,
+    },
+
+    /// Generate embeddings for repos that don't have them yet
+    Embed {
+        /// Batch size for embedding (default: 1000)
+        #[arg(short, long, default_value = "1000")]
+        batch_size: usize,
+
+        /// Maximum repos to embed (default: all)
+        #[arg(short, long)]
+        limit: Option<usize>,
+    },
 }
 
 #[tokio::main]
@@ -110,6 +162,9 @@ async fn main() -> Result<()> {
         Some(Commands::Add { repo }) => {
             add_repo(&client, &db, &repo).await
         }
+        Some(Commands::Load { file }) => {
+            load_repo_stubs(&db, &file)
+        }
         Some(Commands::Stats) => {
             show_stats(&db)
         }
@@ -121,6 +176,18 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Revectorize) => {
             revectorize(&db)
+        }
+        Some(Commands::Crawl { source, limit }) => {
+            crawl_awesome_list(&client, &db, &source, limit).await
+        }
+        Some(Commands::Import { file, limit, skip }) => {
+            import_from_file(&client, &db, &file, limit, skip).await
+        }
+        Some(Commands::Fetch { limit, batch_size }) => {
+            fetch_from_db(&client, &db, limit, batch_size).await
+        }
+        Some(Commands::Embed { batch_size, limit }) => {
+            embed_missing(&db, batch_size, limit)
         }
         None => {
             use clap::CommandFactory;
@@ -558,10 +625,26 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 /// Show statistics
 fn show_stats(db: &Database) -> Result<()> {
     let (total, indexed) = db.stats()?;
+    let without_metadata = db.count_repos_without_metadata()?;
+    let without_embeddings = db.count_repos_without_embeddings()?;
+    let gone = db.count_gone()?;
 
     eprintln!("\x1b[36mIndex Statistics\x1b[0m\n");
-    eprintln!("  \x1b[90mTotal repos:\x1b[0m   {}", total);
-    eprintln!("  \x1b[90mWith embeddings:\x1b[0m {}", indexed);
+    eprintln!("  \x1b[90mTotal repos:\x1b[0m        {}", total);
+    eprintln!("  \x1b[90mWith metadata:\x1b[0m      {}", total - without_metadata - gone);
+    eprintln!("  \x1b[90mWith embeddings:\x1b[0m    {}", indexed);
+    eprintln!();
+    eprintln!("  \x1b[90mNeed metadata:\x1b[0m      {}", without_metadata);
+    eprintln!("  \x1b[90mNeed embeddings:\x1b[0m    {}", without_embeddings);
+    if gone > 0 {
+        eprintln!("  \x1b[90mGone (deleted):\x1b[0m     {}", gone);
+    }
+
+    if without_metadata > 0 {
+        eprintln!("\n  \x1b[33mTip:\x1b[0m Run: goto-gh fetch");
+    } else if without_embeddings > 0 {
+        eprintln!("\n  \x1b[33mTip:\x1b[0m Run: goto-gh embed");
+    }
 
     Ok(())
 }
@@ -679,6 +762,725 @@ fn format_stars(stars: u64) -> String {
     } else {
         format!("{}", stars)
     }
+}
+
+/// Crawl an awesome-list to discover and index linked repos
+async fn crawl_awesome_list(client: &GitHubClient, db: &Database, source: &str, limit: usize) -> Result<()> {
+    // Parse source - could be "owner/repo" or a full URL
+    let repo_name = if source.starts_with("http") {
+        // Extract owner/repo from URL like https://github.com/sindresorhus/awesome
+        source
+            .trim_end_matches('/')
+            .rsplit('/')
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("/")
+    } else {
+        source.to_string()
+    };
+
+    eprintln!("\x1b[36m..\x1b[0m Fetching README from {} via GraphQL...", repo_name);
+
+    // Fetch the README via GraphQL (more efficient, separate rate limit)
+    let source_repos = match client.fetch_repos_batch(&[repo_name.clone()]).await {
+        Ok(repos) => repos,
+        Err(e) => {
+            eprintln!("\x1b[31mx\x1b[0m Failed to fetch source repo {}: {}", repo_name, e);
+            return Ok(());
+        }
+    };
+
+    let readme = match source_repos.into_iter().next() {
+        Some(repo) => match repo.readme {
+            Some(content) => content,
+            None => {
+                eprintln!("\x1b[31mx\x1b[0m No README found for {}", repo_name);
+                return Ok(());
+            }
+        },
+        None => {
+            eprintln!("\x1b[31mx\x1b[0m Repository {} not found", repo_name);
+            return Ok(());
+        }
+    };
+
+    // Extract GitHub repo links from markdown
+    let repo_links = extract_github_repos(&readme);
+    let unique_repos: std::collections::HashSet<_> = repo_links.into_iter().collect();
+
+    eprintln!("\x1b[36m..\x1b[0m Found {} unique GitHub repos in README", unique_repos.len());
+
+    if unique_repos.is_empty() {
+        return Ok(());
+    }
+
+    // Filter out already-fresh repos first
+    let mut indexed = 0;
+    let mut skipped = 0;
+    let mut errors = 0;
+
+    let all_repos: Vec<_> = unique_repos.into_iter().take(limit).collect();
+    let repos_to_fetch: Vec<_> = all_repos
+        .iter()
+        .filter(|name| !db.is_fresh(name, 7).unwrap_or(false))
+        .cloned()
+        .collect();
+
+    skipped = all_repos.len() - repos_to_fetch.len();
+
+    if repos_to_fetch.is_empty() {
+        eprintln!(
+            "\x1b[32mok\x1b[0m Crawled {} - {} repos all fresh (skipped)",
+            source, skipped
+        );
+        return Ok(());
+    }
+
+    eprintln!(
+        "\x1b[36m..\x1b[0m Fetching {} repos via GraphQL ({} already fresh)...",
+        repos_to_fetch.len(),
+        skipped
+    );
+
+    // Fetch all repos via GraphQL in batches (much more efficient than REST)
+    let fetched_repos = match client.fetch_repos_batch(&repos_to_fetch).await {
+        Ok(repos) => repos,
+        Err(e) => {
+            eprintln!("\x1b[31mx\x1b[0m Failed to fetch repos: {}", e);
+            return Ok(());
+        }
+    };
+
+    eprintln!(
+        "\x1b[36m..\x1b[0m Processing {} fetched repos...",
+        fetched_repos.len()
+    );
+
+    // Convert RepoWithReadme to the format expected by db.upsert_repo
+    for repo in fetched_repos {
+        let text = build_embedding_text(
+            &repo.full_name,
+            repo.description.as_deref(),
+            &repo.topics,
+            repo.language.as_deref(),
+            repo.readme.as_deref(),
+        );
+
+        match embed_text(&text) {
+            Ok(embedding) => {
+                // Create a GitHubRepo from the GraphQL response
+                let github_repo = github::GitHubRepo {
+                    full_name: repo.full_name.clone(),
+                    description: repo.description.clone(),
+                    html_url: repo.html_url.clone(),
+                    stargazers_count: repo.stars,
+                    language: repo.language.clone(),
+                    topics: repo.topics.clone(),
+                };
+
+                let repo_id = db.upsert_repo(&github_repo, repo.readme.as_deref(), &text)?;
+                db.upsert_embedding(repo_id, &embedding)?;
+                indexed += 1;
+            }
+            Err(e) => {
+                eprintln!("  \x1b[31mx\x1b[0m {} - embedding error: {}", repo.full_name, e);
+                errors += 1;
+            }
+        }
+    }
+
+    // Count repos we couldn't find
+    let not_found = repos_to_fetch.len() - indexed - errors;
+    if not_found > 0 {
+        errors += not_found;
+    }
+
+    eprintln!(
+        "\x1b[32mok\x1b[0m Crawled {} - indexed {} new, {} skipped, {} errors",
+        source, indexed, skipped, errors
+    );
+
+    Ok(())
+}
+
+/// Import repos from a file (one "owner/repo" per line)
+async fn import_from_file(
+    client: &GitHubClient,
+    db: &Database,
+    file_path: &str,
+    limit: Option<usize>,
+    skip: usize,
+) -> Result<()> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    // Read file
+    let file = File::open(file_path)?;
+    let reader = BufReader::new(file);
+
+    let all_repos: Vec<String> = reader
+        .lines()
+        .filter_map(|l| l.ok())
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && l.contains('/'))
+        .skip(skip)
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+
+    let total = all_repos.len();
+    eprintln!(
+        "\x1b[36m..\x1b[0m Importing {} repos from {} (skip: {}, limit: {:?})",
+        total, file_path, skip, limit
+    );
+
+    if total == 0 {
+        eprintln!("\x1b[33m..\x1b[0m No repos to import");
+        return Ok(());
+    }
+
+    // Filter out repos already in DB (fresh within 7 days)
+    let repos_to_fetch: Vec<String> = all_repos
+        .iter()
+        .filter(|name| !db.is_fresh(name, 7).unwrap_or(false))
+        .cloned()
+        .collect();
+
+    let skipped = total - repos_to_fetch.len();
+    eprintln!(
+        "\x1b[36m..\x1b[0m {} repos to fetch ({} already fresh)",
+        repos_to_fetch.len(), skipped
+    );
+
+    if repos_to_fetch.is_empty() {
+        eprintln!("\x1b[32mok\x1b[0m All {} repos already indexed", total);
+        return Ok(());
+    }
+
+    // Process in batches
+    const BATCH_SIZE: usize = 500;
+    const EMBED_BATCH_SIZE: usize = 1000;
+
+    let mut indexed = 0;
+    let mut errors = 0;
+    let mut pending_embed: Vec<(github::RepoWithReadme, String)> = Vec::new();
+
+    for (batch_idx, batch) in repos_to_fetch.chunks(BATCH_SIZE).enumerate() {
+        let batch_start = batch_idx * BATCH_SIZE + skip;
+        eprintln!(
+            "\x1b[36m..\x1b[0m Batch {}: fetching repos {}-{} via GraphQL...",
+            batch_idx + 1,
+            batch_start,
+            batch_start + batch.len()
+        );
+
+        // Fetch via GraphQL
+        let fetched_repos = match client.fetch_repos_batch(batch).await {
+            Ok(repos) => repos,
+            Err(e) => {
+                eprintln!("\x1b[31mx\x1b[0m Batch {} failed: {}", batch_idx + 1, e);
+                errors += batch.len();
+                continue;
+            }
+        };
+
+        // Accumulate for embedding
+        let fetched_count = fetched_repos.len();
+        for repo in fetched_repos {
+            let text = build_embedding_text(
+                &repo.full_name,
+                repo.description.as_deref(),
+                &repo.topics,
+                repo.language.as_deref(),
+                repo.readme.as_deref(),
+            );
+            pending_embed.push((repo, text));
+        }
+
+        // Record repos we couldn't find
+        errors += batch.len() - fetched_count;
+
+        // Flush embeddings if we have enough
+        if pending_embed.len() >= EMBED_BATCH_SIZE {
+            let batch_len = pending_embed.len();
+            let texts: Vec<String> = pending_embed.iter().map(|(_, t)| t.clone()).collect();
+            let repos_to_embed: Vec<_> = pending_embed.drain(..).collect();
+
+            eprintln!("  ... embedding {} repos...", batch_len);
+            let embeddings = embed_texts(&texts)?;
+
+            for ((repo, text), embedding) in repos_to_embed.into_iter().zip(embeddings) {
+                let github_repo = github::GitHubRepo {
+                    full_name: repo.full_name.clone(),
+                    description: repo.description.clone(),
+                    html_url: repo.html_url.clone(),
+                    stargazers_count: repo.stars,
+                    language: repo.language.clone(),
+                    topics: repo.topics.clone(),
+                };
+
+                let repo_id = db.upsert_repo(&github_repo, repo.readme.as_deref(), &text)?;
+                db.upsert_embedding(repo_id, &embedding)?;
+                indexed += 1;
+            }
+            eprintln!("  ... indexed {} total", indexed);
+        }
+
+        // Small delay between batches to avoid rate limits
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Flush remaining
+    if !pending_embed.is_empty() {
+        let batch_len = pending_embed.len();
+        let texts: Vec<String> = pending_embed.iter().map(|(_, t)| t.clone()).collect();
+        let repos_to_embed: Vec<_> = pending_embed.drain(..).collect();
+
+        eprintln!("  ... embedding final {} repos...", batch_len);
+        let embeddings = embed_texts(&texts)?;
+
+        for ((repo, text), embedding) in repos_to_embed.into_iter().zip(embeddings) {
+            let github_repo = github::GitHubRepo {
+                full_name: repo.full_name.clone(),
+                description: repo.description.clone(),
+                html_url: repo.html_url.clone(),
+                stargazers_count: repo.stars,
+                language: repo.language.clone(),
+                topics: repo.topics.clone(),
+            };
+
+            let repo_id = db.upsert_repo(&github_repo, repo.readme.as_deref(), &text)?;
+            db.upsert_embedding(repo_id, &embedding)?;
+            indexed += 1;
+        }
+    }
+
+    eprintln!(
+        "\x1b[32mok\x1b[0m Imported {} new repos ({} skipped, {} errors)",
+        indexed, skipped, errors
+    );
+
+    Ok(())
+}
+
+/// Fetch repos from file without generating embeddings (metadata-only)
+async fn fetch_from_file(
+    client: &GitHubClient,
+    db: &Database,
+    file_path: &str,
+    limit: Option<usize>,
+    skip: usize,
+) -> Result<()> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    // Read file
+    let file = File::open(file_path)?;
+    let reader = BufReader::new(file);
+
+    let all_repos: Vec<String> = reader
+        .lines()
+        .filter_map(|l| l.ok())
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && l.contains('/'))
+        .skip(skip)
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+
+    let total = all_repos.len();
+    eprintln!(
+        "\x1b[36m..\x1b[0m Fetching {} repos from {} (skip: {}, limit: {:?}) - NO EMBEDDINGS",
+        total, file_path, skip, limit
+    );
+
+    if total == 0 {
+        eprintln!("\x1b[33m..\x1b[0m No repos to fetch");
+        return Ok(());
+    }
+
+    // Filter out repos already in DB (fresh within 7 days)
+    let repos_to_fetch: Vec<String> = all_repos
+        .iter()
+        .filter(|name| !db.is_fresh(name, 7).unwrap_or(false))
+        .cloned()
+        .collect();
+
+    let skipped = total - repos_to_fetch.len();
+    eprintln!(
+        "\x1b[36m..\x1b[0m {} repos to fetch ({} already fresh)",
+        repos_to_fetch.len(), skipped
+    );
+
+    if repos_to_fetch.is_empty() {
+        eprintln!("\x1b[32mok\x1b[0m All {} repos already indexed", total);
+        return Ok(());
+    }
+
+    // Process in batches (larger since we're not embedding)
+    const BATCH_SIZE: usize = 500;
+
+    let mut stored = 0;
+    let mut errors = 0;
+
+    for (batch_idx, batch) in repos_to_fetch.chunks(BATCH_SIZE).enumerate() {
+        let batch_start = batch_idx * BATCH_SIZE + skip;
+        eprintln!(
+            "\x1b[36m..\x1b[0m Batch {}: fetching repos {}-{} via GraphQL...",
+            batch_idx + 1,
+            batch_start,
+            batch_start + batch.len()
+        );
+
+        // Fetch via GraphQL
+        let fetched_repos = match client.fetch_repos_batch(batch).await {
+            Ok(repos) => repos,
+            Err(e) => {
+                eprintln!("\x1b[31mx\x1b[0m Batch {} failed: {}", batch_idx + 1, e);
+                errors += batch.len();
+                continue;
+            }
+        };
+
+        // Store metadata without embedding
+        let fetched_count = fetched_repos.len();
+        for repo in fetched_repos {
+            let text = build_embedding_text(
+                &repo.full_name,
+                repo.description.as_deref(),
+                &repo.topics,
+                repo.language.as_deref(),
+                repo.readme.as_deref(),
+            );
+
+            // Store metadata + embedded_text but NO embedding
+            db.upsert_repo_metadata_only(&repo, &text)?;
+            stored += 1;
+        }
+
+        // Record repos we couldn't find
+        errors += batch.len() - fetched_count;
+
+        eprintln!("  ... stored {} repos (total: {})", fetched_count, stored);
+
+        // Small delay between batches to avoid rate limits
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    eprintln!(
+        "\x1b[32mok\x1b[0m Fetched {} repos ({} skipped, {} errors) - ready for embedding",
+        stored, skipped, errors
+    );
+
+    // Show how many need embedding
+    let need_embed = db.count_repos_without_embeddings()?;
+    eprintln!("\x1b[36m..\x1b[0m {} repos now awaiting embeddings", need_embed);
+    eprintln!("    Run: goto-gh embed --batch-size 1000");
+
+    Ok(())
+}
+
+/// Load repo stubs from file (no API calls, just stores names in DB)
+fn load_repo_stubs(db: &Database, file_path: &str) -> Result<()> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(file_path)?;
+    let reader = BufReader::new(file);
+
+    let all_repos: Vec<String> = reader
+        .lines()
+        .filter_map(|l| l.ok())
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && l.contains('/'))
+        .collect();
+
+    let total = all_repos.len();
+    eprintln!(
+        "\x1b[36m..\x1b[0m Loading {} repo names from {} (no GitHub API calls)",
+        total, file_path
+    );
+
+    if total == 0 {
+        eprintln!("\x1b[33m..\x1b[0m No repos to load");
+        return Ok(());
+    }
+
+    // Process in batches for progress reporting
+    const BATCH_SIZE: usize = 10000;
+    let mut total_inserted = 0;
+    let mut total_skipped = 0;
+
+    for (batch_idx, batch) in all_repos.chunks(BATCH_SIZE).enumerate() {
+        let batch_vec: Vec<String> = batch.to_vec();
+        let (inserted, skipped) = db.add_repo_stubs_bulk(&batch_vec)?;
+        total_inserted += inserted;
+        total_skipped += skipped;
+
+        if (batch_idx + 1) % 10 == 0 || batch_idx == 0 {
+            let processed = (batch_idx + 1) * BATCH_SIZE;
+            eprintln!(
+                "  ... processed {}/{} (+{} new, {} dupe)",
+                processed.min(total), total, inserted, skipped
+            );
+        }
+    }
+
+    eprintln!(
+        "\x1b[32mok\x1b[0m Loaded {} new repos ({} already existed)",
+        total_inserted, total_skipped
+    );
+
+    // Show next steps
+    let need_fetch = db.count_repos_without_metadata()?;
+    eprintln!("\x1b[36m..\x1b[0m {} repos now awaiting metadata fetch", need_fetch);
+    eprintln!("    Run: goto-gh fetch --batch-size 500");
+
+    Ok(())
+}
+
+/// Fetch metadata from GitHub for repos in DB that don't have it yet
+async fn fetch_from_db(
+    client: &GitHubClient,
+    db: &Database,
+    limit: Option<usize>,
+    batch_size: usize,
+) -> Result<()> {
+    let need_fetch = db.count_repos_without_metadata()?;
+
+    if need_fetch == 0 {
+        eprintln!("\x1b[32mok\x1b[0m All repos already have metadata");
+        return Ok(());
+    }
+
+    let to_fetch = limit.map(|l| l.min(need_fetch)).unwrap_or(need_fetch);
+    eprintln!(
+        "\x1b[36m..\x1b[0m Fetching metadata for {} repos (batch size: {}) - NO EMBEDDINGS",
+        to_fetch, batch_size
+    );
+
+    let mut stored = 0;
+    let mut errors = 0;
+    let mut batch_num = 0;
+
+    while stored + errors < to_fetch {
+        batch_num += 1;
+        let remaining = to_fetch - stored - errors;
+        let this_batch_size = remaining.min(batch_size);
+
+        // Get next batch of repos without metadata
+        let repos_to_fetch = db.get_repos_without_metadata(Some(this_batch_size))?;
+
+        if repos_to_fetch.is_empty() {
+            break;
+        }
+
+        eprintln!(
+            "\x1b[36m..\x1b[0m Batch {}: fetching {} repos via GraphQL...",
+            batch_num, repos_to_fetch.len()
+        );
+
+        // Fetch via GraphQL
+        let fetched_repos = match client.fetch_repos_batch(&repos_to_fetch).await {
+            Ok(repos) => repos,
+            Err(e) => {
+                eprintln!("\x1b[31mx\x1b[0m Batch {} failed: {}", batch_num, e);
+                errors += repos_to_fetch.len();
+                continue;
+            }
+        };
+
+        // Store metadata without embedding
+        let fetched_count = fetched_repos.len();
+        let fetched_names: std::collections::HashSet<_> = fetched_repos
+            .iter()
+            .map(|r| r.full_name.to_lowercase())
+            .collect();
+
+        let mut discovered_repos: Vec<String> = Vec::new();
+
+        for repo in fetched_repos {
+            let text = build_embedding_text(
+                &repo.full_name,
+                repo.description.as_deref(),
+                &repo.topics,
+                repo.language.as_deref(),
+                repo.readme.as_deref(),
+            );
+
+            db.upsert_repo_metadata_only(&repo, &text)?;
+            stored += 1;
+
+            // Extract linked repos from README for organic growth
+            if let Some(readme) = &repo.readme {
+                let linked = extract_github_repos(readme);
+                discovered_repos.extend(linked);
+            }
+        }
+
+        // Mark repos that weren't found as gone (deleted/renamed)
+        let missing: Vec<String> = repos_to_fetch
+            .iter()
+            .filter(|name| !fetched_names.contains(&name.to_lowercase()))
+            .cloned()
+            .collect();
+
+        if !missing.is_empty() {
+            let gone_count = db.mark_as_gone_bulk(&missing)?;
+            errors += gone_count;
+            eprintln!("  ... marked {} repos as gone (deleted/renamed)", gone_count);
+        }
+
+        eprintln!("  ... stored {} repos (total: {})", fetched_count, stored);
+
+        // Add discovered repos as stubs for organic growth
+        if !discovered_repos.is_empty() {
+            let unique_discovered: std::collections::HashSet<_> = discovered_repos.into_iter().collect();
+            let discovered_vec: Vec<String> = unique_discovered.into_iter().collect();
+            let (added, _) = db.add_repo_stubs_bulk(&discovered_vec)?;
+            if added > 0 {
+                eprintln!("  ... discovered {} new repos from READMEs", added);
+            }
+        }
+
+        // Small delay between batches to avoid rate limits
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Report total discovered
+    let total_discovered = db.count_repos_without_metadata()?;
+
+    eprintln!(
+        "\x1b[32mok\x1b[0m Fetched {} repos ({} errors) - ready for embedding",
+        stored, errors
+    );
+
+    // Show how many need embedding
+    let need_embed = db.count_repos_without_embeddings()?;
+    eprintln!("\x1b[36m..\x1b[0m {} repos now awaiting embeddings", need_embed);
+    eprintln!("    Run: goto-gh embed --batch-size 1000");
+
+    Ok(())
+}
+
+/// Generate embeddings for repos that don't have them yet
+fn embed_missing(db: &Database, batch_size: usize, limit: Option<usize>) -> Result<()> {
+    let need_embed = db.count_repos_without_embeddings()?;
+
+    if need_embed == 0 {
+        eprintln!("\x1b[32mok\x1b[0m All repos already have embeddings");
+        return Ok(());
+    }
+
+    let to_process = limit.map(|l| l.min(need_embed)).unwrap_or(need_embed);
+    eprintln!(
+        "\x1b[36m..\x1b[0m Generating embeddings for {} repos (batch size: {})",
+        to_process, batch_size
+    );
+
+    let mut total_embedded = 0;
+    let mut offset = 0;
+
+    while total_embedded < to_process {
+        // Fetch a batch of repos without embeddings
+        let remaining = to_process - total_embedded;
+        let this_batch_size = remaining.min(batch_size);
+
+        let repos = db.get_repos_without_embeddings(Some(this_batch_size))?;
+
+        if repos.is_empty() {
+            break;
+        }
+
+        let batch_len = repos.len();
+        eprintln!(
+            "\x1b[36m..\x1b[0m Batch {}: embedding {} repos...",
+            offset / batch_size + 1,
+            batch_len
+        );
+
+        // Extract texts for batch embedding
+        let texts: Vec<String> = repos.iter().map(|(_, text)| text.clone()).collect();
+        let repo_ids: Vec<i64> = repos.iter().map(|(id, _)| *id).collect();
+
+        // Generate embeddings in batch
+        let embeddings = embed_texts(&texts)?;
+
+        // Store embeddings
+        for (repo_id, embedding) in repo_ids.into_iter().zip(embeddings) {
+            db.upsert_embedding(repo_id, &embedding)?;
+        }
+
+        total_embedded += batch_len;
+        offset += batch_len;
+
+        eprintln!(
+            "  ... embedded {} (total: {}/{})",
+            batch_len, total_embedded, to_process
+        );
+
+        // Pause between batches to avoid overloading the embedding API
+        if total_embedded < to_process {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    }
+
+    eprintln!(
+        "\x1b[32mok\x1b[0m Generated embeddings for {} repos",
+        total_embedded
+    );
+
+    // Show remaining
+    let still_need = db.count_repos_without_embeddings()?;
+    if still_need > 0 {
+        eprintln!("\x1b[36m..\x1b[0m {} repos still awaiting embeddings", still_need);
+    }
+
+    Ok(())
+}
+
+/// Extract GitHub repo names from markdown content
+fn extract_github_repos(markdown: &str) -> Vec<String> {
+    let mut repos = Vec::new();
+
+    // Match patterns like:
+    // - https://github.com/owner/repo
+    // - [text](https://github.com/owner/repo)
+    // - github.com/owner/repo
+
+    let re_patterns = [
+        r"https?://github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)",
+        r"github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)",
+    ];
+
+    for pattern in re_patterns {
+        for cap in regex_lite::Regex::new(pattern)
+            .unwrap()
+            .captures_iter(markdown)
+        {
+            if let Some(m) = cap.get(1) {
+                let repo = m.as_str();
+                // Filter out non-repo paths (issues, pulls, blob, tree, etc.)
+                if !repo.contains('/')
+                    || repo.ends_with(".git")
+                    || repo.split('/').nth(1).map_or(true, |s| {
+                        ["issues", "pull", "blob", "tree", "wiki", "releases", "actions", "discussions"]
+                            .contains(&s.split('/').next().unwrap_or(""))
+                            || s.contains('#')
+                            || s.contains('?')
+                    })
+                {
+                    continue;
+                }
+
+                // Clean up: take only owner/repo part
+                let parts: Vec<&str> = repo.split('/').take(2).collect();
+                if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                    repos.push(format!("{}/{}", parts[0], parts[1]));
+                }
+            }
+        }
+    }
+
+    repos
 }
 
 /// Animated dots spinner
