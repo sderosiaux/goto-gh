@@ -83,13 +83,17 @@ enum Commands {
 
     /// Generate embeddings for repos that don't have them yet
     Embed {
-        /// Batch size for embedding (default: 1000)
-        #[arg(short, long, default_value = "1000")]
+        /// Batch size for embedding (default: 200)
+        #[arg(short, long, default_value = "200")]
         batch_size: usize,
 
         /// Maximum repos to embed (default: all)
         #[arg(short, long)]
         limit: Option<usize>,
+
+        /// Delay between batches in seconds (default: 5)
+        #[arg(short, long, default_value = "5")]
+        delay: u64,
     },
 }
 
@@ -128,8 +132,8 @@ async fn main() -> Result<()> {
         Some(Commands::Fetch { limit, batch_size }) => {
             fetch_from_db(&client, &db, limit, batch_size).await
         }
-        Some(Commands::Embed { batch_size, limit }) => {
-            embed_missing(&db, batch_size, limit)
+        Some(Commands::Embed { batch_size, limit, delay }) => {
+            embed_missing(&db, batch_size, limit, delay)
         }
         None => {
             use clap::CommandFactory;
@@ -576,13 +580,13 @@ async fn fetch_from_db(
     // Show how many need embedding
     let need_embed = db.count_repos_without_embeddings()?;
     eprintln!("\x1b[36m..\x1b[0m {} repos now awaiting embeddings", need_embed);
-    eprintln!("    Run: goto-gh embed --batch-size 1000");
+    eprintln!("    Run: goto-gh embed --batch-size 200 --delay 5");
 
     Ok(())
 }
 
 /// Generate embeddings for repos that don't have them yet
-fn embed_missing(db: &Database, batch_size: usize, limit: Option<usize>) -> Result<()> {
+fn embed_missing(db: &Database, batch_size: usize, limit: Option<usize>, delay_secs: u64) -> Result<()> {
     let need_embed = db.count_repos_without_embeddings()?;
 
     if need_embed == 0 {
@@ -638,8 +642,9 @@ fn embed_missing(db: &Database, batch_size: usize, limit: Option<usize>) -> Resu
         );
 
         // Pause between batches to avoid overloading the embedding API
-        if total_embedded < to_process {
-            std::thread::sleep(std::time::Duration::from_secs(3));
+        if total_embedded < to_process && delay_secs > 0 {
+            eprintln!("  \x1b[90m⏳ Waiting {}s before next batch...\x1b[0m", delay_secs);
+            std::thread::sleep(std::time::Duration::from_secs(delay_secs));
         }
     }
 
