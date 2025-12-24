@@ -16,8 +16,6 @@ pub struct Repo {
     pub url: String,
     pub stars: u64,
     pub language: Option<String>,
-    pub pushed_at: Option<String>,
-    pub created_at: Option<String>,
 }
 
 pub struct Database {
@@ -148,49 +146,6 @@ impl Database {
         Ok(id)
     }
 
-    /// Insert or update a repository from GraphQL result (includes README)
-    pub fn upsert_repo_with_readme(&self, repo: &RepoWithReadme, readme_excerpt: Option<&str>, embedded_text: &str) -> Result<i64> {
-        let now = Utc::now().to_rfc3339();
-        let topics_json = serde_json::to_string(&repo.topics)?;
-
-        self.conn.execute(
-            "INSERT INTO repos (full_name, description, url, stars, language, topics, readme_excerpt, embedded_text, pushed_at, created_at, last_indexed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(full_name) DO UPDATE SET
-                 description = ?2,
-                 url = ?3,
-                 stars = ?4,
-                 language = ?5,
-                 topics = ?6,
-                 readme_excerpt = ?7,
-                 embedded_text = ?8,
-                 pushed_at = ?9,
-                 created_at = ?10,
-                 last_indexed = ?11",
-            params![
-                repo.full_name,
-                repo.description,
-                repo.html_url,
-                repo.stars as i64,
-                repo.language,
-                topics_json,
-                readme_excerpt,
-                embedded_text,
-                repo.pushed_at,
-                repo.created_at,
-                now,
-            ],
-        )?;
-
-        let id = self.conn.query_row(
-            "SELECT id FROM repos WHERE full_name = ?",
-            [&repo.full_name],
-            |row| row.get(0),
-        )?;
-
-        Ok(id)
-    }
-
     /// Store embedding for a repo
     pub fn upsert_embedding(&self, repo_id: i64, embedding: &[f32]) -> Result<()> {
         self.conn.execute(
@@ -226,7 +181,7 @@ impl Database {
     /// Get repo by ID
     pub fn get_repo_by_id(&self, id: i64) -> Result<Option<Repo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT full_name, description, url, stars, language, pushed_at, created_at FROM repos WHERE id = ?",
+            "SELECT full_name, description, url, stars, language FROM repos WHERE id = ?",
         )?;
 
         let result = stmt
@@ -237,26 +192,11 @@ impl Database {
                     url: row.get(2)?,
                     stars: row.get::<_, i64>(3)? as u64,
                     language: row.get(4)?,
-                    pushed_at: row.get(5)?,
-                    created_at: row.get(6)?,
                 })
             })
             .optional()?;
 
         Ok(result)
-    }
-
-    /// Check if repo exists and is fresh (indexed within N days)
-    pub fn is_fresh(&self, full_name: &str, max_age_days: i64) -> Result<bool> {
-        let cutoff = (Utc::now() - chrono::Duration::days(max_age_days)).to_rfc3339();
-
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM repos WHERE full_name = ? AND last_indexed > ?",
-            params![full_name, cutoff],
-            |row| row.get(0),
-        )?;
-
-        Ok(count > 0)
     }
 
     /// Get statistics
@@ -312,68 +252,11 @@ impl Database {
         Ok(())
     }
 
-    /// Get index checkpoint (star range index, cursor, total fetched)
-    pub fn get_checkpoint(&self) -> Result<Option<(usize, Option<String>, usize)>> {
-        let result = self
-            .conn
-            .query_row(
-                "SELECT last_star_range_idx, last_cursor, total_fetched FROM index_checkpoints WHERE id = 1",
-                [],
-                |row| Ok((
-                    row.get::<_, i64>(0)? as usize,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, i64>(2)? as usize,
-                )),
-            )
-            .optional()?;
-        Ok(result)
-    }
-
-    /// Save index checkpoint
-    pub fn save_checkpoint(&self, star_range_idx: usize, cursor: Option<&str>, total_fetched: usize) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        self.conn.execute(
-            "INSERT INTO index_checkpoints (id, last_star_range_idx, last_cursor, total_fetched, updated_at)
-             VALUES (1, ?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET
-                 last_star_range_idx = ?1,
-                 last_cursor = ?2,
-                 total_fetched = ?3,
-                 updated_at = ?4",
-            params![star_range_idx as i64, cursor, total_fetched as i64, now],
-        )?;
-        Ok(())
-    }
-
-    /// Clear checkpoint (for fresh indexing)
-    pub fn clear_checkpoint(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM index_checkpoints WHERE id = 1", [])?;
-        Ok(())
-    }
-
-    /// Get minimum stars count from existing repos (for checkpoint inference)
-    pub fn get_min_stars(&self) -> Result<Option<u64>> {
-        let result = self
-            .conn
-            .query_row("SELECT MIN(stars) FROM repos", [], |row| row.get::<_, Option<i64>>(0))
-            .optional()?
-            .flatten();
-        Ok(result.map(|s| s as u64))
-    }
-
-    /// Get count of existing repos
-    pub fn get_repo_count(&self) -> Result<usize> {
-        let count: usize = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM repos", [], |row| row.get(0))?;
-        Ok(count)
-    }
-
     /// Fuzzy search repos by name (case-insensitive LIKE)
     pub fn find_by_name(&self, pattern: &str, limit: usize) -> Result<Vec<Repo>> {
         let pattern = format!("%{}%", pattern);
         let mut stmt = self.conn.prepare(
-            "SELECT full_name, description, url, stars, language, pushed_at, created_at
+            "SELECT full_name, description, url, stars, language
              FROM repos
              WHERE full_name LIKE ?1 COLLATE NOCASE
              ORDER BY stars DESC
@@ -387,8 +270,6 @@ impl Database {
                 url: row.get(2)?,
                 stars: row.get::<_, i64>(3)? as u64,
                 language: row.get(4)?,
-                pushed_at: row.get(5)?,
-                created_at: row.get(6)?,
             })
         })?;
 
@@ -570,15 +451,6 @@ impl Database {
         Ok(count)
     }
 
-    /// Mark a repo as gone (deleted/renamed on GitHub)
-    pub fn mark_as_gone(&self, full_name: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE repos SET gone = 1 WHERE full_name = ?",
-            [full_name],
-        )?;
-        Ok(())
-    }
-
     /// Mark multiple repos as gone (batch)
     pub fn mark_as_gone_bulk(&self, names: &[String]) -> Result<usize> {
         let mut count = 0;
@@ -596,28 +468,6 @@ impl Database {
     pub fn count_gone(&self) -> Result<usize> {
         let count: usize = self.conn.query_row(
             "SELECT COUNT(*) FROM repos WHERE gone = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count)
-    }
-
-    /// Get all READMEs from repos that have them (for repo discovery)
-    /// Returns iterator over (full_name, readme_excerpt) pairs
-    pub fn get_all_readmes(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT full_name, readme_excerpt FROM repos WHERE readme_excerpt IS NOT NULL AND readme_excerpt != ''"
-        )?;
-        let results = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
-    /// Count repos with READMEs
-    pub fn count_repos_with_readme(&self) -> Result<usize> {
-        let count: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM repos WHERE readme_excerpt IS NOT NULL AND readme_excerpt != ''",
             [],
             |row| row.get(0),
         )?;

@@ -22,7 +22,6 @@ pub struct RepoWithReadme {
     pub stars: u64,
     pub language: Option<String>,
     pub topics: Vec<String>,
-    pub fork: bool,
     pub readme: Option<String>,
     pub pushed_at: Option<String>,
     pub created_at: Option<String>,
@@ -217,15 +216,7 @@ struct GraphQLData {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphQLSearch {
-    page_info: PageInfo,
     nodes: Vec<Option<GraphQLRepo>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PageInfo {
-    has_next_page: bool,
-    end_cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,7 +228,6 @@ struct GraphQLRepo {
     stargazer_count: u64,
     primary_language: Option<PrimaryLanguage>,
     repository_topics: RepositoryTopics,
-    is_fork: bool,
     pushed_at: Option<String>,
     created_at: Option<String>,
     readme: Option<BlobContent>,
@@ -289,7 +279,6 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
         repositoryTopics(first: 10) {
           nodes { topic { name } }
         }
-        isFork
         pushedAt
         createdAt
         readme: object(expression: "HEAD:README.md") {
@@ -306,130 +295,6 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
   }
 }
 "#;
-
-    /// Search repos with GraphQL - returns repos WITH readme in single call
-    pub async fn search_repos_graphql(
-        &self,
-        query: &str,
-        count: u32,
-        after: Option<String>,
-    ) -> Result<(Vec<RepoWithReadme>, Option<String>, bool)> {
-        let token = self.token.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("GraphQL requires authentication"))?;
-
-        let request = GraphQLRequest {
-            query: Self::GRAPHQL_QUERY.to_string(),
-            variables: GraphQLVariables {
-                query: format!("{} sort:stars-desc", query),
-                first: count.min(100),
-                after,
-            },
-        };
-
-        // Retry with exponential backoff for transient errors (502, 504, etc.)
-        let mut last_error = None;
-        for attempt in 0..8 {
-            if attempt > 0 {
-                let delay = std::time::Duration::from_millis(1000 * (1 << attempt.min(4)));
-                tokio::time::sleep(delay).await;
-            }
-
-            let response = match self.client
-                .post("https://api.github.com/graphql")
-                .header("Authorization", format!("Bearer {}", token))
-                .header("User-Agent", "goto-gh/0.1.0")
-                .json(&request)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    last_error = Some(format!("Request failed: {}", e));
-                    continue;
-                }
-            };
-
-            let status = response.status();
-            // Retry on transient errors (502, 503, 504)
-            if status == reqwest::StatusCode::BAD_GATEWAY
-                || status == reqwest::StatusCode::GATEWAY_TIMEOUT
-                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            {
-                last_error = Some(format!("GitHub API error {}", status));
-                continue;
-            }
-
-            // Retry on secondary rate limit (403) with longer backoff
-            if status == reqwest::StatusCode::FORBIDDEN {
-                let body = response.text().await.unwrap_or_default();
-                if body.contains("secondary rate limit") {
-                    last_error = Some(format!("Secondary rate limit hit"));
-                    // Extra delay for rate limit
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    continue;
-                }
-                anyhow::bail!("GraphQL error {}: {}", status, body);
-            }
-
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                anyhow::bail!("GraphQL error {}: {}", status, body);
-            }
-
-            let gql_response: GraphQLResponse = match response.json().await {
-                Ok(r) => r,
-                Err(e) => {
-                    last_error = Some(format!("Parse error: {}", e));
-                    continue;
-                }
-            };
-
-            if let Some(errors) = gql_response.errors {
-                let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
-                anyhow::bail!("GraphQL errors: {}", msgs.join(", "));
-            }
-
-            let data = gql_response.data
-                .ok_or_else(|| anyhow::anyhow!("No data in GraphQL response"))?;
-
-            let repos: Vec<RepoWithReadme> = data.search.nodes
-                .into_iter()
-                .filter_map(|node| {
-                    let repo = node?;
-
-                    // Get README from any of the common locations
-                    let readme = repo.readme
-                        .and_then(|b| b.text)
-                        .or_else(|| repo.readme_lower.and_then(|b| b.text))
-                        .or_else(|| repo.readme_rst.and_then(|b| b.text));
-
-                    Some(RepoWithReadme {
-                        full_name: repo.name_with_owner,
-                        description: repo.description,
-                        html_url: repo.url,
-                        stars: repo.stargazer_count,
-                        language: repo.primary_language.map(|l| l.name),
-                        topics: repo.repository_topics.nodes
-                            .into_iter()
-                            .map(|t| t.topic.name)
-                            .collect(),
-                        fork: repo.is_fork,
-                        readme,
-                        pushed_at: repo.pushed_at,
-                        created_at: repo.created_at,
-                    })
-                })
-                .collect();
-
-            let has_next = data.search.page_info.has_next_page;
-            let cursor = data.search.page_info.end_cursor;
-
-            return Ok((repos, cursor, has_next));
-        }
-
-        // All retries failed
-        anyhow::bail!("GraphQL request failed after 5 retries: {}", last_error.unwrap_or_default())
-    }
 
     /// Fetch multiple repos by owner/name using GraphQL (batched, efficient)
     /// Uses the search API with "repo:" filters to fetch up to 100 repos in one call
@@ -537,7 +402,6 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                                     .into_iter()
                                     .map(|t| t.topic.name)
                                     .collect(),
-                                fork: repo.is_fork,
                                 readme,
                                 pushed_at: repo.pushed_at,
                                 created_at: repo.created_at,
