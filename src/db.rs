@@ -602,6 +602,28 @@ impl Database {
         Ok(count)
     }
 
+    /// Get all READMEs from repos that have them (for repo discovery)
+    /// Returns iterator over (full_name, readme_excerpt) pairs
+    pub fn get_all_readmes(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT full_name, readme_excerpt FROM repos WHERE readme_excerpt IS NOT NULL AND readme_excerpt != ''"
+        )?;
+        let results = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Count repos with READMEs
+    pub fn count_repos_with_readme(&self) -> Result<usize> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM repos WHERE readme_excerpt IS NOT NULL AND readme_excerpt != ''",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Find repos by name match (strongest signal for hybrid search)
     /// Prioritizes: exact repo name > word boundary matches > substring matches
     pub fn find_by_name_match(&self, query: &str, limit: usize) -> Result<Vec<i64>> {

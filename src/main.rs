@@ -136,6 +136,9 @@ enum Commands {
         #[arg(short, long)]
         limit: Option<usize>,
     },
+
+    /// Discover new repos by parsing all READMEs in the database
+    Discover,
 }
 
 #[tokio::main]
@@ -188,6 +191,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Embed { batch_size, limit }) => {
             embed_missing(&db, batch_size, limit)
+        }
+        Some(Commands::Discover) => {
+            discover_from_readmes(&db)
         }
         None => {
             use clap::CommandFactory;
@@ -1295,7 +1301,7 @@ async fn fetch_from_db(
             .map(|r| r.full_name.to_lowercase())
             .collect();
 
-        let mut discovered_repos: Vec<String> = Vec::new();
+        let mut total_discovered = 0;
 
         for repo in fetched_repos {
             let text = build_embedding_text(
@@ -1309,10 +1315,9 @@ async fn fetch_from_db(
             db.upsert_repo_metadata_only(&repo, &text)?;
             stored += 1;
 
-            // Extract linked repos from README for organic growth
+            // Extract linked repos from README for organic growth (like a web scraper)
             if let Some(readme) = &repo.readme {
-                let linked = extract_github_repos(readme);
-                discovered_repos.extend(linked);
+                total_discovered += discover_repos_from_readme(db, readme);
             }
         }
 
@@ -1331,14 +1336,8 @@ async fn fetch_from_db(
 
         eprintln!("  ... stored {} repos (total: {})", fetched_count, stored);
 
-        // Add discovered repos as stubs for organic growth
-        if !discovered_repos.is_empty() {
-            let unique_discovered: std::collections::HashSet<_> = discovered_repos.into_iter().collect();
-            let discovered_vec: Vec<String> = unique_discovered.into_iter().collect();
-            let (added, _) = db.add_repo_stubs_bulk(&discovered_vec)?;
-            if added > 0 {
-                eprintln!("  ... discovered {} new repos from READMEs", added);
-            }
+        if total_discovered > 0 {
+            eprintln!("  ... discovered {} new repos from READMEs", total_discovered);
         }
 
         // Small delay between batches to avoid rate limits
@@ -1437,6 +1436,53 @@ fn embed_missing(db: &Database, batch_size: usize, limit: Option<usize>) -> Resu
     Ok(())
 }
 
+/// Discover new repos by parsing all READMEs in the database
+fn discover_from_readmes(db: &Database) -> Result<()> {
+    let readme_count = db.count_repos_with_readme()?;
+
+    if readme_count == 0 {
+        eprintln!("\x1b[33m..\x1b[0m No READMEs in database. Run 'goto-gh fetch' first.");
+        return Ok(());
+    }
+
+    eprintln!(
+        "\x1b[36m..\x1b[0m Scanning {} READMEs for GitHub repo links...",
+        readme_count
+    );
+
+    let readmes = db.get_all_readmes()?;
+    let mut all_discovered: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (_full_name, readme) in &readmes {
+        let repos = extract_github_repos(readme);
+        all_discovered.extend(repos);
+    }
+
+    if all_discovered.is_empty() {
+        eprintln!("\x1b[33m..\x1b[0m No new repos found in READMEs");
+        return Ok(());
+    }
+
+    eprintln!(
+        "\x1b[36m..\x1b[0m Found {} unique repo references, adding as stubs...",
+        all_discovered.len()
+    );
+
+    let discovered_vec: Vec<String> = all_discovered.into_iter().collect();
+    let (added, skipped) = db.add_repo_stubs_bulk(&discovered_vec)?;
+
+    eprintln!(
+        "\x1b[32mok\x1b[0m Discovered {} new repos ({} already existed)",
+        added, skipped
+    );
+
+    if added > 0 {
+        eprintln!("\x1b[36m..\x1b[0m Run 'goto-gh fetch' to get metadata for discovered repos");
+    }
+
+    Ok(())
+}
+
 /// Extract GitHub repo names from markdown content
 fn extract_github_repos(markdown: &str) -> Vec<String> {
     let mut repos = Vec::new();
@@ -1481,6 +1527,23 @@ fn extract_github_repos(markdown: &str) -> Vec<String> {
     }
 
     repos
+}
+
+/// Discover and add repo stubs from a single README
+/// Returns the number of new repos added
+fn discover_repos_from_readme(db: &Database, readme: &str) -> usize {
+    let linked = extract_github_repos(readme);
+    if linked.is_empty() {
+        return 0;
+    }
+
+    let unique: std::collections::HashSet<_> = linked.into_iter().collect();
+    let repos_vec: Vec<String> = unique.into_iter().collect();
+
+    match db.add_repo_stubs_bulk(&repos_vec) {
+        Ok((added, _)) => added,
+        Err(_) => 0,
+    }
 }
 
 /// Animated dots spinner
