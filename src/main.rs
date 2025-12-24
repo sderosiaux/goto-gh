@@ -32,6 +32,10 @@ struct Cli {
     #[arg(short, long, default_value = "10")]
     limit: usize,
 
+    /// Semantic-only search (disable name/keyword boosting)
+    #[arg(short, long)]
+    semantic: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -107,7 +111,7 @@ async fn main() -> Result<()> {
     // If query provided, do semantic search
     if !cli.query.is_empty() {
         let query = cli.query.join(" ");
-        return search(&query, cli.limit, &db);
+        return search(&query, cli.limit, cli.semantic, &db);
     }
 
     match cli.command {
@@ -145,7 +149,7 @@ async fn main() -> Result<()> {
 }
 
 /// Hybrid search (semantic + keyword + name match with RRF fusion)
-fn search(query: &str, limit: usize, db: &Database) -> Result<()> {
+fn search(query: &str, limit: usize, semantic_only: bool, db: &Database) -> Result<()> {
     let (_total, indexed) = db.stats()?;
 
     if indexed == 0 {
@@ -154,17 +158,26 @@ fn search(query: &str, limit: usize, db: &Database) -> Result<()> {
         std::process::exit(1);
     }
 
-    let dots = Dots::start(&format!("Searching {} repos (hybrid)", indexed));
+    let mode = if semantic_only { "semantic" } else { "hybrid" };
+    let dots = Dots::start(&format!("Searching {} repos ({})", indexed, mode));
 
     // 1. Semantic search via embeddings
     let query_embedding = embed_text(query)?;
     let vector_results = db.find_similar(&query_embedding, limit * 3)?;
 
     // 2. Name match search (strongest signal - repos with query in name)
-    let name_results = db.find_by_name_match(query, limit * 3)?;
+    let name_results = if semantic_only {
+        vec![]
+    } else {
+        db.find_by_name_match(query, limit * 3)?
+    };
 
     // 3. Content keyword search via LIKE on embedded_text
-    let keyword_results = db.find_by_keywords(query, limit * 3)?;
+    let keyword_results = if semantic_only {
+        vec![]
+    } else {
+        db.find_by_keywords(query, limit * 3)?
+    };
 
     dots.stop();
 
@@ -201,8 +214,12 @@ fn search(query: &str, limit: usize, db: &Database) -> Result<()> {
     combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Display results
-    // Max theoretical score: 1/21 + 1/61 + 1/81 ≈ 0.072
-    let max_score = 1.0 / (k_name + 1.0) + 1.0 / (k_vector + 1.0) + 1.0 / (k_keyword + 1.0);
+    // Max score depends on mode
+    let max_score = if semantic_only {
+        1.0 / (k_vector + 1.0)  // Only vector contributes
+    } else {
+        1.0 / (k_name + 1.0) + 1.0 / (k_vector + 1.0) + 1.0 / (k_keyword + 1.0)
+    };
 
     for (i, (repo_id, rrf_score)) in combined.iter().take(limit).enumerate() {
         let repo = match db.get_repo_by_id(*repo_id)? {
