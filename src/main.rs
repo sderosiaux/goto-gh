@@ -27,6 +27,16 @@ fn format_repo_link(name: &str, url: &str) -> String {
     }
 }
 
+/// Format owner name as clickable hyperlink (checks stderr since discover outputs there)
+fn format_owner_link(name: &str, url: &str) -> String {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        format!("\x1b]8;;{}\x1b\\\x1b[1m{}\x1b[0m\x1b]8;;\x1b\\", url, name)
+    } else {
+        name.to_string()
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "goto-gh")]
 #[command(about = "Semantic search for GitHub repositories")]
@@ -373,10 +383,8 @@ async fn discover_from_owners(
 
     let mut total_discovered = 0;
     let mut total_explored = 0;
-    let mut batch_num = 0;
 
     for chunk in owners.chunks(concurrency) {
-        batch_num += 1;
         let futures: Vec<_> = chunk
             .iter()
             .map(|owner| {
@@ -388,28 +396,35 @@ async fn discover_from_owners(
 
         let results = futures::future::join_all(futures).await;
 
-        let mut batch_discovered = 0;
         for (owner, result) in results {
             total_explored += 1;
+            let owner_url = format!("https://github.com/{}", owner);
+            let owner_link = format_owner_link(&owner, &owner_url);
+
             match result {
                 Ok(repos) => {
                     let count = repos.len();
                     let (inserted, _) = db.add_repo_stubs_bulk(&repos)?;
                     db.mark_owner_explored(&owner, count)?;
-                    batch_discovered += inserted;
                     total_discovered += inserted;
+
+                    if inserted > 0 {
+                        eprintln!(
+                            "  {} \x1b[32m+{}\x1b[0m new ({} total repos)",
+                            owner_link, inserted, count
+                        );
+                    } else {
+                        eprintln!(
+                            "  {} \x1b[90m{} repos (all known)\x1b[0m",
+                            owner_link, count
+                        );
+                    }
                 }
-                Err(_) => {
+                Err(e) => {
                     db.mark_owner_explored(&owner, 0)?;
+                    eprintln!("  {} \x1b[31mx\x1b[0m {}", owner_link, e);
                 }
             }
-        }
-
-        if batch_discovered > 0 || batch_num % 10 == 0 {
-            eprintln!(
-                "  ... batch {}: explored {} owners, +{} repos (total: {})",
-                batch_num, total_explored, total_discovered, total_explored
-            );
         }
     }
 
