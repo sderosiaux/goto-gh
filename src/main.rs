@@ -567,7 +567,10 @@ async fn check_rate_limit(client: &GitHubClient) -> Result<()> {
 
     let format_reset = |reset: u64| {
         chrono::DateTime::from_timestamp(reset as i64, 0)
-            .map(|dt| dt.format("%H:%M:%S").to_string())
+            .map(|dt| {
+                let local = dt.with_timezone(&chrono::Local);
+                local.format("%H:%M:%S").to_string()
+            })
             .unwrap_or_else(|| "?".to_string())
     };
 
