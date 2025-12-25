@@ -364,8 +364,20 @@ async fn discover_from_owners(
     client: &GitHubClient,
     db: &Database,
     limit: Option<usize>,
-    concurrency: usize,
+    _concurrency: usize,
 ) -> Result<()> {
+    // First, check for any interrupted (in-progress) owners and resume them
+    let in_progress = db.get_in_progress_owners()?;
+    if !in_progress.is_empty() {
+        eprintln!(
+            "\x1b[33m..\x1b[0m Resuming {} interrupted owner(s)",
+            in_progress.len()
+        );
+        for owner in &in_progress {
+            discover_single_owner(client, db, owner).await?;
+        }
+    }
+
     let total_unexplored = db.count_unexplored_owners()?;
 
     if total_unexplored == 0 {
@@ -377,55 +389,17 @@ async fn discover_from_owners(
     let to_explore = owners.len();
 
     eprintln!(
-        "\x1b[36m..\x1b[0m Discovering repos from {} owners ({} total unexplored, {} concurrent)",
-        to_explore, total_unexplored, concurrency
+        "\x1b[36m..\x1b[0m Discovering repos from {} owners ({} total unexplored)",
+        to_explore, total_unexplored
     );
 
     let mut total_discovered = 0;
     let mut total_explored = 0;
 
-    for chunk in owners.chunks(concurrency) {
-        let futures: Vec<_> = chunk
-            .iter()
-            .map(|owner| {
-                let owner = owner.clone();
-                let client = client;
-                async move { (owner.clone(), client.list_owner_repos(&owner).await) }
-            })
-            .collect();
-
-        let results = futures::future::join_all(futures).await;
-
-        for (owner, result) in results {
-            total_explored += 1;
-            let owner_url = format!("https://github.com/{}", owner);
-            let owner_link = format_owner_link(&owner, &owner_url);
-
-            match result {
-                Ok(repos) => {
-                    let count = repos.len();
-                    let (inserted, _) = db.add_repo_stubs_bulk(&repos)?;
-                    db.mark_owner_explored(&owner, count)?;
-                    total_discovered += inserted;
-
-                    if inserted > 0 {
-                        eprintln!(
-                            "  {} \x1b[32m+{}\x1b[0m new ({} total repos)",
-                            owner_link, inserted, count
-                        );
-                    } else {
-                        eprintln!(
-                            "  {} \x1b[90m{} repos (all known)\x1b[0m",
-                            owner_link, count
-                        );
-                    }
-                }
-                Err(e) => {
-                    db.mark_owner_explored(&owner, 0)?;
-                    eprintln!("  {} \x1b[31mx\x1b[0m {}", owner_link, e);
-                }
-            }
-        }
+    for owner in owners {
+        let discovered = discover_single_owner(client, db, &owner).await?;
+        total_discovered += discovered;
+        total_explored += 1;
     }
 
     println!(
@@ -439,6 +413,88 @@ async fn discover_from_owners(
     }
 
     Ok(())
+}
+
+/// Discover repos from a single owner with streaming saves and per-page progress
+async fn discover_single_owner(
+    client: &GitHubClient,
+    db: &Database,
+    owner: &str,
+) -> Result<usize> {
+    use std::cell::RefCell;
+    use std::io::IsTerminal;
+
+    let owner_url = format!("https://github.com/{}", owner);
+    let owner_link = format_owner_link(owner, &owner_url);
+    let is_tty = std::io::stderr().is_terminal();
+
+    // Mark as in-progress before starting (for resume support)
+    db.mark_owner_in_progress(owner)?;
+
+    // Track inserted repos across pages
+    let inserted_count = RefCell::new(0usize);
+    let total_repos = RefCell::new(0usize);
+    let last_page = RefCell::new(0usize);
+
+    // Use streaming to save repos as we fetch each page
+    let result = client
+        .list_owner_repos_streaming(owner, |repos, progress| {
+            // Save this page's repos to DB immediately
+            let (inserted, _) = db.add_repo_stubs_bulk(&repos)?;
+            *inserted_count.borrow_mut() += inserted;
+            *total_repos.borrow_mut() = progress.total_so_far;
+            *last_page.borrow_mut() = progress.page;
+
+            // Show per-page progress for large owners
+            if is_tty && progress.page > 1 {
+                eprint!(
+                    "\r  {} \x1b[90mpage {} ({} repos, +{} new)...\x1b[0m\x1b[K",
+                    owner_link, progress.page, progress.total_so_far, *inserted_count.borrow()
+                );
+                let _ = std::io::stderr().flush();
+            }
+
+            Ok(())
+        })
+        .await;
+
+    // Clear the progress line if we printed any
+    if is_tty && *last_page.borrow() > 1 {
+        eprint!("\r\x1b[K");
+    }
+
+    let inserted = *inserted_count.borrow();
+    let total = *total_repos.borrow();
+
+    match result {
+        Ok(_) => {
+            db.mark_owner_explored(owner, total)?;
+
+            if inserted > 0 {
+                eprintln!(
+                    "  {} \x1b[32m+{}\x1b[0m new ({} total repos)",
+                    owner_link, inserted, total
+                );
+            } else if total > 0 {
+                eprintln!(
+                    "  {} \x1b[90m{} repos (all known)\x1b[0m",
+                    owner_link, total
+                );
+            } else {
+                eprintln!("  {} \x1b[90mempty\x1b[0m", owner_link);
+            }
+            Ok(inserted)
+        }
+        Err(e) => {
+            // Even on error, we may have saved some repos - mark as explored with what we got
+            db.mark_owner_explored(owner, total)?;
+            eprintln!(
+                "  {} \x1b[31mx\x1b[0m {} (saved {} repos before error)",
+                owner_link, e, total
+            );
+            Ok(inserted)
+        }
+    }
 }
 
 /// Fuzzy search by repo name
@@ -950,3 +1006,4 @@ impl Drop for Dots {
         self.running.store(false, Ordering::Relaxed);
     }
 }
+

@@ -171,29 +171,63 @@ impl GitHubClient {
 
     /// List all public repos for a user or org (paginated, with retry)
     pub async fn list_owner_repos(&self, owner: &str) -> Result<Vec<String>> {
+        let mut all = Vec::new();
+        self.list_owner_repos_streaming(owner, |repos, _progress| {
+            all.extend(repos);
+            Ok(())
+        }).await?;
+        Ok(all)
+    }
+
+    /// List repos with streaming: calls on_page for each page of results
+    /// This allows saving repos to DB as we fetch them (resumable)
+    pub async fn list_owner_repos_streaming<F>(
+        &self,
+        owner: &str,
+        mut on_page: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(Vec<String>, DiscoveryProgress) -> Result<()>,
+    {
         // Try as user first
-        match self.list_repos_paginated(&format!(
-            "https://api.github.com/users/{}/repos?per_page=100&page={{page}}&type=owner",
-            owner
-        )).await {
-            Ok(repos) => return Ok(repos),
+        match self.list_repos_paginated_streaming(
+            owner,
+            &format!(
+                "https://api.github.com/users/{}/repos?per_page=100&page={{page}}&type=owner",
+                owner
+            ),
+            &mut on_page,
+        ).await {
+            Ok(count) => return Ok(count),
             Err(e) => {
                 // If user not found, try as org
                 let err_str = e.to_string();
                 if err_str.contains("404") {
-                    return self.list_repos_paginated(&format!(
-                        "https://api.github.com/orgs/{}/repos?per_page=100&page={{page}}&type=public",
-                        owner
-                    )).await;
+                    return self.list_repos_paginated_streaming(
+                        owner,
+                        &format!(
+                            "https://api.github.com/orgs/{}/repos?per_page=100&page={{page}}&type=public",
+                            owner
+                        ),
+                        &mut on_page,
+                    ).await;
                 }
                 return Err(e);
             }
         }
     }
 
-    /// Paginated repo listing with retry logic for transient errors
-    async fn list_repos_paginated(&self, url_template: &str) -> Result<Vec<String>> {
-        let mut all_repos = Vec::new();
+    /// Paginated repo listing with streaming callback and retry logic
+    async fn list_repos_paginated_streaming<F>(
+        &self,
+        owner: &str,
+        url_template: &str,
+        on_page: &mut F,
+    ) -> Result<usize>
+    where
+        F: FnMut(Vec<String>, DiscoveryProgress) -> Result<()>,
+    {
+        let mut total_repos = 0;
         let mut page = 1;
         let per_page = 100;
 
@@ -243,8 +277,8 @@ impl GitHubClient {
 
                 // Other errors: if we have partial results, return them; otherwise fail
                 if !status.is_success() {
-                    if !all_repos.is_empty() {
-                        return Ok(all_repos);
+                    if total_repos > 0 {
+                        return Ok(total_repos);
                     }
                     anyhow::bail!("GitHub API error {}", status);
                 }
@@ -265,8 +299,8 @@ impl GitHubClient {
             let repos = match repos_page {
                 Some(r) => r,
                 None => {
-                    if !all_repos.is_empty() {
-                        return Ok(all_repos);
+                    if total_repos > 0 {
+                        return Ok(total_repos);
                     }
                     anyhow::bail!("Failed after 5 retries: {}", last_error.unwrap_or_default());
                 }
@@ -276,18 +310,27 @@ impl GitHubClient {
                 break;
             }
 
-            for repo in &repos {
-                all_repos.push(repo.full_name.clone());
-            }
+            let repo_names: Vec<String> = repos.iter().map(|r| r.full_name.clone()).collect();
+            let count = repo_names.len();
+            total_repos += count;
 
-            if repos.len() < per_page {
+            // Call the streaming callback with this page's repos
+            let progress = DiscoveryProgress {
+                owner: owner.to_string(),
+                page,
+                repos_this_page: count,
+                total_so_far: total_repos,
+            };
+            on_page(repo_names, progress)?;
+
+            if count < per_page {
                 break;
             }
 
             page += 1;
         }
 
-        Ok(all_repos)
+        Ok(total_repos)
     }
 }
 
@@ -295,6 +338,15 @@ impl GitHubClient {
 #[derive(Debug, Deserialize)]
 struct OwnerRepoInfo {
     full_name: String,
+}
+
+/// Progress update for streaming repo discovery
+#[derive(Debug, Clone)]
+pub struct DiscoveryProgress {
+    pub owner: String,
+    pub page: usize,
+    pub repos_this_page: usize,
+    pub total_so_far: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -513,13 +565,11 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                     }
                 };
 
-                // Log chunk timing (only if slow or had retries)
+                // Log chunk timing
                 let chunk_elapsed = chunk_start.elapsed();
-                if attempt > 0 || chunk_elapsed.as_millis() > 2000 {
-                    eprintln!("  \x1b[90m✓ Chunk {}/{} completed in {}ms (req: {}ms{})\x1b[0m",
-                        chunk_idx + 1, total_chunks, chunk_elapsed.as_millis(), req_elapsed.as_millis(),
-                        if attempt > 0 { format!(", {} retries", attempt) } else { String::new() });
-                }
+                eprintln!("  \x1b[90m✓ Chunk {}/{} completed in {}ms (req: {}ms{})\x1b[0m",
+                    chunk_idx + 1, total_chunks, chunk_elapsed.as_millis(), req_elapsed.as_millis(),
+                    if attempt > 0 { format!(", {} retries", attempt) } else { String::new() });
 
                 if let Some(errors) = gql_response.errors {
                     let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();

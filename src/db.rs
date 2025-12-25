@@ -114,6 +114,16 @@ impl Database {
             [],
         )?;
 
+        // Add status column to explored_owners for resume support
+        let has_status: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('explored_owners') WHERE name = 'status'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_status {
+            self.conn.execute("ALTER TABLE explored_owners ADD COLUMN status TEXT DEFAULT 'done'", [])?;
+        }
+
         Ok(())
     }
 
@@ -566,14 +576,43 @@ impl Database {
         Ok(count > 0)
     }
 
-    /// Mark an owner as explored
+    /// Mark an owner as explored (completed)
     pub fn mark_owner_explored(&self, owner: &str, repo_count: usize) -> Result<()> {
         let now = Utc::now().timestamp();
         self.conn.execute(
-            "INSERT OR REPLACE INTO explored_owners (owner, repo_count, explored_at) VALUES (?1, ?2, ?3)",
+            "INSERT OR REPLACE INTO explored_owners (owner, repo_count, explored_at, status) VALUES (?1, ?2, ?3, 'done')",
             params![owner.to_lowercase(), repo_count as i64, now],
         )?;
         Ok(())
+    }
+
+    /// Mark an owner as in-progress (for resume support)
+    pub fn mark_owner_in_progress(&self, owner: &str) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO explored_owners (owner, repo_count, explored_at, status) VALUES (?1, 0, ?2, 'in_progress')",
+            params![owner.to_lowercase(), now],
+        )?;
+        Ok(())
+    }
+
+    /// Get owners that were interrupted (in_progress state)
+    pub fn get_in_progress_owners(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT owner FROM explored_owners WHERE status = 'in_progress'"
+        )?;
+        let results = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Count in-progress owners
+    pub fn count_in_progress_owners(&self) -> Result<usize> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM explored_owners WHERE status = 'in_progress'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
     }
 
     /// Get distinct owners from repos that haven't been explored yet
