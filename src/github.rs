@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use base64::Engine;
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// GitHub repository metadata (REST API)
 #[derive(Debug, Clone, Deserialize)]
@@ -155,8 +158,8 @@ impl GitHubClient {
         anyhow::bail!("Failed to fetch README after 5 retries: {}", last_error.unwrap_or_default())
     }
 
-    /// Check rate limit status
-    pub async fn rate_limit(&self) -> Result<RateLimit> {
+    /// Check rate limit status (returns both REST and GraphQL limits)
+    pub async fn rate_limit(&self) -> Result<RateLimitResources> {
         let url = "https://api.github.com/rate_limit";
 
         let response = self
@@ -166,7 +169,53 @@ impl GitHubClient {
             .context("Failed to check rate limit")?;
 
         let data: RateLimitResponse = response.json().await?;
-        Ok(data.rate)
+        Ok(data.resources)
+    }
+
+    /// Wait for rate limit reset if we're running low
+    /// Returns true if we had to wait, false if we had enough quota
+    async fn wait_for_rate_limit(&self, rate: &RateLimit, api_name: &str, min_remaining: u32) -> bool {
+        if rate.remaining >= min_remaining {
+            return false;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if rate.reset <= now {
+            // Reset time already passed, should be fine
+            return false;
+        }
+
+        let wait_secs = rate.reset - now + 5; // +5s buffer
+        let wait_mins = wait_secs / 60;
+        let wait_remainder = wait_secs % 60;
+
+        eprintln!(
+            "  \x1b[33m⏸ {} rate limit low ({}/{}), waiting {}m{}s for reset...\x1b[0m",
+            api_name, rate.remaining, rate.limit, wait_mins, wait_remainder
+        );
+
+        tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+
+        eprintln!("  \x1b[32m▶ Rate limit reset, resuming\x1b[0m");
+        true
+    }
+
+    /// Check and wait for REST API rate limit if needed
+    pub async fn ensure_rest_quota(&self, min_remaining: u32) -> Result<()> {
+        let rates = self.rate_limit().await?;
+        self.wait_for_rate_limit(&rates.core, "REST API", min_remaining).await;
+        Ok(())
+    }
+
+    /// Check and wait for GraphQL API rate limit if needed
+    pub async fn ensure_graphql_quota(&self, min_remaining: u32) -> Result<()> {
+        let rates = self.rate_limit().await?;
+        self.wait_for_rate_limit(&rates.graphql, "GraphQL API", min_remaining).await;
+        Ok(())
     }
 
     /// List all public repos for a user or org (paginated, with retry)
@@ -268,10 +317,17 @@ impl GitHubClient {
                     continue;
                 }
 
-                // Retry on rate limit (403) with extra delay
+                // On rate limit (403), wait for reset then retry
                 if status == reqwest::StatusCode::FORBIDDEN {
                     last_error = Some("Rate limited (403)".to_string());
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    // Check actual rate limit and wait for reset
+                    if let Ok(rates) = self.rate_limit().await {
+                        self.wait_for_rate_limit(&rates.core, "REST API", 10).await;
+                    } else {
+                        // Fallback: wait 60s if we can't check rate limit
+                        eprintln!("  \x1b[33m⏸ Rate limited, waiting 60s...\x1b[0m");
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
                     continue;
                 }
 
@@ -357,8 +413,14 @@ pub struct RateLimit {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RateLimitResources {
+    pub core: RateLimit,
+    pub graphql: RateLimit,
+}
+
+#[derive(Debug, Deserialize)]
 struct RateLimitResponse {
-    rate: RateLimit,
+    resources: RateLimitResources,
 }
 
 // === GraphQL Types ===
@@ -477,6 +539,7 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
 
     /// Fetch multiple repos by owner/name using GraphQL (batched, efficient)
     /// Uses the search API with "repo:" filters to fetch up to 100 repos in one call
+    /// Parallelizes chunk fetching with concurrency limit to maximize throughput
     pub async fn fetch_repos_batch(&self, repo_names: &[String]) -> Result<Vec<RepoWithReadme>> {
         if repo_names.is_empty() {
             return Ok(vec![]);
@@ -487,145 +550,212 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
 
         // Build search query with multiple repo: filters (limit to ~30 per query to avoid URL length issues)
         let chunk_size = 30;
-        let mut all_repos = Vec::new();
         let batch_start = std::time::Instant::now();
-        let total_chunks = (repo_names.len() + chunk_size - 1) / chunk_size;
+        let chunks: Vec<_> = repo_names.chunks(chunk_size).collect();
+        let total_chunks = chunks.len();
 
-        for (chunk_idx, chunk) in repo_names.chunks(chunk_size).enumerate() {
-            let query = chunk.iter()
-                .map(|name| format!("repo:{}", name))
-                .collect::<Vec<_>>()
-                .join(" ");
+        // Concurrency limit: 3 parallel requests
+        let semaphore = Arc::new(Semaphore::new(3));
+        let completed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-            let request = GraphQLRequest {
-                query: Self::GRAPHQL_QUERY.to_string(),
-                variables: GraphQLVariables {
-                    query,
-                    first: 100,
-                    after: None,
-                },
-            };
+        // Create futures for all chunks
+        let chunk_futures = chunks.into_iter().enumerate().map(|(chunk_idx, chunk)| {
+            let client = self.client.clone();
+            let token = token.clone();
+            let semaphore = Arc::clone(&semaphore);
+            let completed_count = Arc::clone(&completed_count);
+            let chunk = chunk.to_vec();
 
-            // Retry with exponential backoff
-            let mut last_error = None;
-            let chunk_start = std::time::Instant::now();
-            for attempt in 0..5 {
-                if attempt > 0 {
-                    let delay_ms = 500 * (1 << attempt.min(3));
-                    let delay = std::time::Duration::from_millis(delay_ms);
-                    eprintln!("  \x1b[33m⟳ Retry {}/5 for chunk {}/{} after {}ms ({})\x1b[0m",
-                        attempt + 1, chunk_idx + 1, total_chunks, delay_ms,
-                        last_error.as_deref().unwrap_or("unknown"));
-                    tokio::time::sleep(delay).await;
-                }
+            async move {
+                // Acquire semaphore permit (limits concurrency)
+                let _permit = semaphore.acquire().await.unwrap();
 
-                let req_start = std::time::Instant::now();
-                let response = match self.client
-                    .post("https://api.github.com/graphql")
-                    .header("Authorization", format!("Bearer {}", token))
-                    .header("User-Agent", "goto-gh/0.1.0")
-                    .json(&request)
-                    .send()
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        last_error = Some(format!("Request failed: {}", e));
-                        continue;
-                    }
-                };
-                let req_elapsed = req_start.elapsed();
+                let query = chunk.iter()
+                    .map(|name| format!("repo:{}", name))
+                    .collect::<Vec<_>>()
+                    .join(" ");
 
-                let status = response.status();
-                if status == reqwest::StatusCode::BAD_GATEWAY
-                    || status == reqwest::StatusCode::GATEWAY_TIMEOUT
-                    || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                {
-                    last_error = Some(format!("GitHub API error {} ({}ms)", status, req_elapsed.as_millis()));
-                    continue;
-                }
-
-                if status == reqwest::StatusCode::FORBIDDEN {
-                    last_error = Some(format!("Rate limited (403) after {}ms", req_elapsed.as_millis()));
-                    eprintln!("  \x1b[31m⚠ Rate limited, waiting 2s...\x1b[0m");
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    continue;
-                }
-
-                if !status.is_success() {
-                    let body = response.text().await.unwrap_or_default();
-                    anyhow::bail!("GraphQL error {}: {}", status, body);
-                }
-
-                let gql_response: GraphQLResponse = match response.json().await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        last_error = Some(format!("Parse error: {}", e));
-                        continue;
-                    }
+                let request = GraphQLRequest {
+                    query: GitHubClient::GRAPHQL_QUERY.to_string(),
+                    variables: GraphQLVariables {
+                        query,
+                        first: 100,
+                        after: None,
+                    },
                 };
 
-                // Log chunk timing
-                let chunk_elapsed = chunk_start.elapsed();
-                eprintln!("  \x1b[90m✓ Chunk {}/{} completed in {}ms (req: {}ms{})\x1b[0m",
-                    chunk_idx + 1, total_chunks, chunk_elapsed.as_millis(), req_elapsed.as_millis(),
-                    if attempt > 0 { format!(", {} retries", attempt) } else { String::new() });
+                // Retry with exponential backoff
+                let mut last_error = None;
+                let chunk_start = std::time::Instant::now();
 
-                if let Some(errors) = gql_response.errors {
-                    let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
-                    // Don't fail on partial errors - some repos might not exist
-                    eprintln!("  \x1b[90mGraphQL warnings: {}\x1b[0m", msgs.join(", "));
-                }
+                for attempt in 0..5 {
+                    if attempt > 0 {
+                        let delay_ms = 500 * (1 << attempt.min(3));
+                        let delay = std::time::Duration::from_millis(delay_ms);
+                        eprintln!("  \x1b[33m⟳ Retry {}/5 for chunk {} after {}ms ({})\x1b[0m",
+                            attempt + 1, chunk_idx + 1, delay_ms,
+                            last_error.as_deref().unwrap_or("unknown"));
+                        tokio::time::sleep(delay).await;
+                    }
 
-                if let Some(data) = gql_response.data {
-                    let repos: Vec<RepoWithReadme> = data.search.nodes
-                        .into_iter()
-                        .filter_map(|node| {
-                            let repo = node?;
-                            let readme = repo.readme
-                                .and_then(|b| b.text)
-                                .or_else(|| repo.readme_lower.and_then(|b| b.text))
-                                .or_else(|| repo.readme_rst.and_then(|b| b.text));
+                    let req_start = std::time::Instant::now();
+                    let response = match client
+                        .post("https://api.github.com/graphql")
+                        .header("Authorization", format!("Bearer {}", token))
+                        .header("User-Agent", "goto-gh/0.1.0")
+                        .json(&request)
+                        .send()
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            last_error = Some(format!("Request failed: {}", e));
+                            continue;
+                        }
+                    };
+                    let req_elapsed = req_start.elapsed();
 
-                            Some(RepoWithReadme {
-                                full_name: repo.name_with_owner,
-                                description: repo.description,
-                                html_url: repo.url,
-                                stars: repo.stargazer_count,
-                                language: repo.primary_language.map(|l| l.name),
-                                topics: repo.repository_topics.nodes
-                                    .into_iter()
-                                    .map(|t| t.topic.name)
-                                    .collect(),
-                                readme,
-                                pushed_at: repo.pushed_at,
-                                created_at: repo.created_at,
+                    let status = response.status();
+                    if status == reqwest::StatusCode::BAD_GATEWAY
+                        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+                        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    {
+                        last_error = Some(format!("GitHub API error {} ({}ms)", status, req_elapsed.as_millis()));
+                        continue;
+                    }
+
+                    if status == reqwest::StatusCode::FORBIDDEN {
+                        last_error = Some(format!("Rate limited (403) after {}ms", req_elapsed.as_millis()));
+                        // Check rate limit and wait for reset
+                        let rate_url = "https://api.github.com/rate_limit";
+                        if let Ok(resp) = client.get(rate_url)
+                            .header("Authorization", format!("Bearer {}", token))
+                            .header("User-Agent", "goto-gh/0.1.0")
+                            .send()
+                            .await
+                        {
+                            if let Ok(data) = resp.json::<RateLimitResponse>().await {
+                                let rate = &data.resources.graphql;
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs();
+                                if rate.remaining < 10 && rate.reset > now {
+                                    let wait_secs = rate.reset - now + 5;
+                                    let wait_mins = wait_secs / 60;
+                                    let wait_remainder = wait_secs % 60;
+                                    eprintln!(
+                                        "  \x1b[33m⏸ GraphQL rate limit low ({}/{}), waiting {}m{}s for reset...\x1b[0m",
+                                        rate.remaining, rate.limit, wait_mins, wait_remainder
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                                    eprintln!("  \x1b[32m▶ Rate limit reset, resuming\x1b[0m");
+                                    continue;
+                                }
+                            }
+                        }
+                        // Fallback: short wait
+                        eprintln!("  \x1b[33m⏸ Rate limited, waiting 30s...\x1b[0m");
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        continue;
+                    }
+
+                    if !status.is_success() {
+                        let body = response.text().await.unwrap_or_default();
+                        return Err(anyhow::anyhow!("GraphQL error {}: {}", status, body));
+                    }
+
+                    let gql_response: GraphQLResponse = match response.json().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            last_error = Some(format!("Parse error: {}", e));
+                            continue;
+                        }
+                    };
+
+                    // Log chunk timing (with completed count for parallel visibility)
+                    let chunk_elapsed = chunk_start.elapsed();
+                    let done = completed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    eprintln!("  \x1b[90m✓ Chunk {}/{} completed in {}ms (req: {}ms{})\x1b[0m",
+                        done, total_chunks, chunk_elapsed.as_millis(), req_elapsed.as_millis(),
+                        if attempt > 0 { format!(", {} retries", attempt) } else { String::new() });
+
+                    if let Some(errors) = gql_response.errors {
+                        let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
+                        eprintln!("  \x1b[90mGraphQL warnings: {}\x1b[0m", msgs.join(", "));
+                    }
+
+                    if let Some(data) = gql_response.data {
+                        let repos: Vec<RepoWithReadme> = data.search.nodes
+                            .into_iter()
+                            .filter_map(|node| {
+                                let repo = node?;
+                                let readme = repo.readme
+                                    .and_then(|b| b.text)
+                                    .or_else(|| repo.readme_lower.and_then(|b| b.text))
+                                    .or_else(|| repo.readme_rst.and_then(|b| b.text));
+
+                                Some(RepoWithReadme {
+                                    full_name: repo.name_with_owner,
+                                    description: repo.description,
+                                    html_url: repo.url,
+                                    stars: repo.stargazer_count,
+                                    language: repo.primary_language.map(|l| l.name),
+                                    topics: repo.repository_topics.nodes
+                                        .into_iter()
+                                        .map(|t| t.topic.name)
+                                        .collect(),
+                                    readme,
+                                    pushed_at: repo.pushed_at,
+                                    created_at: repo.created_at,
+                                })
                             })
-                        })
-                        .collect();
+                            .collect();
 
-                    all_repos.extend(repos);
+                        return Ok(repos);
+                    }
+
+                    return Ok(vec![]);
                 }
 
-                break;
+                Err(anyhow::anyhow!("Failed to fetch chunk after 5 retries: {}",
+                    last_error.unwrap_or_else(|| "unknown error".to_string())))
             }
+        });
 
-            if last_error.is_some() && all_repos.is_empty() {
-                anyhow::bail!("Failed to fetch repos: {}", last_error.unwrap_or_default());
-            }
+        // Execute all chunks in parallel with buffer_unordered (respects semaphore limit)
+        let results: Vec<Result<Vec<RepoWithReadme>>> = stream::iter(chunk_futures)
+            .buffer_unordered(8) // Allow up to 8 futures to be polled, semaphore limits actual concurrency
+            .collect()
+            .await;
 
-            // Small delay between chunks to avoid secondary rate limits
-            if chunk_size < repo_names.len() {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Collect results
+        let mut all_repos = Vec::new();
+        let mut had_error = false;
+        for result in results {
+            match result {
+                Ok(repos) => all_repos.extend(repos),
+                Err(e) => {
+                    eprintln!("  \x1b[31m⚠ Chunk error: {}\x1b[0m", e);
+                    had_error = true;
+                }
             }
         }
 
-        // Log batch summary (only if took more than 5s or we had multiple chunks)
+        // Log batch summary
         let batch_elapsed = batch_start.elapsed();
-        if batch_elapsed.as_secs() >= 5 || total_chunks > 1 {
-            let avg_per_chunk = batch_elapsed.as_millis() / total_chunks as u128;
-            eprintln!("  \x1b[90m⏱ GraphQL batch: {} repos in {:.1}s ({} chunks, ~{}ms/chunk)\x1b[0m",
-                repo_names.len(), batch_elapsed.as_secs_f32(), total_chunks, avg_per_chunk);
+        if batch_elapsed.as_secs() >= 2 || total_chunks > 1 {
+            let throughput = if batch_elapsed.as_secs_f32() > 0.0 {
+                (repo_names.len() as f32 / batch_elapsed.as_secs_f32()) as u32
+            } else {
+                0
+            };
+            eprintln!("  \x1b[90m⏱ GraphQL batch: {} repos in {:.1}s ({} chunks parallel, ~{} repos/s)\x1b[0m",
+                repo_names.len(), batch_elapsed.as_secs_f32(), total_chunks, throughput);
+        }
+
+        if had_error && all_repos.is_empty() {
+            anyhow::bail!("All chunks failed");
         }
 
         Ok(all_repos)

@@ -563,16 +563,23 @@ fn show_stats(db: &Database) -> Result<()> {
 
 /// Check rate limit
 async fn check_rate_limit(client: &GitHubClient) -> Result<()> {
-    let rate = client.rate_limit().await?;
+    let rates = client.rate_limit().await?;
 
-    let reset_time = chrono::DateTime::from_timestamp(rate.reset as i64, 0)
-        .map(|dt| dt.format("%H:%M:%S").to_string())
-        .unwrap_or_else(|| "?".to_string());
+    let format_reset = |reset: u64| {
+        chrono::DateTime::from_timestamp(reset as i64, 0)
+            .map(|dt| dt.format("%H:%M:%S").to_string())
+            .unwrap_or_else(|| "?".to_string())
+    };
 
-    println!("\x1b[36mGitHub API Rate Limit\x1b[0m\n");
-    println!("  \x1b[90mLimit:\x1b[0m     {}/hour", rate.limit);
-    println!("  \x1b[90mRemaining:\x1b[0m {}", rate.remaining);
-    println!("  \x1b[90mResets at:\x1b[0m {}", reset_time);
+    println!("\x1b[36mGitHub API Rate Limits\x1b[0m\n");
+
+    println!("  \x1b[1mREST API\x1b[0m (discover, list repos)");
+    println!("    \x1b[90mRemaining:\x1b[0m {}/{}", rates.core.remaining, rates.core.limit);
+    println!("    \x1b[90mResets at:\x1b[0m {}\n", format_reset(rates.core.reset));
+
+    println!("  \x1b[1mGraphQL API\x1b[0m (fetch repos/READMEs)");
+    println!("    \x1b[90mRemaining:\x1b[0m {}/{}", rates.graphql.remaining, rates.graphql.limit);
+    println!("    \x1b[90mResets at:\x1b[0m {}", format_reset(rates.graphql.reset));
 
     Ok(())
 }
