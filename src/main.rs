@@ -266,15 +266,18 @@ fn expand_query(query: &str) -> Result<String> {
     use std::process::Command;
 
     let prompt = format!(
-        r#"You are a GitHub repository search query expander. Given a user's natural language query, output ONLY a comma-separated list of 5-10 specific technical keywords and phrases that would match relevant repositories.
-
-Rules:
-- Output ONLY the keywords, nothing else (no explanations, no "Here are", no quotes)
-- Include the original terms plus related technical terms
-- Focus on: project names, technologies, tools, concepts, file types
-- Be specific to software/code repositories
+        r#"Expand this GitHub search query into technical keywords.
 
 Query: "{}"
+
+Output ONLY comma-separated keywords (no intro, no explanation, no quotes). Include:
+- Original terms
+- Related tools/libraries (e.g., metasploit, nmap, burpsuite)
+- Technical concepts (e.g., buffer overflow, RCE, SSRF)
+- File types/languages when relevant
+
+Example input: "web security"
+Example output: web security, OWASP, XSS, SQL injection, CSRF, burpsuite, ZAP, web application firewall, penetration testing
 
 Keywords:"#,
         query
@@ -282,9 +285,28 @@ Keywords:"#,
 
     eprintln!("\x1b[36m..\x1b[0m Expanding query with Claude...");
 
-    let output = Command::new("claude")
-        .args(["-p", &prompt])
-        .output();
+    // Try to find claude in common locations
+    let claude_paths = [
+        "claude",  // In PATH
+        "/usr/local/bin/claude",
+        &format!("{}/.nvm/versions/node/v22.20.0/bin/claude", std::env::var("HOME").unwrap_or_default()),
+    ];
+
+    let mut output = None;
+    for claude_path in &claude_paths {
+        let result = Command::new(claude_path)
+            .args(["--dangerously-skip-permissions", "--model", "haiku", "-p", &prompt])
+            .output();
+        if result.is_ok() {
+            output = Some(result);
+            break;
+        }
+    }
+
+    let output = match output {
+        Some(o) => o,
+        None => return Ok(query.to_string()),  // Fallback silently
+    };
 
     match output {
         Ok(out) if out.status.success() => {
