@@ -860,7 +860,7 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
     /// Fetch multiple repos by owner/name using GraphQL (batched, efficient)
     /// Uses the search API with "repo:" filters to fetch up to 100 repos in one call
     /// Parallelizes chunk fetching with concurrency limit to maximize throughput
-    pub async fn fetch_repos_batch(&self, repo_names: &[String]) -> Result<Vec<RepoWithReadme>> {
+    pub async fn fetch_repos_batch(&self, repo_names: &[String], concurrency: usize) -> Result<Vec<RepoWithReadme>> {
         if repo_names.is_empty() {
             return Ok(vec![]);
         }
@@ -875,8 +875,8 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
         let chunks: Vec<_> = repo_names.chunks(chunk_size).collect();
         let total_chunks = chunks.len();
 
-        // Concurrency limit: 3 parallel requests
-        let semaphore = Arc::new(Semaphore::new(3));
+        // Concurrency limit for parallel GraphQL requests
+        let semaphore = Arc::new(Semaphore::new(concurrency));
         let completed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         // Create futures for all chunks

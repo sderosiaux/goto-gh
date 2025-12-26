@@ -112,6 +112,10 @@ enum Commands {
         /// Batch size for GraphQL queries (default: 300, = 10 API chunks of 30)
         #[arg(short, long, default_value = "300")]
         batch_size: usize,
+
+        /// Number of parallel GraphQL requests (default: 4)
+        #[arg(short = 'j', long, default_value = "4")]
+        concurrency: usize,
     },
 
     /// Generate embeddings for repos that don't have them yet
@@ -188,8 +192,8 @@ async fn main() -> Result<()> {
         Some(Commands::Revectorize) => {
             revectorize(&db)
         }
-        Some(Commands::Fetch { limit, batch_size }) => {
-            fetch_from_db(&client, &db, limit, batch_size).await
+        Some(Commands::Fetch { limit, batch_size, concurrency }) => {
+            fetch_from_db(&client, &db, limit, batch_size, concurrency).await
         }
         Some(Commands::Embed { batch_size, limit, delay }) => {
             embed_missing(&db, batch_size, limit, delay)
@@ -874,6 +878,7 @@ async fn fetch_from_db(
     db: &Database,
     limit: Option<usize>,
     batch_size: usize,
+    concurrency: usize,
 ) -> Result<()> {
     let need_fetch = db.count_repos_without_metadata()?;
 
@@ -884,8 +889,8 @@ async fn fetch_from_db(
 
     let to_fetch = limit.map(|l| l.min(need_fetch)).unwrap_or(need_fetch);
     eprintln!(
-        "\x1b[36m..\x1b[0m Fetching metadata for {} repos (batch size: {}) - NO EMBEDDINGS",
-        to_fetch, batch_size
+        "\x1b[36m..\x1b[0m Fetching metadata for {} repos (batch size: {}, concurrency: {}) - NO EMBEDDINGS",
+        to_fetch, batch_size, concurrency
     );
 
     let mut stored = 0;
@@ -910,7 +915,7 @@ async fn fetch_from_db(
         );
 
         // Fetch via GraphQL
-        let fetched_repos = match client.fetch_repos_batch(&repos_to_fetch).await {
+        let fetched_repos = match client.fetch_repos_batch(&repos_to_fetch, concurrency).await {
             Ok(repos) => repos,
             Err(e) => {
                 eprintln!("\x1b[31mx\x1b[0m Batch {} failed: {}", batch_num, e);
