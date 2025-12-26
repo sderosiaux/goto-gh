@@ -154,6 +154,10 @@ enum Commands {
         /// Path to proxy list file (one ip:port per line) for REST API calls
         #[arg(long)]
         proxy_file: Option<String>,
+
+        /// Force using proxies for all requests (don't use token)
+        #[arg(long)]
+        force_proxy: bool,
     },
 }
 
@@ -202,15 +206,13 @@ async fn main() -> Result<()> {
             println!("{}", Config::db_path()?.display());
             Ok(())
         }
-        Some(Commands::Discover { limit, concurrency, debug, proxy_file }) => {
+        Some(Commands::Discover { limit, concurrency, debug, proxy_file, force_proxy }) => {
             // Load proxies if specified
             let proxy_manager = if let Some(path) = proxy_file {
                 let path = std::path::PathBuf::from(&path);
-                let failed_file = path.with_extension("failed.txt");
-                match ProxyManager::from_file(&path, Some(failed_file)) {
+                match ProxyManager::from_file(&path) {
                     Ok(pm) => {
-                        let stats = pm.stats();
-                        eprintln!("\x1b[36m..\x1b[0m {}", stats);
+                        eprintln!("\x1b[36m..\x1b[0m {}", pm);
                         Some(pm)
                     }
                     Err(e) => {
@@ -219,10 +221,18 @@ async fn main() -> Result<()> {
                     }
                 }
             } else {
+                if force_proxy {
+                    eprintln!("\x1b[31mx\x1b[0m --force-proxy requires --proxy-file");
+                    std::process::exit(1);
+                }
                 None
             };
 
-            let client = GitHubClient::new_with_options(token.clone(), debug, proxy_manager);
+            if force_proxy {
+                eprintln!("\x1b[33m..\x1b[0m Force proxy mode (token disabled)");
+            }
+
+            let client = GitHubClient::new_with_options(token.clone(), debug, proxy_manager, force_proxy);
             discover_from_owners(&client, &db, limit, concurrency).await
         }
         None => {

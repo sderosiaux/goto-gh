@@ -46,20 +46,21 @@ pub struct GitHubClient {
     token: Option<String>,
     debug: bool,
     proxy_manager: Option<ProxyManager>,
+    force_proxy: bool,
 }
 
 impl GitHubClient {
     pub fn new(token: Option<String>) -> Self {
-        Self::new_with_options(token, false, None)
+        Self::new_with_options(token, false, None, false)
     }
 
-    pub fn new_with_options(token: Option<String>, debug: bool, proxy_manager: Option<ProxyManager>) -> Self {
+    pub fn new_with_options(token: Option<String>, debug: bool, proxy_manager: Option<ProxyManager>, force_proxy: bool) -> Self {
         let client = reqwest::Client::builder()
             .user_agent("goto-gh/0.1.0")
             .build()
             .expect("Failed to create HTTP client");
 
-        Self { client, token, debug, proxy_manager }
+        Self { client, token, debug, proxy_manager, force_proxy }
     }
 
     /// Create a client configured to use a specific proxy
@@ -67,7 +68,8 @@ impl GitHubClient {
         reqwest::Client::builder()
             .user_agent("goto-gh/0.1.0")
             .proxy(reqwest::Proxy::all(proxy_url).ok()?)
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(15)) // 15s total timeout (some proxies are slow)
+            .connect_timeout(std::time::Duration::from_secs(3)) // 3s connect timeout
             .build()
             .ok()
     }
@@ -98,14 +100,15 @@ impl GitHubClient {
     }
 
     /// Send REST request via proxy (no auth token - proxies are unauthenticated)
-    async fn send_request_via_proxy(&self, url: &str, proxy: &str) -> Result<reqwest::Response, String> {
+    /// If show_debug is false, suppresses per-request debug output (for parallel racing)
+    async fn send_request_via_proxy_inner(&self, url: &str, proxy: &str, show_debug: bool) -> Result<reqwest::Response, String> {
         use std::io::Write;
 
         let proxy_url = format!("http://{}", proxy);
         let proxy_client = Self::client_with_proxy(&proxy_url)
             .ok_or_else(|| format!("Failed to create proxy client for {}", proxy))?;
 
-        if self.debug {
+        if self.debug && show_debug {
             eprint!("\x1b[90m[PROXY {}] GET {} ... \x1b[0m", proxy, url);
             std::io::stderr().flush().ok();
         }
@@ -120,71 +123,125 @@ impl GitHubClient {
             .send()
             .await;
 
-        if self.debug {
+        if self.debug && show_debug {
             eprintln!("\x1b[90m{}ms\x1b[0m", start.elapsed().as_millis());
         }
 
         result.map_err(|e| e.to_string())
     }
 
-    /// Try request through rotating proxies until one succeeds
+    /// Send REST request via proxy with debug output
+    async fn send_request_via_proxy(&self, url: &str, proxy: &str) -> Result<reqwest::Response, String> {
+        self.send_request_via_proxy_inner(url, proxy, true).await
+    }
+
+    /// Try request through proxies - uses sticky proxy if available, otherwise races multiple proxies
     async fn try_with_proxies(&self, url: &str, pm: &ProxyManager) -> Result<(reqwest::Response, Option<String>), String> {
-        let stats = pm.stats();
-        let max_attempts = stats.available.min(50); // Don't try more than 50 proxies per request
+        // First, try the sticky proxy if we have one (with retry for timeouts)
+        if let Some(sticky_proxy) = pm.get_current_proxy() {
+            for retry in 0..2 {
+                match self.send_request_via_proxy(url, &sticky_proxy).await {
+                    Ok(response) => {
+                        let status = response.status();
 
-        for attempt in 0..max_attempts {
-            let proxy = match pm.get_next() {
-                Some(p) => p,
-                None => {
-                    return Err("No proxies available".to_string());
+                        // Success or expected errors (404, etc.) - proxy worked, keep it sticky
+                        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+                            return Ok((response, Some(sticky_proxy)));
+                        }
+
+                        // Rate limit via this proxy - clear sticky and try others
+                        if status == reqwest::StatusCode::FORBIDDEN
+                            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        {
+                            if self.debug {
+                                eprintln!("\x1b[33m[STICKY] {} rate limited, rotating...\x1b[0m", sticky_proxy);
+                            }
+                            pm.clear_current();
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let is_timeout = e.contains("timed out") || e.contains("timeout");
+                        if is_timeout && retry == 0 {
+                            // Retry once on timeout
+                            if self.debug {
+                                eprintln!("\x1b[33m[STICKY] {} timeout, retrying...\x1b[0m", sticky_proxy);
+                            }
+                            continue;
+                        }
+                        // Connection error or second timeout - clear sticky proxy
+                        if self.debug {
+                            eprintln!("\x1b[33m[STICKY] {} failed ({}), rotating...\x1b[0m", sticky_proxy, e);
+                        }
+                        pm.clear_current();
+                        break;
+                    }
                 }
-            };
+            }
+        }
 
-            match self.send_request_via_proxy(url, &proxy).await {
-                Ok(response) => {
+        // Race multiple proxies in parallel - first successful response wins
+        let parallel_count = 5; // Try 5 proxies at once
+        let max_rounds = 10; // Up to 10 rounds = 50 proxies total
+
+        for round in 0..max_rounds {
+            // Get batch of proxies to try
+            let mut proxies_to_try = Vec::with_capacity(parallel_count);
+            for _ in 0..parallel_count {
+                if let Some(p) = pm.get_next() {
+                    proxies_to_try.push(p);
+                }
+            }
+
+            if proxies_to_try.is_empty() {
+                return Err("No proxies available".to_string());
+            }
+
+            // Show what we're racing (compact)
+            if self.debug {
+                eprint!("\x1b[90m[RACE] {} proxies... \x1b[0m", proxies_to_try.len());
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            }
+
+            let race_start = std::time::Instant::now();
+
+            // Race all proxies in parallel (quiet mode - no per-request output)
+            let futures: Vec<_> = proxies_to_try
+                .iter()
+                .map(|proxy| {
+                    let proxy = proxy.clone();
+                    let url = url.to_string();
+                    async move {
+                        let result = self.send_request_via_proxy_inner(&url, &proxy, false).await;
+                        (proxy, result)
+                    }
+                })
+                .collect();
+
+            let results = futures::future::join_all(futures).await;
+
+            // Find first successful response
+            for (proxy, result) in results {
+                if let Ok(response) = result {
                     let status = response.status();
 
                     // Success or expected errors (404, etc.) - proxy worked
                     if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-                        pm.mark_success(&proxy);
+                        if self.debug {
+                            eprintln!("\x1b[32m{} won ({}ms)\x1b[0m", proxy, race_start.elapsed().as_millis());
+                        }
+                        pm.mark_working(&proxy);
                         return Ok((response, Some(proxy)));
-                    }
-
-                    // Rate limit via proxy too - try next proxy
-                    if status == reqwest::StatusCode::FORBIDDEN
-                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                    {
-                        pm.mark_failed(&proxy, &format!("rate limited ({})", status));
-                        continue;
-                    }
-
-                    // Other errors - mark failed and try next
-                    pm.mark_failed(&proxy, &format!("HTTP {}", status));
-                }
-                Err(e) => {
-                    // Connection/timeout error
-                    let error_lower = e.to_lowercase();
-                    if error_lower.contains("timeout")
-                        || error_lower.contains("connection")
-                        || error_lower.contains("refused")
-                        || error_lower.contains("reset")
-                    {
-                        pm.mark_failed(&proxy, &e);
-                    } else {
-                        pm.mark_failed(&proxy, &e);
                     }
                 }
             }
 
-            // Progress indicator every 10 attempts
-            if (attempt + 1) % 10 == 0 {
-                eprint!("\r  \x1b[90m... tried {} proxies\x1b[0m\x1b[K", attempt + 1);
-                let _ = std::io::Write::flush(&mut std::io::stderr());
+            if self.debug {
+                eprintln!("\x1b[90mall failed ({}ms)\x1b[0m", race_start.elapsed().as_millis());
             }
         }
 
-        eprint!("\r\x1b[K"); // Clear progress line
-        Err(format!("All {} proxy attempts failed", max_attempts))
+        Err(format!("All {} proxy attempts failed", max_rounds * parallel_count))
     }
 
     /// Build GraphQL request
@@ -427,6 +484,40 @@ impl GitHubClient {
                     tokio::time::sleep(delay).await;
                 }
 
+                // If force_proxy is enabled, go directly to proxy rotation
+                if self.force_proxy {
+                    if let Some(ref pm) = self.proxy_manager {
+                        match self.try_with_proxies(&url, pm).await {
+                            Ok((proxy_response, _proxy)) => {
+                                let proxy_status = proxy_response.status();
+                                if proxy_status.is_success() {
+                                    match proxy_response.json::<Vec<OwnerRepoInfo>>().await {
+                                        Ok(repos) => {
+                                            repos_page = Some(repos);
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            last_error = Some(format!("JSON parse error: {}", e));
+                                            continue;
+                                        }
+                                    }
+                                } else if proxy_status == reqwest::StatusCode::NOT_FOUND && page == 1 {
+                                    anyhow::bail!("404 not found");
+                                } else {
+                                    last_error = Some(format!("Proxy returned {}", proxy_status));
+                                    continue;
+                                }
+                            }
+                            Err(e) => {
+                                last_error = Some(format!("Proxy rotation failed: {}", e));
+                                continue;
+                            }
+                        }
+                    } else {
+                        anyhow::bail!("force_proxy enabled but no proxy_manager configured");
+                    }
+                }
+
                 let response = match self.send_request(&url).await {
                     Ok(r) => r,
                     Err(e) => {
@@ -574,6 +665,40 @@ impl GitHubClient {
                 if attempt > 0 {
                     let delay = std::time::Duration::from_millis(500 * (1 << attempt.min(3)));
                     tokio::time::sleep(delay).await;
+                }
+
+                // If force_proxy is enabled, go directly to proxy rotation
+                if self.force_proxy {
+                    if let Some(ref pm) = self.proxy_manager {
+                        match self.try_with_proxies(&url, pm).await {
+                            Ok((proxy_response, _proxy)) => {
+                                let proxy_status = proxy_response.status();
+                                if proxy_status.is_success() {
+                                    match proxy_response.json::<Vec<FollowerInfo>>().await {
+                                        Ok(followers) => {
+                                            followers_page = Some(followers);
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            last_error = Some(format!("JSON parse error: {}", e));
+                                            continue;
+                                        }
+                                    }
+                                } else if proxy_status == reqwest::StatusCode::NOT_FOUND && page == 1 {
+                                    anyhow::bail!("User {} not found (404)", owner);
+                                } else {
+                                    last_error = Some(format!("Proxy returned {}", proxy_status));
+                                    continue;
+                                }
+                            }
+                            Err(e) => {
+                                last_error = Some(format!("Proxy rotation failed: {}", e));
+                                continue;
+                            }
+                        }
+                    } else {
+                        anyhow::bail!("force_proxy enabled but no proxy_manager configured");
+                    }
                 }
 
                 let response = match self.send_request(&url).await {
