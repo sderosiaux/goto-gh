@@ -253,19 +253,9 @@ impl GitHubClient {
         req.header("User-Agent", "goto-gh/0.1.0")
     }
 
-    /// Send GraphQL request with optional debug timing
-    async fn send_graphql<T: serde::Serialize>(&self, debug_context: &str, body: &T) -> Result<reqwest::Response, reqwest::Error> {
-        use std::io::Write;
-        if self.debug {
-            eprint!("\x1b[90m[API] POST graphql ({}) ... \x1b[0m", debug_context);
-            std::io::stderr().flush().ok();
-        }
-        let start = std::time::Instant::now();
-        let result = self.graphql_request().json(body).send().await;
-        if self.debug {
-            eprintln!("\x1b[90m{}ms\x1b[0m", start.elapsed().as_millis());
-        }
-        result
+    /// Send GraphQL request (timing is handled by caller for parallel-safe output)
+    async fn send_graphql<T: serde::Serialize>(&self, _debug_context: &str, body: &T) -> Result<reqwest::Response, reqwest::Error> {
+        self.graphql_request().json(body).send().await
     }
 
     /// Get repository details
@@ -1031,7 +1021,6 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
 
                 // Retry with exponential backoff
                 let mut last_error = None;
-                let chunk_start = std::time::Instant::now();
 
                 for attempt in 0..5 {
                     if attempt > 0 {
@@ -1107,13 +1096,6 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                         }
                     };
 
-                    // Log chunk timing (with completed count for parallel visibility)
-                    let chunk_elapsed = chunk_start.elapsed();
-                    let done = completed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    eprintln!("  \x1b[90m✓ Chunk {}/{} completed in {}ms (req: {}ms{})\x1b[0m",
-                        done, total_chunks, chunk_elapsed.as_millis(), req_elapsed.as_millis(),
-                        if attempt > 0 { format!(", {} retries", attempt) } else { String::new() });
-
                     if let Some(errors) = gql_response.errors {
                         let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
                         eprintln!("  \x1b[90mGraphQL warnings: {}\x1b[0m", msgs.join(", "));
@@ -1146,9 +1128,15 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                             })
                             .collect();
 
-                        // Count repos with README for visibility
+                        // Atomic debug output (single line, parallel-safe)
+                        let done = completed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         let with_readme = repos.iter().filter(|r| r.readme.is_some()).count();
-                        eprintln!("    \x1b[90m└─ {} repos, {} with README\x1b[0m", repos.len(), with_readme);
+                        if gh_client.debug {
+                            eprintln!("  \x1b[90m✓ [{}/{}] {}ms - {} repos ({} README){}\x1b[0m",
+                                done, total_chunks, req_elapsed.as_millis(),
+                                repos.len(), with_readme,
+                                if attempt > 0 { format!(", {} retries", attempt) } else { String::new() });
+                        }
 
                         return Ok(repos);
                     }

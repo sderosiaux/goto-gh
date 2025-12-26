@@ -59,6 +59,10 @@ struct Cli {
     #[arg(short, long)]
     semantic: bool,
 
+    /// Expand query using LLM (Claude CLI) for better semantic understanding
+    #[arg(short, long)]
+    expand: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -116,6 +120,10 @@ enum Commands {
         /// Number of parallel GraphQL requests (default: 4)
         #[arg(short = 'j', long, default_value = "4")]
         concurrency: usize,
+
+        /// Show API calls for debugging
+        #[arg(long)]
+        debug: bool,
     },
 
     /// Generate embeddings for repos that don't have them yet
@@ -171,7 +179,15 @@ async fn main() -> Result<()> {
     // If query provided, do semantic search
     if !cli.query.is_empty() {
         let query = cli.query.join(" ");
-        return search(&query, cli.limit, cli.semantic, &db);
+
+        // Expand query with LLM if requested
+        let search_query = if cli.expand {
+            expand_query(&query)?
+        } else {
+            query
+        };
+
+        return search(&search_query, cli.limit, cli.semantic, &db);
     }
 
     match cli.command {
@@ -196,7 +212,8 @@ async fn main() -> Result<()> {
         Some(Commands::Revectorize) => {
             revectorize(&db)
         }
-        Some(Commands::Fetch { limit, batch_size, concurrency }) => {
+        Some(Commands::Fetch { limit, batch_size, concurrency, debug }) => {
+            let client = GitHubClient::new_with_options(token.clone(), debug, None, false);
             fetch_from_db(&client, &db, limit, batch_size, concurrency).await
         }
         Some(Commands::Embed { batch_size, limit, delay }) => {
@@ -240,6 +257,54 @@ async fn main() -> Result<()> {
             Cli::command().print_help()?;
             eprintln!();
             std::process::exit(0);
+        }
+    }
+}
+
+/// Expand a search query using Claude CLI for better semantic understanding
+fn expand_query(query: &str) -> Result<String> {
+    use std::process::Command;
+
+    let prompt = format!(
+        r#"You are a GitHub repository search query expander. Given a user's natural language query, output ONLY a comma-separated list of 5-10 specific technical keywords and phrases that would match relevant repositories.
+
+Rules:
+- Output ONLY the keywords, nothing else (no explanations, no "Here are", no quotes)
+- Include the original terms plus related technical terms
+- Focus on: project names, technologies, tools, concepts, file types
+- Be specific to software/code repositories
+
+Query: "{}"
+
+Keywords:"#,
+        query
+    );
+
+    eprintln!("\x1b[36m..\x1b[0m Expanding query with Claude...");
+
+    let output = Command::new("claude")
+        .args(["-p", &prompt])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let expanded = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if expanded.is_empty() {
+                eprintln!("\x1b[33m!\x1b[0m Claude returned empty, using original query");
+                Ok(query.to_string())
+            } else {
+                eprintln!("\x1b[32m✓\x1b[0m Expanded: {}", truncate_str(&expanded, 80));
+                Ok(expanded)
+            }
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            eprintln!("\x1b[33m!\x1b[0m Claude failed ({}), using original query", err.trim());
+            Ok(query.to_string())
+        }
+        Err(e) => {
+            eprintln!("\x1b[33m!\x1b[0m Claude not available ({}), using original query", e);
+            Ok(query.to_string())
         }
     }
 }
