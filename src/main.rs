@@ -2,6 +2,7 @@ mod config;
 mod db;
 mod embedding;
 mod github;
+mod proxy;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -15,6 +16,7 @@ use config::Config;
 use db::Database;
 use embedding::{build_embedding_text, embed_text, embed_texts};
 use github::GitHubClient;
+use proxy::ProxyManager;
 
 /// Format repo name as clickable hyperlink (only if stdout is a TTY)
 fn format_repo_link(name: &str, url: &str) -> String {
@@ -72,6 +74,12 @@ enum Commands {
     /// Load repo names from file into DB (no GitHub fetch, just stores names)
     Load {
         /// Path to file containing repo names (one per line)
+        file: String,
+    },
+
+    /// Load usernames from file as owners to discover (no GitHub fetch)
+    LoadUsers {
+        /// Path to file containing usernames (one per line)
         file: String,
     },
 
@@ -138,6 +146,10 @@ enum Commands {
         /// Show API calls for debugging
         #[arg(long)]
         debug: bool,
+
+        /// Path to proxy list file (one ip:port per line) for REST API calls
+        #[arg(long)]
+        proxy_file: Option<String>,
     },
 }
 
@@ -161,6 +173,9 @@ async fn main() -> Result<()> {
         Some(Commands::Load { file }) => {
             load_repo_stubs(&db, &file)
         }
+        Some(Commands::LoadUsers { file }) => {
+            load_user_stubs(&db, &file)
+        }
         Some(Commands::Stats) => {
             show_stats(&db)
         }
@@ -183,8 +198,27 @@ async fn main() -> Result<()> {
             println!("{}", Config::db_path()?.display());
             Ok(())
         }
-        Some(Commands::Discover { limit, concurrency, debug }) => {
-            let client = GitHubClient::new_with_debug(token.clone(), debug);
+        Some(Commands::Discover { limit, concurrency, debug, proxy_file }) => {
+            // Load proxies if specified
+            let proxy_manager = if let Some(path) = proxy_file {
+                let path = std::path::PathBuf::from(&path);
+                let failed_file = path.with_extension("failed.txt");
+                match ProxyManager::from_file(&path, Some(failed_file)) {
+                    Ok(pm) => {
+                        let stats = pm.stats();
+                        eprintln!("\x1b[36m..\x1b[0m {}", stats);
+                        Some(pm)
+                    }
+                    Err(e) => {
+                        eprintln!("\x1b[31mx\x1b[0m Failed to load proxies: {}", e);
+                        return Err(e);
+                    }
+                }
+            } else {
+                None
+            };
+
+            let client = GitHubClient::new_with_options(token.clone(), debug, proxy_manager);
             discover_from_owners(&client, &db, limit, concurrency).await
         }
         None => {
@@ -782,6 +816,54 @@ fn load_repo_stubs(db: &Database, file_path: &str) -> Result<()> {
     let need_fetch = db.count_repos_without_metadata()?;
     eprintln!("\x1b[36m..\x1b[0m {} repos now awaiting metadata fetch", need_fetch);
     eprintln!("    Run: goto-gh fetch --batch-size 300");
+
+    Ok(())
+}
+
+/// Load usernames from file as owners to discover (creates placeholder repos)
+fn load_user_stubs(db: &Database, file_path: &str) -> Result<()> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(file_path)?;
+    let reader = BufReader::new(file);
+
+    let usernames: Vec<String> = reader
+        .lines()
+        .filter_map(|l| l.ok())
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.contains('/'))
+        .collect();
+
+    let total = usernames.len();
+    eprintln!(
+        "\x1b[36m..\x1b[0m Loading {} usernames from {} (no GitHub API calls)",
+        total, file_path
+    );
+
+    if total == 0 {
+        eprintln!("\x1b[33m..\x1b[0m No usernames to load");
+        return Ok(());
+    }
+
+    let mut added = 0;
+    let mut skipped = 0;
+
+    for username in &usernames {
+        match db.add_follower_as_owner(username)? {
+            true => added += 1,
+            false => skipped += 1,
+        }
+    }
+
+    eprintln!(
+        "\x1b[32mok\x1b[0m Added {} new users ({} already known)",
+        added, skipped
+    );
+
+    let unexplored = db.count_unexplored_owners()?;
+    eprintln!("\x1b[36m..\x1b[0m {} owners now awaiting discovery", unexplored);
+    eprintln!("    Run: goto-gh discover");
 
     Ok(())
 }

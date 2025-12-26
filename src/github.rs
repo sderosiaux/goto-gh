@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+use crate::proxy::ProxyManager;
+
 /// GitHub repository metadata (REST API)
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitHubRepo {
@@ -43,20 +45,31 @@ pub struct GitHubClient {
     client: reqwest::Client,
     token: Option<String>,
     debug: bool,
+    proxy_manager: Option<ProxyManager>,
 }
 
 impl GitHubClient {
     pub fn new(token: Option<String>) -> Self {
-        Self::new_with_debug(token, false)
+        Self::new_with_options(token, false, None)
     }
 
-    pub fn new_with_debug(token: Option<String>, debug: bool) -> Self {
+    pub fn new_with_options(token: Option<String>, debug: bool, proxy_manager: Option<ProxyManager>) -> Self {
         let client = reqwest::Client::builder()
             .user_agent("goto-gh/0.1.0")
             .build()
             .expect("Failed to create HTTP client");
 
-        Self { client, token, debug }
+        Self { client, token, debug, proxy_manager }
+    }
+
+    /// Create a client configured to use a specific proxy
+    fn client_with_proxy(proxy_url: &str) -> Option<reqwest::Client> {
+        reqwest::Client::builder()
+            .user_agent("goto-gh/0.1.0")
+            .proxy(reqwest::Proxy::all(proxy_url).ok()?)
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .ok()
     }
 
     /// Build REST request with auth header if token available
@@ -69,7 +82,7 @@ impl GitHubClient {
             .header("X-GitHub-Api-Version", "2022-11-28")
     }
 
-    /// Send REST request with optional debug timing
+    /// Send REST request with optional debug timing (uses main token)
     async fn send_request(&self, url: &str) -> Result<reqwest::Response, reqwest::Error> {
         use std::io::Write;
         if self.debug {
@@ -82,6 +95,96 @@ impl GitHubClient {
             eprintln!("\x1b[90m{}ms\x1b[0m", start.elapsed().as_millis());
         }
         result
+    }
+
+    /// Send REST request via proxy (no auth token - proxies are unauthenticated)
+    async fn send_request_via_proxy(&self, url: &str, proxy: &str) -> Result<reqwest::Response, String> {
+        use std::io::Write;
+
+        let proxy_url = format!("http://{}", proxy);
+        let proxy_client = Self::client_with_proxy(&proxy_url)
+            .ok_or_else(|| format!("Failed to create proxy client for {}", proxy))?;
+
+        if self.debug {
+            eprint!("\x1b[90m[PROXY {}] GET {} ... \x1b[0m", proxy, url);
+            std::io::stderr().flush().ok();
+        }
+
+        let start = std::time::Instant::now();
+
+        // Build request without auth (unauthenticated proxy request)
+        let result = proxy_client
+            .get(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await;
+
+        if self.debug {
+            eprintln!("\x1b[90m{}ms\x1b[0m", start.elapsed().as_millis());
+        }
+
+        result.map_err(|e| e.to_string())
+    }
+
+    /// Try request through rotating proxies until one succeeds
+    async fn try_with_proxies(&self, url: &str, pm: &ProxyManager) -> Result<(reqwest::Response, Option<String>), String> {
+        let stats = pm.stats();
+        let max_attempts = stats.available.min(50); // Don't try more than 50 proxies per request
+
+        for attempt in 0..max_attempts {
+            let proxy = match pm.get_next() {
+                Some(p) => p,
+                None => {
+                    return Err("No proxies available".to_string());
+                }
+            };
+
+            match self.send_request_via_proxy(url, &proxy).await {
+                Ok(response) => {
+                    let status = response.status();
+
+                    // Success or expected errors (404, etc.) - proxy worked
+                    if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+                        pm.mark_success(&proxy);
+                        return Ok((response, Some(proxy)));
+                    }
+
+                    // Rate limit via proxy too - try next proxy
+                    if status == reqwest::StatusCode::FORBIDDEN
+                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    {
+                        pm.mark_failed(&proxy, &format!("rate limited ({})", status));
+                        continue;
+                    }
+
+                    // Other errors - mark failed and try next
+                    pm.mark_failed(&proxy, &format!("HTTP {}", status));
+                }
+                Err(e) => {
+                    // Connection/timeout error
+                    let error_lower = e.to_lowercase();
+                    if error_lower.contains("timeout")
+                        || error_lower.contains("connection")
+                        || error_lower.contains("refused")
+                        || error_lower.contains("reset")
+                    {
+                        pm.mark_failed(&proxy, &e);
+                    } else {
+                        pm.mark_failed(&proxy, &e);
+                    }
+                }
+            }
+
+            // Progress indicator every 10 attempts
+            if (attempt + 1) % 10 == 0 {
+                eprint!("\r  \x1b[90m... tried {} proxies\x1b[0m\x1b[K", attempt + 1);
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            }
+        }
+
+        eprint!("\r\x1b[K"); // Clear progress line
+        Err(format!("All {} proxy attempts failed", max_attempts))
     }
 
     /// Build GraphQL request
@@ -348,14 +451,40 @@ impl GitHubClient {
                     continue;
                 }
 
-                // On rate limit (403), wait for reset then retry
+                // On rate limit (403), try proxies if available, otherwise wait
                 if status == reqwest::StatusCode::FORBIDDEN {
+                    if let Some(ref pm) = self.proxy_manager {
+                        // Try via proxy rotation
+                        eprintln!("  \x1b[33m⏸ Rate limited, switching to proxy rotation...\x1b[0m");
+                        match self.try_with_proxies(&url, pm).await {
+                            Ok((proxy_response, _proxy)) => {
+                                let proxy_status = proxy_response.status();
+                                if proxy_status.is_success() {
+                                    match proxy_response.json::<Vec<OwnerRepoInfo>>().await {
+                                        Ok(repos) => {
+                                            repos_page = Some(repos);
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            last_error = Some(format!("JSON parse error: {}", e));
+                                            continue;
+                                        }
+                                    }
+                                } else if proxy_status == reqwest::StatusCode::NOT_FOUND && page == 1 {
+                                    anyhow::bail!("404 not found");
+                                }
+                            }
+                            Err(e) => {
+                                last_error = Some(format!("Proxy rotation failed: {}", e));
+                            }
+                        }
+                    }
+
+                    // No proxies or proxy failed - wait for rate limit reset
                     last_error = Some("Rate limited (403)".to_string());
-                    // Check actual rate limit and wait for reset
                     if let Ok(rates) = self.rate_limit().await {
                         self.wait_for_rate_limit(&rates.core, "REST API", 10).await;
                     } else {
-                        // Fallback: wait 60s if we can't check rate limit
                         eprintln!("  \x1b[33m⏸ Rate limited, waiting 60s...\x1b[0m");
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     }
@@ -474,8 +603,36 @@ impl GitHubClient {
                     continue;
                 }
 
-                // On rate limit (403), wait for reset then retry
+                // On rate limit (403), try proxies if available, otherwise wait
                 if status == reqwest::StatusCode::FORBIDDEN {
+                    if let Some(ref pm) = self.proxy_manager {
+                        // Try via proxy rotation
+                        eprintln!("  \x1b[33m⏸ Rate limited, switching to proxy rotation...\x1b[0m");
+                        match self.try_with_proxies(&url, pm).await {
+                            Ok((proxy_response, _proxy)) => {
+                                let proxy_status = proxy_response.status();
+                                if proxy_status.is_success() {
+                                    match proxy_response.json::<Vec<FollowerInfo>>().await {
+                                        Ok(followers) => {
+                                            followers_page = Some(followers);
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            last_error = Some(format!("JSON parse error: {}", e));
+                                            continue;
+                                        }
+                                    }
+                                } else if proxy_status == reqwest::StatusCode::NOT_FOUND && page == 1 {
+                                    anyhow::bail!("User {} not found (404)", owner);
+                                }
+                            }
+                            Err(e) => {
+                                last_error = Some(format!("Proxy rotation failed: {}", e));
+                            }
+                        }
+                    }
+
+                    // No proxies or proxy failed - wait for rate limit reset
                     last_error = Some("Rate limited (403)".to_string());
                     if let Ok(rates) = self.rate_limit().await {
                         self.wait_for_rate_limit(&rates.core, "REST API", 10).await;
@@ -863,6 +1020,10 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                                 })
                             })
                             .collect();
+
+                        // Count repos with README for visibility
+                        let with_readme = repos.iter().filter(|r| r.readme.is_some()).count();
+                        eprintln!("    \x1b[90m└─ {} repos, {} with README\x1b[0m", repos.len(), with_readme);
 
                         return Ok(repos);
                     }

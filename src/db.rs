@@ -456,14 +456,14 @@ impl Database {
         Ok((inserted, skipped))
     }
 
-    /// Get repos that need metadata fetch (have no embedded_text = never fetched, and not gone)
+    /// Get repos that need metadata fetch (have no embedded_text = never fetched, not gone, and not placeholders)
     pub fn get_repos_without_metadata(&self, limit: Option<usize>) -> Result<Vec<String>> {
         let sql = match limit {
             Some(lim) => format!(
-                "SELECT full_name FROM repos WHERE embedded_text IS NULL AND gone = 0 LIMIT {}",
+                "SELECT full_name FROM repos WHERE embedded_text IS NULL AND gone = 0 AND full_name NOT LIKE '%/__placeholder__' LIMIT {}",
                 lim
             ),
-            None => "SELECT full_name FROM repos WHERE embedded_text IS NULL AND gone = 0".to_string(),
+            None => "SELECT full_name FROM repos WHERE embedded_text IS NULL AND gone = 0 AND full_name NOT LIKE '%/__placeholder__'".to_string(),
         };
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -472,10 +472,10 @@ impl Database {
         results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Count repos without metadata (excluding gone repos)
+    /// Count repos without metadata (excluding gone repos and placeholders)
     pub fn count_repos_without_metadata(&self) -> Result<usize> {
         let count: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM repos WHERE embedded_text IS NULL AND gone = 0",
+            "SELECT COUNT(*) FROM repos WHERE embedded_text IS NULL AND gone = 0 AND full_name NOT LIKE '%/__placeholder__'",
             [],
             |row| row.get(0),
         )?;
