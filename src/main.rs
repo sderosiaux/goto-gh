@@ -124,7 +124,7 @@ enum Commands {
     /// Print database file path
     DbPath,
 
-    /// Discover more repos by exploring owners of existing repos
+    /// Discover more repos by exploring owners of existing repos (also fetches followers)
     #[command(name = "discover")]
     Discover {
         /// Maximum owners to explore (default: all)
@@ -134,6 +134,10 @@ enum Commands {
         /// Number of concurrent requests (default: 5)
         #[arg(short, long, default_value = "5")]
         concurrency: usize,
+
+        /// Show API calls for debugging
+        #[arg(long)]
+        debug: bool,
     },
 }
 
@@ -179,7 +183,8 @@ async fn main() -> Result<()> {
             println!("{}", Config::db_path()?.display());
             Ok(())
         }
-        Some(Commands::Discover { limit, concurrency }) => {
+        Some(Commands::Discover { limit, concurrency, debug }) => {
+            let client = GitHubClient::new_with_debug(token.clone(), debug);
             discover_from_owners(&client, &db, limit, concurrency).await
         }
         None => {
@@ -331,7 +336,7 @@ async fn discover_owner_repos(client: &GitHubClient, db: &Database, full_name: &
     }
 
     // Skip if already explored
-    if db.is_owner_explored(owner)? {
+    if db.is_owner_repos_fetched(owner)? {
         return Ok(());
     }
 
@@ -359,68 +364,101 @@ async fn discover_owner_repos(client: &GitHubClient, db: &Database, full_name: &
     Ok(())
 }
 
-/// Discover more repos by exploring owners of existing repos
+/// Discover more repos by exploring owners of existing repos (also fetches followers)
 async fn discover_from_owners(
     client: &GitHubClient,
     db: &Database,
     limit: Option<usize>,
     _concurrency: usize,
 ) -> Result<()> {
-    // First, check for any interrupted (in-progress) owners and resume them
-    let in_progress = db.get_in_progress_owners()?;
-    if !in_progress.is_empty() {
-        eprintln!(
-            "\x1b[33m..\x1b[0m Resuming {} interrupted owner(s)",
-            in_progress.len()
-        );
-        for owner in &in_progress {
+    // First, check for any interrupted owners and resume them
+    let in_progress_repos = db.get_in_progress_owners()?;
+    let in_progress_followers = db.get_in_progress_followers_fetch()?;
+
+    if !in_progress_repos.is_empty() || !in_progress_followers.is_empty() {
+        let total = in_progress_repos.len() + in_progress_followers.len();
+        eprintln!("\x1b[33m..\x1b[0m Resuming {} interrupted owner(s)", total);
+
+        let mut all_in_progress: Vec<String> = in_progress_repos;
+        all_in_progress.extend(in_progress_followers);
+        all_in_progress.sort();
+        all_in_progress.dedup();
+
+        for owner in &all_in_progress {
             discover_single_owner(client, db, owner).await?;
         }
     }
 
-    let total_unexplored = db.count_unexplored_owners()?;
+    // Get owners that need either repos OR followers fetched
+    let unexplored = db.count_unexplored_owners()?;
+    let without_followers = db.count_owners_without_followers()?;
 
-    if total_unexplored == 0 {
-        println!("\x1b[32mok\x1b[0m All owners already explored");
+    if unexplored == 0 && without_followers == 0 {
+        println!("\x1b[32mok\x1b[0m All owners fully explored (repos + followers)");
         return Ok(());
     }
 
-    let owners = db.get_unexplored_owners(limit)?;
-    let to_explore = owners.len();
+    // Get owners: prioritize unexplored, then those missing followers
+    let mut owners_to_process: Vec<String> = db.get_unexplored_owners(limit)?;
 
+    // If limit allows, add owners that have repos but no followers
+    if let Some(lim) = limit {
+        if owners_to_process.len() < lim {
+            let remaining = lim - owners_to_process.len();
+            let more = db.get_owners_without_followers(Some(remaining))?;
+            owners_to_process.extend(more);
+        }
+    } else {
+        // No limit - add all owners without followers
+        let more = db.get_owners_without_followers(None)?;
+        owners_to_process.extend(more);
+    }
+
+    // Dedupe (some might be in both lists)
+    owners_to_process.sort();
+    owners_to_process.dedup();
+
+    let to_process = owners_to_process.len();
     eprintln!(
-        "\x1b[36m..\x1b[0m Discovering repos from {} owners ({} total unexplored)",
-        to_explore, total_unexplored
+        "\x1b[36m..\x1b[0m Discovering from {} owners ({} need repos, {} need followers)",
+        to_process, unexplored, without_followers
     );
 
-    let mut total_discovered = 0;
-    let mut total_explored = 0;
+    let mut total_repos = 0;
+    let mut total_profiles = 0;
+    let mut processed = 0;
 
-    for owner in owners {
-        let discovered = discover_single_owner(client, db, &owner).await?;
-        total_discovered += discovered;
-        total_explored += 1;
+    for owner in owners_to_process {
+        let (repos, profiles) = discover_single_owner(client, db, &owner).await?;
+        total_repos += repos;
+        total_profiles += profiles;
+        processed += 1;
     }
 
     println!(
-        "\x1b[32mok\x1b[0m Explored {} owners, discovered {} new repos",
-        total_explored, total_discovered
+        "\x1b[32mok\x1b[0m Processed {} owners: +{} repos, +{} profiles",
+        processed, total_repos, total_profiles
     );
 
     let still_unexplored = db.count_unexplored_owners()?;
-    if still_unexplored > 0 {
-        eprintln!("\x1b[36m..\x1b[0m {} owners still unexplored", still_unexplored);
+    let still_without_followers = db.count_owners_without_followers()?;
+
+    if still_unexplored > 0 || still_without_followers > 0 {
+        eprintln!(
+            "\x1b[36m..\x1b[0m {} still need repos, {} need followers",
+            still_unexplored, still_without_followers
+        );
     }
 
     Ok(())
 }
 
-/// Discover repos from a single owner with streaming saves and per-page progress
+/// Discover repos AND followers from a single owner with streaming saves
 async fn discover_single_owner(
     client: &GitHubClient,
     db: &Database,
     owner: &str,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
     use std::cell::RefCell;
     use std::io::IsTerminal;
 
@@ -428,73 +466,106 @@ async fn discover_single_owner(
     let owner_link = format_owner_link(owner, &owner_url);
     let is_tty = std::io::stderr().is_terminal();
 
-    // Mark as in-progress before starting (for resume support)
-    db.mark_owner_in_progress(owner)?;
+    let needs_repos = !db.is_owner_repos_fetched(owner)?;
+    let needs_followers = !db.is_owner_followers_fetched(owner)?;
 
-    // Track inserted repos across pages
-    let inserted_count = RefCell::new(0usize);
-    let total_repos = RefCell::new(0usize);
-    let last_page = RefCell::new(0usize);
+    let mut repos_inserted = 0usize;
+    let mut followers_added = 0usize;
 
-    // Use streaming to save repos as we fetch each page
-    let result = client
-        .list_owner_repos_streaming(owner, |repos, progress| {
-            // Save this page's repos to DB immediately
-            let (inserted, _) = db.add_repo_stubs_bulk(&repos)?;
-            *inserted_count.borrow_mut() += inserted;
-            *total_repos.borrow_mut() = progress.total_so_far;
-            *last_page.borrow_mut() = progress.page;
+    // === REPOS ===
+    if needs_repos {
+        db.mark_owner_in_progress(owner)?;
 
-            // Show per-page progress for large owners
-            if is_tty && progress.page > 1 {
-                eprint!(
-                    "\r  {} \x1b[90mpage {} ({} repos, +{} new)...\x1b[0m\x1b[K",
-                    owner_link, progress.page, progress.total_so_far, *inserted_count.borrow()
-                );
-                let _ = std::io::stderr().flush();
-            }
+        let inserted_count = RefCell::new(0usize);
+        let total_repos = RefCell::new(0usize);
+        let last_page = RefCell::new(0usize);
 
-            Ok(())
-        })
-        .await;
+        let result = client
+            .list_owner_repos_streaming(owner, |repos, progress| {
+                let (inserted, _) = db.add_repo_stubs_bulk(&repos)?;
+                *inserted_count.borrow_mut() += inserted;
+                *total_repos.borrow_mut() = progress.total_so_far;
+                *last_page.borrow_mut() = progress.page;
 
-    // Clear the progress line if we printed any
-    if is_tty && *last_page.borrow() > 1 {
-        eprint!("\r\x1b[K");
-    }
+                if is_tty && progress.page > 1 {
+                    eprint!(
+                        "\r  {} \x1b[90mrepos: {} (+{} new)...\x1b[0m\x1b[K",
+                        owner_link, progress.total_so_far, *inserted_count.borrow()
+                    );
+                    let _ = std::io::stderr().flush();
+                }
+                Ok(())
+            })
+            .await;
 
-    let inserted = *inserted_count.borrow();
-    let total = *total_repos.borrow();
-
-    match result {
-        Ok(_) => {
-            db.mark_owner_explored(owner, total)?;
-
-            if inserted > 0 {
-                eprintln!(
-                    "  {} \x1b[32m+{}\x1b[0m new ({} total repos)",
-                    owner_link, inserted, total
-                );
-            } else if total > 0 {
-                eprintln!(
-                    "  {} \x1b[90m{} repos (all known)\x1b[0m",
-                    owner_link, total
-                );
-            } else {
-                eprintln!("  {} \x1b[90mempty\x1b[0m", owner_link);
-            }
-            Ok(inserted)
+        if is_tty && *last_page.borrow() >= 1 {
+            eprint!("\r\x1b[K");
         }
-        Err(e) => {
-            // Even on error, we may have saved some repos - mark as explored with what we got
-            db.mark_owner_explored(owner, total)?;
-            eprintln!(
-                "  {} \x1b[31mx\x1b[0m {} (saved {} repos before error)",
-                owner_link, e, total
-            );
-            Ok(inserted)
+
+        repos_inserted = *inserted_count.borrow();
+        let total = *total_repos.borrow();
+
+        match result {
+            Ok(_) => db.mark_owner_explored(owner, total)?,
+            Err(_) => db.mark_owner_explored(owner, total)?,
         }
     }
+
+    // === FOLLOWERS ===
+    if needs_followers {
+        db.mark_owner_followers_in_progress(owner)?;
+
+        let added_count = RefCell::new(0usize);
+        let total_followers = RefCell::new(0usize);
+        let last_page = RefCell::new(0usize);
+
+        let result = client
+            .list_owner_followers_streaming(owner, |followers, progress| {
+                let (added, _) = db.add_followers_as_owners_bulk(&followers)?;
+                *added_count.borrow_mut() += added;
+                *total_followers.borrow_mut() = progress.total_so_far;
+                *last_page.borrow_mut() = progress.page;
+
+                if is_tty {
+                    eprint!(
+                        "\r  {} \x1b[90mfollowers: {} (+{} new)...\x1b[0m\x1b[K",
+                        owner_link, progress.total_so_far, *added_count.borrow()
+                    );
+                    let _ = std::io::stderr().flush();
+                }
+                Ok(())
+            })
+            .await;
+
+        if is_tty && *last_page.borrow() >= 1 {
+            eprint!("\r\x1b[K");
+        }
+
+        followers_added = *added_count.borrow();
+        let total = *total_followers.borrow();
+
+        match result {
+            Ok(_) => db.mark_owner_followers_fetched(owner, total)?,
+            Err(_) => db.mark_owner_followers_fetched(owner, total)?,
+        }
+    }
+
+    // Print summary
+    let mut parts = Vec::new();
+    if repos_inserted > 0 {
+        parts.push(format!("+{} repos", repos_inserted));
+    }
+    if followers_added > 0 {
+        parts.push(format!("+{} profiles", followers_added));
+    }
+
+    if !parts.is_empty() {
+        eprintln!("  {} \x1b[32m{}\x1b[0m", owner_link, parts.join(", "));
+    } else if needs_repos || needs_followers {
+        eprintln!("  {} \x1b[90m(all known)\x1b[0m", owner_link);
+    }
+
+    Ok((repos_inserted, followers_added))
 }
 
 /// Fuzzy search by repo name

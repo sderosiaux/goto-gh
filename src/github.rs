@@ -38,22 +38,28 @@ struct ReadmeResponse {
 }
 
 /// GitHub API client
+#[derive(Clone)]
 pub struct GitHubClient {
     client: reqwest::Client,
     token: Option<String>,
+    debug: bool,
 }
 
 impl GitHubClient {
     pub fn new(token: Option<String>) -> Self {
+        Self::new_with_debug(token, false)
+    }
+
+    pub fn new_with_debug(token: Option<String>, debug: bool) -> Self {
         let client = reqwest::Client::builder()
             .user_agent("goto-gh/0.1.0")
             .build()
             .expect("Failed to create HTTP client");
 
-        Self { client, token }
+        Self { client, token, debug }
     }
 
-    /// Build request with auth header if token available
+    /// Build REST request with auth header if token available
     fn request(&self, url: &str) -> reqwest::RequestBuilder {
         let mut req = self.client.get(url);
         if let Some(token) = &self.token {
@@ -61,6 +67,45 @@ impl GitHubClient {
         }
         req.header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
+    }
+
+    /// Send REST request with optional debug timing
+    async fn send_request(&self, url: &str) -> Result<reqwest::Response, reqwest::Error> {
+        use std::io::Write;
+        if self.debug {
+            eprint!("\x1b[90m[API] GET {} ... \x1b[0m", url);
+            std::io::stderr().flush().ok();
+        }
+        let start = std::time::Instant::now();
+        let result = self.request(url).send().await;
+        if self.debug {
+            eprintln!("\x1b[90m{}ms\x1b[0m", start.elapsed().as_millis());
+        }
+        result
+    }
+
+    /// Build GraphQL request
+    fn graphql_request(&self) -> reqwest::RequestBuilder {
+        let mut req = self.client.post("https://api.github.com/graphql");
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+        req.header("User-Agent", "goto-gh/0.1.0")
+    }
+
+    /// Send GraphQL request with optional debug timing
+    async fn send_graphql<T: serde::Serialize>(&self, debug_context: &str, body: &T) -> Result<reqwest::Response, reqwest::Error> {
+        use std::io::Write;
+        if self.debug {
+            eprint!("\x1b[90m[API] POST graphql ({}) ... \x1b[0m", debug_context);
+            std::io::stderr().flush().ok();
+        }
+        let start = std::time::Instant::now();
+        let result = self.graphql_request().json(body).send().await;
+        if self.debug {
+            eprintln!("\x1b[90m{}ms\x1b[0m", start.elapsed().as_millis());
+        }
+        result
     }
 
     /// Get repository details
@@ -96,7 +141,7 @@ impl GitHubClient {
                 tokio::time::sleep(delay).await;
             }
 
-            let response = match self.request(&url).send().await {
+            let response = match self.send_request(&url).await {
                 Ok(r) => r,
                 Err(e) => {
                     last_error = Some(format!("Request failed: {}", e));
@@ -204,20 +249,6 @@ impl GitHubClient {
         true
     }
 
-    /// Check and wait for REST API rate limit if needed
-    pub async fn ensure_rest_quota(&self, min_remaining: u32) -> Result<()> {
-        let rates = self.rate_limit().await?;
-        self.wait_for_rate_limit(&rates.core, "REST API", min_remaining).await;
-        Ok(())
-    }
-
-    /// Check and wait for GraphQL API rate limit if needed
-    pub async fn ensure_graphql_quota(&self, min_remaining: u32) -> Result<()> {
-        let rates = self.rate_limit().await?;
-        self.wait_for_rate_limit(&rates.graphql, "GraphQL API", min_remaining).await;
-        Ok(())
-    }
-
     /// List all public repos for a user or org (paginated, with retry)
     pub async fn list_owner_repos(&self, owner: &str) -> Result<Vec<String>> {
         let mut all = Vec::new();
@@ -269,7 +300,7 @@ impl GitHubClient {
     /// Paginated repo listing with streaming callback and retry logic
     async fn list_repos_paginated_streaming<F>(
         &self,
-        owner: &str,
+        _owner: &str,
         url_template: &str,
         on_page: &mut F,
     ) -> Result<usize>
@@ -293,7 +324,7 @@ impl GitHubClient {
                     tokio::time::sleep(delay).await;
                 }
 
-                let response = match self.request(&url).send().await {
+                let response = match self.send_request(&url).await {
                     Ok(r) => r,
                     Err(e) => {
                         last_error = Some(format!("Request failed: {}", e));
@@ -372,9 +403,7 @@ impl GitHubClient {
 
             // Call the streaming callback with this page's repos
             let progress = DiscoveryProgress {
-                owner: owner.to_string(),
                 page,
-                repos_this_page: count,
                 total_so_far: total_repos,
             };
             on_page(repo_names, progress)?;
@@ -388,6 +417,129 @@ impl GitHubClient {
 
         Ok(total_repos)
     }
+
+    /// List all followers for a user with streaming callback
+    pub async fn list_owner_followers_streaming<F>(
+        &self,
+        owner: &str,
+        mut on_page: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(Vec<String>, FollowerProgress) -> Result<()>,
+    {
+        let mut total_followers = 0;
+        let mut page = 1;
+        let per_page = 100;
+
+        loop {
+            let url = format!(
+                "https://api.github.com/users/{}/followers?per_page={}&page={}",
+                owner, per_page, page
+            );
+
+            // Retry with exponential backoff for transient errors
+            let mut last_error = None;
+            let mut followers_page: Option<Vec<FollowerInfo>> = None;
+
+            for attempt in 0..5 {
+                if attempt > 0 {
+                    let delay = std::time::Duration::from_millis(500 * (1 << attempt.min(3)));
+                    tokio::time::sleep(delay).await;
+                }
+
+                let response = match self.send_request(&url).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        last_error = Some(format!("Request failed: {}", e));
+                        continue;
+                    }
+                };
+
+                let status = response.status();
+
+                // 404 = user not found
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    if page == 1 {
+                        anyhow::bail!("User {} not found (404)", owner);
+                    }
+                    break;
+                }
+
+                // Retry on transient errors (502, 503, 504)
+                if status == reqwest::StatusCode::BAD_GATEWAY
+                    || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+                    || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                {
+                    last_error = Some(format!("GitHub API error {}", status));
+                    continue;
+                }
+
+                // On rate limit (403), wait for reset then retry
+                if status == reqwest::StatusCode::FORBIDDEN {
+                    last_error = Some("Rate limited (403)".to_string());
+                    if let Ok(rates) = self.rate_limit().await {
+                        self.wait_for_rate_limit(&rates.core, "REST API", 10).await;
+                    } else {
+                        eprintln!("  \x1b[33m⏸ Rate limited, waiting 60s...\x1b[0m");
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                    continue;
+                }
+
+                if !status.is_success() {
+                    if total_followers > 0 {
+                        return Ok(total_followers);
+                    }
+                    anyhow::bail!("GitHub API error {}", status);
+                }
+
+                match response.json::<Vec<FollowerInfo>>().await {
+                    Ok(followers) => {
+                        followers_page = Some(followers);
+                        break;
+                    }
+                    Err(e) => {
+                        last_error = Some(format!("JSON parse error: {}", e));
+                        continue;
+                    }
+                }
+            }
+
+            // All retries exhausted
+            let followers = match followers_page {
+                Some(f) => f,
+                None => {
+                    if total_followers > 0 {
+                        return Ok(total_followers);
+                    }
+                    anyhow::bail!("Failed after 5 retries: {}", last_error.unwrap_or_default());
+                }
+            };
+
+            if followers.is_empty() {
+                break;
+            }
+
+            let follower_logins: Vec<String> = followers.iter().map(|f| f.login.clone()).collect();
+            let count = follower_logins.len();
+            total_followers += count;
+
+            // Call the streaming callback with this page's followers
+            let progress = FollowerProgress {
+                page,
+                total_so_far: total_followers,
+            };
+            on_page(follower_logins, progress)?;
+
+            if count < per_page {
+                break;
+            }
+
+            page += 1;
+        }
+
+        Ok(total_followers)
+    }
 }
 
 /// Minimal repo info for listing
@@ -396,12 +548,23 @@ struct OwnerRepoInfo {
     full_name: String,
 }
 
+/// Follower info from GitHub API
+#[derive(Debug, Deserialize)]
+struct FollowerInfo {
+    login: String,
+}
+
 /// Progress update for streaming repo discovery
 #[derive(Debug, Clone)]
 pub struct DiscoveryProgress {
-    pub owner: String,
     pub page: usize,
-    pub repos_this_page: usize,
+    pub total_so_far: usize,
+}
+
+/// Progress update for streaming follower discovery
+#[derive(Debug, Clone)]
+pub struct FollowerProgress {
+    pub page: usize,
     pub total_so_far: usize,
 }
 
@@ -545,8 +708,9 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
             return Ok(vec![]);
         }
 
-        let token = self.token.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("GraphQL requires authentication"))?;
+        if self.token.is_none() {
+            anyhow::bail!("GraphQL requires authentication");
+        }
 
         // Build search query with multiple repo: filters (limit to ~30 per query to avoid URL length issues)
         let chunk_size = 30;
@@ -560,8 +724,7 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
 
         // Create futures for all chunks
         let chunk_futures = chunks.into_iter().enumerate().map(|(chunk_idx, chunk)| {
-            let client = self.client.clone();
-            let token = token.clone();
+            let gh_client = self.clone();
             let semaphore = Arc::clone(&semaphore);
             let completed_count = Arc::clone(&completed_count);
             let chunk = chunk.to_vec();
@@ -599,14 +762,8 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                     }
 
                     let req_start = std::time::Instant::now();
-                    let response = match client
-                        .post("https://api.github.com/graphql")
-                        .header("Authorization", format!("Bearer {}", token))
-                        .header("User-Agent", "goto-gh/0.1.0")
-                        .json(&request)
-                        .send()
-                        .await
-                    {
+                    let debug_ctx = format!("chunk {}/{}, {} repos", chunk_idx + 1, total_chunks, chunk.len());
+                    let response = match gh_client.send_graphql(&debug_ctx, &request).await {
                         Ok(r) => r,
                         Err(e) => {
                             last_error = Some(format!("Request failed: {}", e));
@@ -628,12 +785,7 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                         last_error = Some(format!("Rate limited (403) after {}ms", req_elapsed.as_millis()));
                         // Check rate limit and wait for reset
                         let rate_url = "https://api.github.com/rate_limit";
-                        if let Ok(resp) = client.get(rate_url)
-                            .header("Authorization", format!("Bearer {}", token))
-                            .header("User-Agent", "goto-gh/0.1.0")
-                            .send()
-                            .await
-                        {
+                        if let Ok(resp) = gh_client.send_request(rate_url).await {
                             if let Ok(data) = resp.json::<RateLimitResponse>().await {
                                 let rate = &data.resources.graphql;
                                 let now = std::time::SystemTime::now()

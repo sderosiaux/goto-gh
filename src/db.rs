@@ -124,6 +124,17 @@ impl Database {
             self.conn.execute("ALTER TABLE explored_owners ADD COLUMN status TEXT DEFAULT 'done'", [])?;
         }
 
+        // Table to track owners whose followers have been fetched
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS owner_followers_fetched (
+                owner TEXT PRIMARY KEY,
+                follower_count INTEGER DEFAULT 0,
+                fetched_at INTEGER NOT NULL,
+                status TEXT DEFAULT 'done'
+            )",
+            [],
+        )?;
+
         Ok(())
     }
 
@@ -566,10 +577,10 @@ impl Database {
         results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Check if an owner (user/org) has already been explored
-    pub fn is_owner_explored(&self, owner: &str) -> Result<bool> {
+    /// Check if an owner's repos have already been fetched
+    pub fn is_owner_repos_fetched(&self, owner: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM explored_owners WHERE owner = ?1",
+            "SELECT COUNT(*) FROM explored_owners WHERE owner = ?1 AND status = 'done'",
             params![owner.to_lowercase()],
             |row| row.get(0),
         )?;
@@ -605,16 +616,6 @@ impl Database {
         results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Count in-progress owners
-    pub fn count_in_progress_owners(&self) -> Result<usize> {
-        let count: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM explored_owners WHERE status = 'in_progress'",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count)
-    }
-
     /// Get distinct owners from repos that haven't been explored yet
     pub fn get_unexplored_owners(&self, limit: Option<usize>) -> Result<Vec<String>> {
         let sql = match limit {
@@ -645,5 +646,139 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    // ===== Follower fetching tracking =====
+
+    /// Check if an owner's followers have already been fetched
+    pub fn is_owner_followers_fetched(&self, owner: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM owner_followers_fetched WHERE owner = ?1 AND status = 'done'",
+            params![owner.to_lowercase()],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Mark an owner's followers as fetched (completed)
+    pub fn mark_owner_followers_fetched(&self, owner: &str, follower_count: usize) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO owner_followers_fetched (owner, follower_count, fetched_at, status) VALUES (?1, ?2, ?3, 'done')",
+            params![owner.to_lowercase(), follower_count as i64, now],
+        )?;
+        Ok(())
+    }
+
+    /// Mark an owner's followers fetch as in-progress
+    pub fn mark_owner_followers_in_progress(&self, owner: &str) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO owner_followers_fetched (owner, follower_count, fetched_at, status) VALUES (?1, 0, ?2, 'in_progress')",
+            params![owner.to_lowercase(), now],
+        )?;
+        Ok(())
+    }
+
+    /// Get owners whose followers fetch was interrupted
+    pub fn get_in_progress_followers_fetch(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT owner FROM owner_followers_fetched WHERE status = 'in_progress'"
+        )?;
+        let results = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Get explored owners whose followers haven't been fetched yet
+    pub fn get_owners_without_followers(&self, limit: Option<usize>) -> Result<Vec<String>> {
+        let sql = match limit {
+            Some(lim) => format!(
+                "SELECT owner FROM explored_owners
+                 WHERE status = 'done'
+                 AND owner NOT IN (SELECT owner FROM owner_followers_fetched)
+                 ORDER BY repo_count DESC
+                 LIMIT {}",
+                lim
+            ),
+            None => "SELECT owner FROM explored_owners
+                     WHERE status = 'done'
+                     AND owner NOT IN (SELECT owner FROM owner_followers_fetched)
+                     ORDER BY repo_count DESC".to_string(),
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let results = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Count explored owners whose followers haven't been fetched
+    pub fn count_owners_without_followers(&self) -> Result<usize> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM explored_owners
+             WHERE status = 'done'
+             AND owner NOT IN (SELECT owner FROM owner_followers_fetched)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Add a follower as a new owner to explore (if not already known)
+    /// Returns true if it was a new owner, false if already existed
+    pub fn add_follower_as_owner(&self, follower: &str) -> Result<bool> {
+        let follower_lower = follower.to_lowercase();
+
+        // Check if this owner is already in explored_owners (repos fetched)
+        let in_explored: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM explored_owners WHERE owner = ?1",
+            params![&follower_lower],
+            |row| row.get(0),
+        )?;
+
+        if in_explored > 0 {
+            return Ok(false);
+        }
+
+        // Check if this owner is already in owner_followers_fetched (followers fetched)
+        let in_followers: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM owner_followers_fetched WHERE owner = ?1",
+            params![&follower_lower],
+            |row| row.get(0),
+        )?;
+
+        if in_followers > 0 {
+            return Ok(false);
+        }
+
+        // Check if we already have a placeholder for this owner
+        let has_placeholder: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM repos WHERE full_name = ?1",
+            params![format!("{}/__placeholder__", &follower_lower)],
+            |row| row.get(0),
+        )?;
+
+        if has_placeholder > 0 {
+            return Ok(false);
+        }
+
+        // Add a placeholder repo so the owner appears in unexplored_owners
+        self.add_repo_stub(&format!("{}/__placeholder__", follower_lower))?;
+        Ok(true)
+    }
+
+    /// Bulk add followers as owners
+    pub fn add_followers_as_owners_bulk(&self, followers: &[String]) -> Result<(usize, usize)> {
+        let mut added = 0;
+        let mut skipped = 0;
+
+        for follower in followers {
+            if self.add_follower_as_owner(follower)? {
+                added += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+
+        Ok((added, skipped))
     }
 }
