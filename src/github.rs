@@ -1098,6 +1098,44 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
 
                     if let Some(errors) = gql_response.errors {
                         let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
+
+                        // Check if any error is a rate limit error
+                        let is_rate_limit = errors.iter().any(|e|
+                            e.message.to_lowercase().contains("rate limit")
+                        );
+
+                        if is_rate_limit {
+                            last_error = Some("Rate limited (GraphQL error)".to_string());
+                            // Check rate limit and wait for reset
+                            let rate_url = "https://api.github.com/rate_limit";
+                            if let Ok(resp) = gh_client.send_request(rate_url).await {
+                                if let Ok(data) = resp.json::<RateLimitResponse>().await {
+                                    let rate = &data.resources.graphql;
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs();
+                                    if rate.reset > now {
+                                        let wait_secs = rate.reset - now + 5;
+                                        let wait_mins = wait_secs / 60;
+                                        let wait_remainder = wait_secs % 60;
+                                        eprintln!(
+                                            "  \x1b[33m⏸ GraphQL rate limit exceeded ({}/{}), waiting {}m{}s for reset...\x1b[0m",
+                                            rate.remaining, rate.limit, wait_mins, wait_remainder
+                                        );
+                                        tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                                        eprintln!("  \x1b[32m▶ Rate limit reset, resuming\x1b[0m");
+                                        continue;
+                                    }
+                                }
+                            }
+                            // Fallback: wait 60s if we can't get rate limit info
+                            eprintln!("  \x1b[33m⏸ GraphQL rate limit exceeded, waiting 60s...\x1b[0m");
+                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                            continue;
+                        }
+
+                        // Non-rate-limit errors - just log them
                         eprintln!("  \x1b[90mGraphQL warnings: {}\x1b[0m", msgs.join(", "));
                     }
 
