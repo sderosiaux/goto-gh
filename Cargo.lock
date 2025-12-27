@@ -999,6 +999,7 @@ dependencies = [
  "dirs 5.0.1",
  "fastembed",
  "futures",
+ "regex",
  "regex-lite",
  "reqwest",
  "rusqlite",

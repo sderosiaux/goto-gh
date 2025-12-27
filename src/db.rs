@@ -135,6 +135,49 @@ impl Database {
             [],
         )?;
 
+        // Papers table - stores extracted paper links
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS papers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT UNIQUE NOT NULL,
+                domain TEXT NOT NULL,
+                arxiv_id TEXT,
+                doi TEXT,
+                title TEXT,
+                authors TEXT,
+                abstract TEXT,
+                published_at TEXT,
+                fetched_at TEXT
+            )",
+            [],
+        )?;
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_papers_arxiv ON papers(arxiv_id)", [])?;
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_papers_doi ON papers(doi)", [])?;
+
+        // Paper sources - links papers to repos that mention them
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS paper_sources (
+                paper_id INTEGER NOT NULL,
+                repo_id INTEGER NOT NULL,
+                context TEXT,
+                extracted_at TEXT NOT NULL,
+                PRIMARY KEY (paper_id, repo_id),
+                FOREIGN KEY (paper_id) REFERENCES papers(id),
+                FOREIGN KEY (repo_id) REFERENCES repos(id)
+            )",
+            [],
+        )?;
+
+        // Migration: add papers_extracted_at column to repos
+        let has_papers_extracted: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('repos') WHERE name = 'papers_extracted_at'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_papers_extracted {
+            self.conn.execute("ALTER TABLE repos ADD COLUMN papers_extracted_at TEXT", [])?;
+        }
+
         Ok(())
     }
 
@@ -805,5 +848,152 @@ impl Database {
         }
 
         Ok((added, skipped))
+    }
+
+    // ==================== Paper extraction methods ====================
+
+    /// Get repos that need paper extraction
+    /// Returns (repo_id, full_name, readme_excerpt)
+    pub fn get_repos_needing_paper_extraction(&self, limit: Option<usize>) -> Result<Vec<(i64, String, String)>> {
+        let sql = match limit {
+            Some(lim) => format!(
+                "SELECT id, full_name, readme_excerpt FROM repos
+                 WHERE readme_excerpt IS NOT NULL
+                   AND gone = 0
+                   AND full_name NOT LIKE '%/__placeholder__'
+                   AND (papers_extracted_at IS NULL OR papers_extracted_at < last_indexed)
+                 LIMIT {}",
+                lim
+            ),
+            None => "SELECT id, full_name, readme_excerpt FROM repos
+                     WHERE readme_excerpt IS NOT NULL
+                       AND gone = 0
+                       AND full_name NOT LIKE '%/__placeholder__'
+                       AND (papers_extracted_at IS NULL OR papers_extracted_at < last_indexed)".to_string(),
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let results = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Count repos needing paper extraction
+    pub fn count_repos_needing_paper_extraction(&self) -> Result<usize> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM repos
+             WHERE readme_excerpt IS NOT NULL
+               AND gone = 0
+               AND full_name NOT LIKE '%/__placeholder__'
+               AND (papers_extracted_at IS NULL OR papers_extracted_at < last_indexed)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Insert or get a paper, returns paper_id
+    pub fn upsert_paper(&self, url: &str, domain: &str, arxiv_id: Option<&str>, doi: Option<&str>) -> Result<i64> {
+        // Try to insert, ignore if exists
+        self.conn.execute(
+            "INSERT OR IGNORE INTO papers (url, domain, arxiv_id, doi) VALUES (?1, ?2, ?3, ?4)",
+            params![url, domain, arxiv_id, doi],
+        )?;
+
+        // Get the id (either just inserted or existing)
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM papers WHERE url = ?",
+            [url],
+            |row| row.get(0),
+        )?;
+
+        Ok(id)
+    }
+
+    /// Link a paper to a repo (source)
+    pub fn add_paper_source(&self, paper_id: i64, repo_id: i64, context: Option<&str>) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO paper_sources (paper_id, repo_id, context, extracted_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![paper_id, repo_id, context, now],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a repo as having papers extracted
+    pub fn mark_papers_extracted(&self, repo_id: i64) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE repos SET papers_extracted_at = ? WHERE id = ?",
+            params![now, repo_id],
+        )?;
+        Ok(())
+    }
+
+    /// Count total papers
+    pub fn count_papers(&self) -> Result<usize> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM papers",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Count paper sources (repo-paper links)
+    pub fn count_paper_sources(&self) -> Result<usize> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM paper_sources",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get papers needing metadata fetch (no title yet)
+    pub fn get_papers_needing_metadata(&self, limit: Option<usize>) -> Result<Vec<(i64, String, Option<String>, Option<String>)>> {
+        let sql = match limit {
+            Some(lim) => format!(
+                "SELECT id, url, arxiv_id, doi FROM papers WHERE title IS NULL LIMIT {}",
+                lim
+            ),
+            None => "SELECT id, url, arxiv_id, doi FROM papers WHERE title IS NULL".to_string(),
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let results = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Update paper metadata
+    pub fn update_paper_metadata(
+        &self,
+        paper_id: i64,
+        title: Option<&str>,
+        authors: Option<&str>,
+        abstract_text: Option<&str>,
+        published_at: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE papers SET title = ?1, authors = ?2, abstract = ?3, published_at = ?4, fetched_at = ?5 WHERE id = ?6",
+            params![title, authors, abstract_text, published_at, now, paper_id],
+        )?;
+        Ok(())
     }
 }

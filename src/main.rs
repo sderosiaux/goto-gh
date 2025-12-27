@@ -2,6 +2,7 @@ mod config;
 mod db;
 mod embedding;
 mod github;
+mod papers;
 mod proxy;
 
 use anyhow::Result;
@@ -167,6 +168,18 @@ enum Commands {
         #[arg(long)]
         force_proxy: bool,
     },
+
+    /// Extract paper links (arxiv, doi, etc.) from READMEs
+    #[command(name = "extract-papers")]
+    ExtractPapers {
+        /// Maximum repos to process (default: all)
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Batch size for processing (default: 1000)
+        #[arg(short, long, default_value = "1000")]
+        batch_size: usize,
+    },
 }
 
 #[tokio::main]
@@ -251,6 +264,9 @@ async fn main() -> Result<()> {
 
             let client = GitHubClient::new_with_options(token.clone(), debug, proxy_manager, force_proxy);
             discover_from_owners(&client, &db, limit, concurrency).await
+        }
+        Some(Commands::ExtractPapers { limit, batch_size }) => {
+            extract_papers(&db, limit, batch_size)
         }
         None => {
             use clap::CommandFactory;
@@ -1276,5 +1292,108 @@ impl Drop for Dots {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
     }
+}
+
+/// Extract paper links from READMEs
+fn extract_papers(db: &Database, limit: Option<usize>, batch_size: usize) -> Result<()> {
+    let need_extraction = db.count_repos_needing_paper_extraction()?;
+
+    if need_extraction == 0 {
+        let total_papers = db.count_papers()?;
+        let total_sources = db.count_paper_sources()?;
+        eprintln!("\x1b[32mok\x1b[0m All READMEs already processed");
+        eprintln!("    {} unique papers from {} repo mentions", total_papers, total_sources);
+        return Ok(());
+    }
+
+    let to_process = limit.map(|l| l.min(need_extraction)).unwrap_or(need_extraction);
+    eprintln!(
+        "\x1b[36m..\x1b[0m Extracting papers from {} READMEs (batch size: {})",
+        to_process, batch_size
+    );
+
+    let mut total_processed = 0;
+    let mut total_papers_found = 0;
+    let mut total_new_papers = 0;
+    let start = std::time::Instant::now();
+
+    loop {
+        let remaining = limit.map(|l| l - total_processed).unwrap_or(usize::MAX);
+        if remaining == 0 {
+            break;
+        }
+
+        let batch_limit = batch_size.min(remaining);
+        let repos = db.get_repos_needing_paper_extraction(Some(batch_limit))?;
+
+        if repos.is_empty() {
+            break;
+        }
+
+        let batch_start = std::time::Instant::now();
+        let mut batch_papers = 0;
+        let mut batch_new = 0;
+
+        for (repo_id, full_name, readme) in &repos {
+            let papers = papers::extract_paper_links(readme);
+            batch_papers += papers.len();
+
+            for paper in papers {
+                let paper_id = db.upsert_paper(
+                    &paper.url,
+                    &paper.domain,
+                    paper.arxiv_id.as_deref(),
+                    paper.doi.as_deref(),
+                )?;
+
+                // Check if this is a new paper (simple heuristic: if paper_id is recent)
+                // Actually, upsert returns existing id, so we track via sources
+                let sources_before = db.count_paper_sources()?;
+                db.add_paper_source(paper_id, *repo_id, paper.context.as_deref())?;
+                let sources_after = db.count_paper_sources()?;
+                if sources_after > sources_before {
+                    batch_new += 1;
+                }
+            }
+
+            db.mark_papers_extracted(*repo_id)?;
+            total_processed += 1;
+        }
+
+        total_papers_found += batch_papers;
+        total_new_papers += batch_new;
+
+        let elapsed = batch_start.elapsed();
+        let repos_per_sec = repos.len() as f64 / elapsed.as_secs_f64();
+
+        eprintln!(
+            "  \x1b[90m✓ Batch: {} repos in {:.1}s ({:.0}/s) - {} papers ({} new)\x1b[0m",
+            repos.len(),
+            elapsed.as_secs_f64(),
+            repos_per_sec,
+            batch_papers,
+            batch_new
+        );
+    }
+
+    let total_elapsed = start.elapsed();
+    let total_papers = db.count_papers()?;
+    let total_sources = db.count_paper_sources()?;
+
+    eprintln!(
+        "\x1b[32mok\x1b[0m Processed {} repos in {:.1}s",
+        total_processed,
+        total_elapsed.as_secs_f64()
+    );
+    eprintln!(
+        "    Found {} paper links ({} new unique papers)",
+        total_papers_found, total_new_papers
+    );
+    eprintln!(
+        "    Total: {} unique papers from {} repo mentions",
+        total_papers, total_sources
+    );
+
+    Ok(())
 }
 

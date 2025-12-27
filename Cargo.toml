@@ -44,6 +44,7 @@ base64 = "0.22"
 
 # Regex (lightweight, for parsing markdown links)
 regex-lite = "0.1"
+regex = "1.12.2"
 
 [profile.release]
 opt-level = 3
