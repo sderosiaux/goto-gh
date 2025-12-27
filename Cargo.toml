@@ -11,8 +11,12 @@ clap = { version = "4", features = ["derive"] }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
 futures = "0.3"
+
+# HTTP server (for SQL explorer)
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -35,9 +39,6 @@ dirs = "5"
 # Error handling
 anyhow = "1"
 thiserror = "1"
-
-# Signal handling
-ctrlc = "3.4"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

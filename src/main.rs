@@ -4,6 +4,7 @@ mod discovery;
 mod embedding;
 mod formatting;
 mod github;
+mod http;
 mod papers;
 mod proxy;
 mod search;
@@ -170,6 +171,14 @@ enum Commands {
         #[arg(short, long, default_value = "1000")]
         batch_size: usize,
     },
+
+    /// Start HTTP server with SQL explorer interface
+    #[command(hide = true)]
+    Http {
+        /// Port to listen on (default: 3000)
+        #[arg(short, long, default_value = "3000")]
+        port: u16,
+    },
 }
 
 #[tokio::main]
@@ -182,19 +191,31 @@ async fn main() -> Result<()> {
         eprintln!("\x1b[33m!\x1b[0m WAL checkpoint at startup failed: {}", e);
     }
 
-    // Set up graceful shutdown handler
-    let db_path = db.path().to_path_buf();
-    ctrlc::set_handler(move || {
-        eprintln!("\n\x1b[33m!\x1b[0m Interrupted, checkpointing WAL...");
-        // Open a new connection just for checkpoint (original db is in async context)
-        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-            match conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
-                Ok(_) => eprintln!("\x1b[32mok\x1b[0m WAL checkpointed"),
-                Err(e) => eprintln!("\x1b[31mx\x1b[0m WAL checkpoint failed: {}", e),
+    // Run main logic with graceful shutdown support
+    let result = run_main(cli, db).await;
+
+    result
+}
+
+async fn run_main(cli: Cli, db: Database) -> Result<()> {
+    // Set up graceful shutdown using tokio signal (safer than ctrlc)
+    let db_for_shutdown = db.path().to_path_buf();
+
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("\n\x1b[33m!\x1b[0m Interrupted, checkpointing WAL...");
+            // Use the same connection approach but with timeout awareness
+            if let Ok(conn) = rusqlite::Connection::open(&db_for_shutdown) {
+                // Set busy timeout to avoid deadlock
+                let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+                match conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
+                    Ok(_) => eprintln!("\x1b[32mok\x1b[0m WAL checkpointed"),
+                    Err(e) => eprintln!("\x1b[31mx\x1b[0m WAL checkpoint failed: {}", e),
+                }
             }
+            std::process::exit(130); // 128 + SIGINT
         }
-        std::process::exit(0);
-    }).expect("Error setting Ctrl-C handler");
+    });
 
     let token = Config::github_token();
     let client = GitHubClient::new(token.clone());
@@ -278,6 +299,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::ExtractPapers { limit, batch_size }) => {
             extract_papers(&db, limit, batch_size)
+        }
+        Some(Commands::Http { port }) => {
+            http::start_server(db.path().to_path_buf(), port).await
         }
         None => {
             use clap::CommandFactory;
@@ -781,6 +805,8 @@ fn embed_missing(db: &Database, batch_size: usize, limit: Option<usize>, delay_s
         );
 
         // Pause between batches to avoid overloading the embedding API
+        // Note: embed_missing is sync, but this runs in tokio context via block_on
+        // Using std::thread::sleep is intentional here to not block other async tasks
         if total_embedded < to_process && delay_secs > 0 {
             eprintln!("  \x1b[90m⏳ Waiting {}s before next batch...\x1b[0m", delay_secs);
             std::thread::sleep(std::time::Duration::from_secs(delay_secs));

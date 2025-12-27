@@ -989,7 +989,8 @@ impl GitHubClient {
             })
             .collect();
 
-        format!("query {{ {} }}", repo_queries.join("\n"))
+        // Include rateLimit to track API cost/quota
+        format!("query {{ rateLimit {{ cost remaining resetAt }} {} }}", repo_queries.join("\n"))
     }
 
     /// Parse a GraphQL repo from JSON value
@@ -1198,17 +1199,40 @@ impl GitHubClient {
                     }
 
                     // Parse repos from dynamic JSON response
-                    let repos = gql_response.data
-                        .map(|data| Self::parse_graphql_response(&data))
+                    let repos = gql_response.data.as_ref()
+                        .map(|data| Self::parse_graphql_response(data))
                         .unwrap_or_default();
+
+                    // Parse and check GraphQL rate limit (cost-based, separate from REST)
+                    let rate_limit_info = gql_response.data.as_ref()
+                        .and_then(|data| data.get("rateLimit"))
+                        .map(|rl| {
+                            let cost = rl.get("cost").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let remaining = rl.get("remaining").and_then(|v| v.as_u64()).unwrap_or(0);
+                            (cost, remaining)
+                        });
 
                     // Atomic debug output (single line, parallel-safe)
                     let done = completed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     let with_readme = repos.iter().filter(|r| r.readme.is_some()).count();
-                    eprintln!("  \x1b[90m✓ [{}/{}] {}ms - {} repos ({} README){}\x1b[0m",
+
+                    // Include rate limit info in debug output
+                    let rate_info = rate_limit_info
+                        .map(|(cost, remaining)| format!(", cost={} rem={}", cost, remaining))
+                        .unwrap_or_default();
+
+                    eprintln!("  \x1b[90m✓ [{}/{}] {}ms - {} repos ({} README){}{}\x1b[0m",
                         done, total_chunks, req_elapsed.as_millis(),
                         repos.len(), with_readme,
-                        if attempt > 0 { format!(", {} retries", attempt) } else { String::new() });
+                        if attempt > 0 { format!(", {} retries", attempt) } else { String::new() },
+                        rate_info);
+
+                    // Warn if approaching rate limit (< 500 points remaining)
+                    if let Some((cost, remaining)) = rate_limit_info {
+                        if remaining < 500 {
+                            eprintln!("  \x1b[33m⚠ GraphQL quota low: {} points remaining (cost was {})\x1b[0m", remaining, cost);
+                        }
+                    }
 
                     return Ok(repos);
                 }

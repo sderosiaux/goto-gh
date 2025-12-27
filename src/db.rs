@@ -79,10 +79,11 @@ impl Database {
     fn init(&self) -> Result<()> {
         self.conn.execute_batch(
             "
+            PRAGMA foreign_keys = ON;
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA temp_store = MEMORY;
-            PRAGMA cache_size = -2000;
+            PRAGMA cache_size = -307200;
 
             CREATE TABLE IF NOT EXISTS repos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,13 +105,12 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_repos_name_lower ON repos(LOWER(full_name));
             CREATE INDEX IF NOT EXISTS idx_repos_stars ON repos(stars DESC);
 
-            CREATE TABLE IF NOT EXISTS index_checkpoints (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                last_star_range_idx INTEGER NOT NULL,
-                last_cursor TEXT,
-                total_fetched INTEGER DEFAULT 0,
-                updated_at TEXT NOT NULL
-            );
+            -- Composite indexes for discovery queries
+            CREATE INDEX IF NOT EXISTS idx_repos_gone_embedded ON repos(gone, embedded_text) WHERE embedded_text IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_repos_gone_id ON repos(gone, id) WHERE gone = 0;
+
+            -- Drop legacy unused table
+            DROP TABLE IF EXISTS index_checkpoints;
             ",
         )?;
 
@@ -1113,15 +1113,17 @@ impl Database {
             return Ok((0, followers.len()));
         }
 
-        // Insert all remaining candidates in a single transaction
+        // Insert all remaining candidates in a single transaction using prepared statement
         let now = Utc::now().timestamp();
         self.conn.execute("BEGIN IMMEDIATE", [])?;
 
-        for candidate in &final_candidates {
-            self.conn.execute(
-                "INSERT INTO owners_to_explore (owner, added_at, source) VALUES (?1, ?2, 'follower')",
-                params![candidate, now],
+        {
+            let mut stmt = self.conn.prepare_cached(
+                "INSERT INTO owners_to_explore (owner, added_at, source) VALUES (?1, ?2, 'follower')"
             )?;
+            for candidate in &final_candidates {
+                stmt.execute(params![candidate, now])?;
+            }
         }
 
         self.conn.execute("COMMIT", [])?;
