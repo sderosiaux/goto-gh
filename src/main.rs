@@ -315,7 +315,7 @@ Keywords:"#,
                 eprintln!("\x1b[33m!\x1b[0m Claude returned empty, using original query");
                 Ok(query.to_string())
             } else {
-                eprintln!("\x1b[32m✓\x1b[0m Expanded: {}", truncate_str(&expanded, 80));
+                eprintln!("\x1b[32m✓\x1b[0m Expanded: {}", expanded);
                 Ok(expanded)
             }
         }
