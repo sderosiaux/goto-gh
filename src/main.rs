@@ -186,6 +186,26 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let db = Database::open()?;
+
+    // Checkpoint WAL at startup (clean up from previous/crashed runs)
+    if let Err(e) = db.checkpoint() {
+        eprintln!("\x1b[33m!\x1b[0m WAL checkpoint at startup failed: {}", e);
+    }
+
+    // Set up graceful shutdown handler
+    let db_path = db.path().to_path_buf();
+    ctrlc::set_handler(move || {
+        eprintln!("\n\x1b[33m!\x1b[0m Interrupted, checkpointing WAL...");
+        // Open a new connection just for checkpoint (original db is in async context)
+        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+            match conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
+                Ok(_) => eprintln!("\x1b[32mok\x1b[0m WAL checkpointed"),
+                Err(e) => eprintln!("\x1b[31mx\x1b[0m WAL checkpoint failed: {}", e),
+            }
+        }
+        std::process::exit(0);
+    }).expect("Error setting Ctrl-C handler");
+
     let token = Config::github_token();
     let client = GitHubClient::new(token.clone());
 
@@ -584,7 +604,15 @@ async fn discover_from_owners(
         total_repos += repos;
         total_profiles += profiles;
         processed += 1;
+
+        // Checkpoint WAL periodically to prevent unbounded growth
+        if processed % 50 == 0 {
+            let _ = db.checkpoint();
+        }
     }
+
+    // Final checkpoint before exit
+    let _ = db.checkpoint();
 
     println!(
         "\x1b[32mok\x1b[0m Processed {} owners: +{} repos, +{} profiles",
@@ -1089,9 +1117,17 @@ async fn fetch_from_db(
             eprintln!("  ... discovered {} new repos from READMEs", total_discovered);
         }
 
+        // Checkpoint WAL periodically to prevent unbounded growth
+        if batch_num % 10 == 0 {
+            let _ = db.checkpoint();
+        }
+
         // Small delay between batches to avoid rate limits
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    // Final checkpoint before exit
+    let _ = db.checkpoint();
 
     eprintln!(
         "\x1b[32mok\x1b[0m Fetched {} repos ({} errors) - ready for embedding",

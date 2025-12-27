@@ -20,6 +20,7 @@ pub struct Repo {
 
 pub struct Database {
     conn: Connection,
+    path: std::path::PathBuf,
 }
 
 impl Database {
@@ -39,9 +40,21 @@ impl Database {
         let conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
 
-        let db = Self { conn };
+        let db = Self { conn, path: db_path };
         db.init()?;
         Ok(db)
+    }
+
+    /// Get the database file path
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Checkpoint WAL to merge pending writes into main DB file
+    /// Uses PASSIVE mode which doesn't block other connections
+    pub fn checkpoint(&self) -> Result<()> {
+        self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+        Ok(())
     }
 
     fn init(&self) -> Result<()> {
@@ -69,6 +82,7 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_repos_name ON repos(full_name);
+            CREATE INDEX IF NOT EXISTS idx_repos_name_lower ON repos(LOWER(full_name));
             CREATE INDEX IF NOT EXISTS idx_repos_stars ON repos(stars DESC);
 
             CREATE TABLE IF NOT EXISTS index_checkpoints (
@@ -413,46 +427,69 @@ impl Database {
     }
 
     /// Upsert repo metadata only (no embedding) - for fetch-only mode
+    /// Preserves original case from GitHub API response
     pub fn upsert_repo_metadata_only(&self, repo: &RepoWithReadme, embedded_text: &str) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         let topics_json = serde_json::to_string(&repo.topics)?;
 
-        self.conn.execute(
-            "INSERT INTO repos (full_name, description, url, stars, language, topics, readme_excerpt, embedded_text, pushed_at, created_at, last_indexed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(full_name) DO UPDATE SET
-                 description = ?2,
-                 url = ?3,
-                 stars = ?4,
-                 language = ?5,
-                 topics = ?6,
-                 readme_excerpt = ?7,
-                 embedded_text = ?8,
-                 pushed_at = ?9,
-                 created_at = ?10,
-                 last_indexed = ?11",
-            params![
-                repo.full_name,
-                repo.description,
-                repo.html_url,
-                repo.stars as i64,
-                repo.language,
-                topics_json,
-                repo.readme.as_deref(),
-                embedded_text,
-                repo.pushed_at,
-                repo.created_at,
-                now,
-            ],
-        )?;
-
-        let id = self.conn.query_row(
-            "SELECT id FROM repos WHERE full_name = ?",
-            [&repo.full_name],
+        // Check if repo exists (case-insensitive) and get its id
+        let existing_id: Option<i64> = self.conn.query_row(
+            "SELECT id FROM repos WHERE LOWER(full_name) = LOWER(?1)",
+            params![&repo.full_name],
             |row| row.get(0),
-        )?;
+        ).ok();
 
-        Ok(id)
+        if let Some(id) = existing_id {
+            // Update existing row (keep original full_name, update metadata)
+            self.conn.execute(
+                "UPDATE repos SET
+                    description = ?2,
+                    url = ?3,
+                    stars = ?4,
+                    language = ?5,
+                    topics = ?6,
+                    readme_excerpt = ?7,
+                    embedded_text = ?8,
+                    pushed_at = ?9,
+                    created_at = ?10,
+                    last_indexed = ?11
+                 WHERE id = ?1",
+                params![
+                    id,
+                    repo.description,
+                    repo.html_url,
+                    repo.stars as i64,
+                    repo.language,
+                    topics_json,
+                    repo.readme.as_deref(),
+                    embedded_text,
+                    repo.pushed_at,
+                    repo.created_at,
+                    now,
+                ],
+            )?;
+            Ok(id)
+        } else {
+            // Insert new row with original case
+            self.conn.execute(
+                "INSERT INTO repos (full_name, description, url, stars, language, topics, readme_excerpt, embedded_text, pushed_at, created_at, last_indexed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    &repo.full_name,
+                    repo.description,
+                    repo.html_url,
+                    repo.stars as i64,
+                    repo.language,
+                    topics_json,
+                    repo.readme.as_deref(),
+                    embedded_text,
+                    repo.pushed_at,
+                    repo.created_at,
+                    now,
+                ],
+            )?;
+            Ok(self.conn.last_insert_rowid())
+        }
     }
 
     /// Count repos without embeddings (excluding gone repos and placeholders)
@@ -484,8 +521,20 @@ impl Database {
 
     /// Add a repo stub (just the name) - no metadata, no embedding
     /// Used for bulk loading repo names before fetching metadata
+    /// Preserves original case for GitHub API calls, uses case-insensitive dedup
     pub fn add_repo_stub(&self, full_name: &str) -> Result<bool> {
-        // Only insert if not exists - don't update existing repos
+        // Check if repo already exists (case-insensitive)
+        let exists: bool = self.conn.query_row(
+            "SELECT 1 FROM repos WHERE LOWER(full_name) = LOWER(?1) LIMIT 1",
+            params![full_name],
+            |_| Ok(true),
+        ).unwrap_or(false);
+
+        if exists {
+            return Ok(false);
+        }
+
+        // Insert with original case (needed for GitHub API)
         let result = self.conn.execute(
             "INSERT OR IGNORE INTO repos (full_name, url, last_indexed)
              VALUES (?1, ?2, ?3)",
@@ -540,15 +589,15 @@ impl Database {
         Ok(count)
     }
 
-    /// Mark multiple repos as gone (batch)
+    /// Mark multiple repos as gone (batch, case-insensitive match)
     pub fn mark_as_gone_bulk(&self, names: &[String]) -> Result<usize> {
         let mut count = 0;
         for name in names {
-            self.conn.execute(
-                "UPDATE repos SET gone = 1 WHERE full_name = ?",
+            let rows = self.conn.execute(
+                "UPDATE repos SET gone = 1 WHERE LOWER(full_name) = LOWER(?)",
                 [name],
             )?;
-            count += 1;
+            count += rows;
         }
         Ok(count)
     }
