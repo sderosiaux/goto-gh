@@ -412,12 +412,27 @@ impl Database {
         Ok(id)
     }
 
-    /// Count repos without embeddings
+    /// Count repos without embeddings (excluding gone repos and placeholders)
     pub fn count_repos_without_embeddings(&self) -> Result<usize> {
         let count: usize = self.conn.query_row(
             "SELECT COUNT(*) FROM repos r
              LEFT JOIN repo_embeddings e ON r.id = e.repo_id
-             WHERE e.repo_id IS NULL AND r.embedded_text IS NOT NULL",
+             WHERE e.repo_id IS NULL
+               AND r.embedded_text IS NOT NULL
+               AND r.gone = 0
+               AND r.full_name NOT LIKE '%/__placeholder__'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Count distinct owners/users in the database
+    pub fn count_distinct_owners(&self) -> Result<usize> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(DISTINCT LOWER(SUBSTR(full_name, 1, INSTR(full_name, '/') - 1)))
+             FROM repos
+             WHERE full_name NOT LIKE '%/__placeholder__'",
             [],
             |row| row.get(0),
         )?;
@@ -499,6 +514,16 @@ impl Database {
     pub fn count_gone(&self) -> Result<usize> {
         let count: usize = self.conn.query_row(
             "SELECT COUNT(*) FROM repos WHERE gone = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Count placeholder repos
+    pub fn count_placeholders(&self) -> Result<usize> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM repos WHERE full_name LIKE '%/__placeholder__'",
             [],
             |row| row.get(0),
         )?;

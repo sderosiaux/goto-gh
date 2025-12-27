@@ -744,12 +744,18 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 fn show_stats(db: &Database) -> Result<()> {
     let (total, indexed) = db.stats()?;
     let without_metadata = db.count_repos_without_metadata()?;
-    let without_embeddings = db.count_repos_without_embeddings()?;
     let gone = db.count_gone()?;
+    let placeholders = db.count_placeholders()?;
+    let distinct_owners = db.count_distinct_owners()?;
+    // Total visible = total minus gone and internal placeholders
+    let total_visible = total - gone - placeholders;
+    let with_metadata = total_visible - without_metadata;
+    let without_embeddings = total_visible - indexed;
 
     println!("\x1b[36mIndex Statistics\x1b[0m\n");
-    println!("  \x1b[90mTotal repos:\x1b[0m        {}", total);
-    println!("  \x1b[90mWith metadata:\x1b[0m      {}", total - without_metadata - gone);
+    println!("  \x1b[90mTotal repos:\x1b[0m        {}", total_visible);
+    println!("  \x1b[90mDistinct owners:\x1b[0m    {}", distinct_owners);
+    println!("  \x1b[90mWith metadata:\x1b[0m      {}", with_metadata);
     println!("  \x1b[90mWith embeddings:\x1b[0m    {}", indexed);
     println!();
     println!("  \x1b[90mNeed metadata:\x1b[0m      {}", without_metadata);
