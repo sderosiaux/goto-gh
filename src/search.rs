@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 
 use crate::db::Database;
-use crate::embedding::embed_text;
+use crate::embedding::embed_query;
 use crate::formatting::{format_repo_link, format_stars, truncate_str, Dots};
 
 /// Reciprocal Rank Fusion (RRF) weights for hybrid search
@@ -142,7 +142,7 @@ pub fn search(query: &str, limit: usize, semantic_only: bool, db: &Database) -> 
     let dots = Dots::start(&format!("Searching {} repos ({})", indexed, mode));
 
     // 1. Semantic search via embeddings
-    let query_embedding = embed_text(query)?;
+    let query_embedding = embed_query(query)?;
     let vector_results = db.find_similar(&query_embedding, limit * 3)?;
 
     // 2. Name match search (strongest signal - repos with query in name)

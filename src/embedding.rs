@@ -129,6 +129,27 @@ pub fn build_embedding_text(
     parts.join(" | ")
 }
 
+/// Generate embedding for a passage (document/repository)
+/// Adds "passage:" prefix for E5 model asymmetric retrieval
+pub fn embed_passage(text: &str) -> Result<Vec<f32>> {
+    let prefixed = format!("passage: {}", text);
+    embed_text(&prefixed)
+}
+
+/// Generate embedding for a query (search intent)
+/// Adds "query:" prefix for E5 model asymmetric retrieval
+pub fn embed_query(text: &str) -> Result<Vec<f32>> {
+    let prefixed = format!("query: {}", text);
+    embed_text(&prefixed)
+}
+
+/// Generate embeddings for multiple passages (batch processing)
+/// Adds "passage:" prefix for E5 model asymmetric retrieval
+pub fn embed_passages(texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    let prefixed: Vec<String> = texts.iter().map(|t| format!("passage: {}", t)).collect();
+    embed_texts(&prefixed)
+}
+
 /// Check if a header line contains only generic section names
 fn is_generic_header(line: &str) -> bool {
     // Strip markdown header prefix (# ## ### etc.)

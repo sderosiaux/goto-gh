@@ -335,6 +335,12 @@ impl Database {
         Ok(())
     }
 
+    /// Clear all embeddings from the database
+    pub fn clear_all_embeddings(&self) -> Result<usize> {
+        let count = self.conn.execute("DELETE FROM repo_embeddings", [])?;
+        Ok(count)
+    }
+
     /// Find most similar repos to a query embedding
     pub fn find_similar(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<(i64, f32)>> {
         let mut stmt = self.conn.prepare(
@@ -384,46 +390,6 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok((total, indexed))
-    }
-
-    /// Get all repos for revectorization (returns raw stored data)
-    pub fn get_all_repos_raw(&self) -> Result<Vec<(i64, String, Option<String>, Option<String>, Option<String>, Option<String>)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, full_name, description, language, topics, readme_excerpt FROM repos"
-        )?;
-
-        let results = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })?;
-
-        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
-    /// Update embedding and embedded_text for a repo
-    pub fn update_embedding(&self, repo_id: i64, embedded_text: &str, embedding: &[f32]) -> Result<()> {
-        self.conn.execute(
-            "UPDATE repos SET embedded_text = ? WHERE id = ?",
-            params![embedded_text, repo_id],
-        )?;
-
-        self.conn.execute(
-            "DELETE FROM repo_embeddings WHERE repo_id = ?",
-            [repo_id],
-        )?;
-
-        self.conn.execute(
-            "INSERT INTO repo_embeddings (repo_id, embedding) VALUES (?, ?)",
-            params![repo_id, embedding.as_bytes()],
-        )?;
-
-        Ok(())
     }
 
     /// Fuzzy search repos by name (case-insensitive LIKE)

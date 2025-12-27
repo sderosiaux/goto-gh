@@ -16,7 +16,7 @@ use std::time::Duration;
 use config::Config;
 use db::Database;
 use discovery::{discover_from_owners, discover_owner_repos};
-use embedding::{build_embedding_text, embed_text, embed_texts};
+use embedding::{build_embedding_text, embed_passage, embed_passages};
 use formatting::{format_repo_link, format_stars, truncate_str};
 use github::GitHubClient;
 use papers::extract_github_repos;
@@ -95,10 +95,6 @@ enum Commands {
     /// Check GitHub API rate limit
     RateLimit,
 
-    /// Re-generate embeddings from stored data (no API calls)
-    #[command(hide = true)]
-    Revectorize,
-
     /// Fetch metadata from GitHub for repos in DB that don't have it yet
     Fetch {
         /// Number of repos to fetch (default: all pending)
@@ -131,6 +127,10 @@ enum Commands {
         /// Delay between batches in seconds (default: 5)
         #[arg(short, long, default_value = "5")]
         delay: u64,
+
+        /// Clear all existing embeddings first (re-embed everything)
+        #[arg(long)]
+        reset: bool,
     },
 
     /// Print database file path
@@ -253,16 +253,13 @@ async fn run_main(cli: Cli, db: Database) -> Result<()> {
         Some(Commands::RateLimit) => {
             check_rate_limit(&client).await
         }
-        Some(Commands::Revectorize) => {
-            revectorize(&db)
-        }
         Some(Commands::Fetch { limit, batch_size, concurrency, debug }) => {
             let client = GitHubClient::new_with_options(token.clone(), debug, None, false);
             let config = FetchConfig { limit, batch_size, concurrency, debug };
             fetch_from_db(&client, &db, &config).await
         }
-        Some(Commands::Embed { batch_size, limit, delay }) => {
-            embed_missing(&db, batch_size, limit, delay)
+        Some(Commands::Embed { batch_size, limit, delay, reset }) => {
+            embed_missing(&db, batch_size, limit, delay, reset)
         }
         Some(Commands::DbPath) => {
             println!("{}", Config::db_path()?.display());
@@ -327,7 +324,7 @@ async fn add_repo(client: &GitHubClient, db: &Database, full_name: &str) -> Resu
         readme.as_deref(),
     );
 
-    let embedding = embed_text(&text)?;
+    let embedding = embed_passage(&text)?;
 
     let repo_id = db.upsert_repo(&repo, readme.as_deref(), &text)?;
     db.upsert_embedding(repo_id, &embedding)?;
@@ -428,67 +425,6 @@ async fn check_rate_limit(client: &GitHubClient) -> Result<()> {
     println!("  \x1b[1mGraphQL API\x1b[0m (fetch repos/READMEs)");
     println!("    \x1b[90mRemaining:\x1b[0m {}/{}", rates.graphql.remaining, rates.graphql.limit);
     println!("    \x1b[90mResets at:\x1b[0m {}", format_reset(rates.graphql.reset));
-
-    Ok(())
-}
-
-/// Re-generate embeddings from stored data (no API calls)
-fn revectorize(db: &Database) -> Result<()> {
-    let repos = db.get_all_repos_raw()?;
-    let total = repos.len();
-
-    if total == 0 {
-        eprintln!("\x1b[31mx\x1b[0m No repositories in database.");
-        return Ok(());
-    }
-
-    eprintln!("\x1b[36m..\x1b[0m Re-vectorizing {} repos from stored data", total);
-
-    let mut processed = 0;
-    let mut errors = 0;
-
-    for (id, full_name, description, language, topics_json, readme) in repos {
-        // Parse topics from JSON
-        let topics: Vec<String> = topics_json
-            .as_deref()
-            .and_then(|j| serde_json::from_str(j).ok())
-            .unwrap_or_default();
-
-        // Rebuild embedding text
-        let text = build_embedding_text(
-            &full_name,
-            description.as_deref(),
-            &topics,
-            language.as_deref(),
-            readme.as_deref(),
-        );
-
-        // Generate new embedding
-        match embed_text(&text) {
-            Ok(embedding) => {
-                if let Err(e) = db.update_embedding(id, &text, &embedding) {
-                    eprintln!("  \x1b[31mx\x1b[0m {} - {}", full_name, e);
-                    errors += 1;
-                } else {
-                    processed += 1;
-                }
-            }
-            Err(e) => {
-                eprintln!("  \x1b[31mx\x1b[0m {} - {}", full_name, e);
-                errors += 1;
-            }
-        }
-
-        // Progress
-        if processed % 100 == 0 && processed > 0 {
-            eprintln!("  ... processed {}/{}", processed, total);
-        }
-    }
-
-    eprintln!(
-        "\x1b[32mok\x1b[0m Re-vectorized {} repos ({} errors)",
-        processed, errors
-    );
 
     Ok(())
 }
@@ -749,7 +685,12 @@ async fn fetch_from_db(
 }
 
 /// Generate embeddings for repos that don't have them yet
-fn embed_missing(db: &Database, batch_size: usize, limit: Option<usize>, delay_secs: u64) -> Result<()> {
+fn embed_missing(db: &Database, batch_size: usize, limit: Option<usize>, delay_secs: u64, reset: bool) -> Result<()> {
+    if reset {
+        let count = db.clear_all_embeddings()?;
+        eprintln!("\x1b[33m!\x1b[0m Cleared {} existing embeddings", count);
+    }
+
     let need_embed = db.count_repos_without_embeddings()?;
 
     if need_embed == 0 {
@@ -789,7 +730,7 @@ fn embed_missing(db: &Database, batch_size: usize, limit: Option<usize>, delay_s
         let repo_ids: Vec<i64> = repos.iter().map(|(id, _)| *id).collect();
 
         // Generate embeddings in batch
-        let embeddings = embed_texts(&texts)?;
+        let embeddings = embed_passages(&texts)?;
 
         // Store embeddings
         for (repo_id, embedding) in repo_ids.into_iter().zip(embeddings) {
