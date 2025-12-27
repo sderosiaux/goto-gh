@@ -351,10 +351,10 @@ fn show_stats(db: &Database) -> Result<()> {
     let (total, indexed) = db.stats()?;
     let without_metadata = db.count_repos_without_metadata()?;
     let gone = db.count_gone()?;
-    let placeholders = db.count_placeholders()?;
     let distinct_owners = db.count_distinct_owners()?;
-    // Total visible = total minus gone and internal placeholders
-    let total_visible = total - gone - placeholders;
+    let owners_to_explore = db.count_owners_to_explore()?;
+    // Total visible = total minus gone repos
+    let total_visible = total - gone;
     let with_metadata = total_visible - without_metadata;
     let without_embeddings = total_visible - indexed;
 
@@ -368,6 +368,9 @@ fn show_stats(db: &Database) -> Result<()> {
     println!("  \x1b[90mNeed embeddings:\x1b[0m    {}", without_embeddings);
     if gone > 0 {
         println!("  \x1b[90mGone (deleted):\x1b[0m     {}", gone);
+    }
+    if owners_to_explore > 0 {
+        println!("  \x1b[90mOwners to explore:\x1b[0m  {}", owners_to_explore);
     }
 
     if without_metadata > 0 {
@@ -524,7 +527,7 @@ fn load_repo_stubs(db: &Database, file_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Load usernames from file as owners to discover (creates placeholder repos)
+/// Load usernames from file as owners to discover
 fn load_user_stubs(db: &Database, file_path: &str) -> Result<()> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};

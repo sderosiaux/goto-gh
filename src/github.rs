@@ -160,7 +160,8 @@ impl GitHubClient {
     async fn send_request(&self, url: &str) -> Result<reqwest::Response, reqwest::Error> {
         use std::io::Write;
         if self.debug {
-            eprint!("\x1b[90m[API] GET {} ... \x1b[0m", url);
+            let now = chrono::Local::now().format("%H:%M:%S%.3f");
+            eprint!("\x1b[90m[{}] GET {} ... \x1b[0m", now, url);
             std::io::stderr().flush().ok();
         }
         let start = std::time::Instant::now();
@@ -181,7 +182,8 @@ impl GitHubClient {
             .ok_or_else(|| format!("Failed to create proxy client for {}", proxy))?;
 
         if self.debug && show_debug {
-            eprint!("\x1b[90m[PROXY {}] GET {} ... \x1b[0m", proxy, url);
+            let now = chrono::Local::now().format("%H:%M:%S%.3f");
+            eprint!("\x1b[90m[{} PROXY {}] GET {} ... \x1b[0m", now, proxy, url);
             std::io::stderr().flush().ok();
         }
 
@@ -461,15 +463,18 @@ impl GitHubClient {
     async fn handle_graphql_rate_limit(&self, fallback_wait_secs: u64) -> bool {
         if let Ok(rates) = self.rate_limit().await {
             let rate = &rates.graphql;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
 
-            if rate.reset > now {
+            // Only wait if we're actually rate limited (remaining is very low)
+            if rate.remaining < 10 {
                 Self::wait_for_rate_reset(rate, "GraphQL").await;
                 return true;
             }
+
+            // We have quota but got an error - just do a short backoff
+            eprintln!("  \x1b[33m⏸ Got rate limit error but have {}/{} quota, backing off {}s...\x1b[0m",
+                rate.remaining, rate.limit, fallback_wait_secs);
+            tokio::time::sleep(Duration::from_secs(fallback_wait_secs)).await;
+            return true;
         }
 
         // Fallback: wait fixed time if we can't get rate limit info

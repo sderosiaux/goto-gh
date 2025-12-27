@@ -137,6 +137,24 @@ impl Database {
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_repos_gone ON repos(gone)", [])?;
         }
 
+        // Migration: add owner column (denormalized for fast lookups)
+        let has_owner: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('repos') WHERE name = 'owner'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_owner {
+            eprintln!("\x1b[36m..\x1b[0m Adding owner column to repos table (one-time migration)...");
+            self.conn.execute("ALTER TABLE repos ADD COLUMN owner TEXT", [])?;
+            // Populate owner from full_name (extract part before /)
+            self.conn.execute(
+                "UPDATE repos SET owner = LOWER(substr(full_name, 1, instr(full_name, '/') - 1)) WHERE owner IS NULL",
+                [],
+            )?;
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_repos_owner ON repos(owner)", [])?;
+            eprintln!("\x1b[32mok\x1b[0m Owner column migration complete");
+        }
+
         // Table to track explored owners (users/orgs) - avoid re-fetching their repos
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS explored_owners (
@@ -164,6 +182,52 @@ impl Database {
                 follower_count INTEGER DEFAULT 0,
                 fetched_at INTEGER NOT NULL,
                 status TEXT DEFAULT 'done'
+            )",
+            [],
+        )?;
+
+        // Table to track owners we want to explore (from followers, user lists, etc.)
+        // This replaces the old __placeholder__ repo hack
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS owners_to_explore (
+                owner TEXT PRIMARY KEY,
+                added_at INTEGER NOT NULL,
+                source TEXT
+            )",
+            [],
+        )?;
+
+        // Migration: remove any existing __placeholder__ repos and migrate to owners_to_explore
+        let placeholder_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM repos WHERE full_name LIKE '%/__placeholder__'",
+            [],
+            |row| row.get(0),
+        )?;
+        if placeholder_count > 0 {
+            let now = Utc::now().timestamp();
+            self.conn.execute(
+                "INSERT OR IGNORE INTO owners_to_explore (owner, added_at, source)
+                 SELECT LOWER(substr(full_name, 1, instr(full_name, '/') - 1)), ?1, 'migrated'
+                 FROM repos WHERE full_name LIKE '%/__placeholder__'",
+                params![now],
+            )?;
+            self.conn.execute(
+                "DELETE FROM repos WHERE full_name LIKE '%/__placeholder__'",
+                [],
+            )?;
+        }
+
+        // Clean up owners_to_explore: remove owners who already have real repos or are already explored
+        self.conn.execute(
+            "DELETE FROM owners_to_explore WHERE owner IN (
+                SELECT DISTINCT LOWER(substr(full_name, 1, instr(full_name, '/') - 1))
+                FROM repos
+            )",
+            [],
+        )?;
+        self.conn.execute(
+            "DELETE FROM owners_to_explore WHERE owner IN (
+                SELECT owner FROM explored_owners
             )",
             [],
         )?;
@@ -218,10 +282,11 @@ impl Database {
     pub fn upsert_repo(&self, repo: &GitHubRepo, readme_excerpt: Option<&str>, embedded_text: &str) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         let topics_json = serde_json::to_string(&repo.topics)?;
+        let owner = repo.full_name.split('/').next().unwrap_or("").to_lowercase();
 
         self.conn.execute(
-            "INSERT INTO repos (full_name, description, url, stars, language, topics, readme_excerpt, embedded_text, last_indexed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO repos (full_name, description, url, stars, language, topics, readme_excerpt, embedded_text, last_indexed, owner)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(full_name) DO UPDATE SET
                  description = ?2,
                  url = ?3,
@@ -230,7 +295,8 @@ impl Database {
                  topics = ?6,
                  readme_excerpt = ?7,
                  embedded_text = ?8,
-                 last_indexed = ?9",
+                 last_indexed = ?9,
+                 owner = ?10",
             params![
                 repo.full_name,
                 repo.description,
@@ -241,6 +307,7 @@ impl Database {
                 readme_excerpt,
                 embedded_text,
                 now,
+                owner,
             ],
         )?;
 
@@ -458,6 +525,8 @@ impl Database {
             |row| row.get(0),
         ).ok();
 
+        let owner = repo.full_name.split('/').next().unwrap_or("").to_lowercase();
+
         if let Some(id) = existing_id {
             // Update existing row (keep original full_name, update metadata)
             self.conn.execute(
@@ -471,7 +540,8 @@ impl Database {
                     embedded_text = ?8,
                     pushed_at = ?9,
                     created_at = ?10,
-                    last_indexed = ?11
+                    last_indexed = ?11,
+                    owner = ?12
                  WHERE id = ?1",
                 params![
                     id,
@@ -485,14 +555,15 @@ impl Database {
                     repo.pushed_at,
                     repo.created_at,
                     now,
+                    owner,
                 ],
             )?;
             Ok(id)
         } else {
             // Insert new row with original case
             self.conn.execute(
-                "INSERT INTO repos (full_name, description, url, stars, language, topics, readme_excerpt, embedded_text, pushed_at, created_at, last_indexed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO repos (full_name, description, url, stars, language, topics, readme_excerpt, embedded_text, pushed_at, created_at, last_indexed, owner)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     &repo.full_name,
                     repo.description,
@@ -505,21 +576,21 @@ impl Database {
                     repo.pushed_at,
                     repo.created_at,
                     now,
+                    owner,
                 ],
             )?;
             Ok(self.conn.last_insert_rowid())
         }
     }
 
-    /// Count repos without embeddings (excluding gone repos and placeholders)
+    /// Count repos without embeddings (excluding gone repos)
     pub fn count_repos_without_embeddings(&self) -> Result<usize> {
         let count: usize = self.conn.query_row(
             "SELECT COUNT(*) FROM repos r
              LEFT JOIN repo_embeddings e ON r.id = e.repo_id
              WHERE e.repo_id IS NULL
                AND r.embedded_text IS NOT NULL
-               AND r.gone = 0
-               AND r.full_name NOT LIKE '%/__placeholder__'",
+               AND r.gone = 0",
             [],
             |row| row.get(0),
         )?;
@@ -530,8 +601,7 @@ impl Database {
     pub fn count_distinct_owners(&self) -> Result<usize> {
         let count: usize = self.conn.query_row(
             "SELECT COUNT(DISTINCT LOWER(SUBSTR(full_name, 1, INSTR(full_name, '/') - 1)))
-             FROM repos
-             WHERE full_name NOT LIKE '%/__placeholder__'",
+             FROM repos",
             [],
             |row| row.get(0),
         )?;
@@ -568,28 +638,44 @@ impl Database {
 
     /// Bulk add repo stubs (optimized for large imports)
     pub fn add_repo_stubs_bulk(&self, names: &[String]) -> Result<(usize, usize)> {
+        if names.is_empty() {
+            return Ok((0, 0));
+        }
+
+        // Use a single transaction for all inserts
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+
         let mut inserted = 0;
         let mut skipped = 0;
 
         for name in names {
-            if self.add_repo_stub(name)? {
+            // Extract owner from full_name (part before /)
+            let owner = name.split('/').next().unwrap_or("").to_lowercase();
+            // Try INSERT OR IGNORE and check if it actually inserted
+            let result = self.conn.execute(
+                "INSERT OR IGNORE INTO repos (full_name, url, last_indexed, owner)
+                 VALUES (?1, ?2, '1970-01-01T00:00:00Z', ?3)",
+                params![name, format!("https://github.com/{}", name), owner],
+            )?;
+            if result > 0 {
                 inserted += 1;
             } else {
                 skipped += 1;
             }
         }
 
+        self.conn.execute("COMMIT", [])?;
         Ok((inserted, skipped))
     }
 
-    /// Get repos that need metadata fetch (have no embedded_text = never fetched, not gone, and not placeholders)
+    /// Get repos that need metadata fetch (have no embedded_text = never fetched, not gone)
     pub fn get_repos_without_metadata(&self, limit: Option<usize>) -> Result<Vec<String>> {
         let sql = match limit {
             Some(lim) => format!(
-                "SELECT full_name FROM repos WHERE embedded_text IS NULL AND gone = 0 AND full_name NOT LIKE '%/__placeholder__' LIMIT {}",
+                "SELECT full_name FROM repos WHERE embedded_text IS NULL AND gone = 0 LIMIT {}",
                 lim
             ),
-            None => "SELECT full_name FROM repos WHERE embedded_text IS NULL AND gone = 0 AND full_name NOT LIKE '%/__placeholder__'".to_string(),
+            None => "SELECT full_name FROM repos WHERE embedded_text IS NULL AND gone = 0".to_string(),
         };
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -598,10 +684,10 @@ impl Database {
         results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Count repos without metadata (excluding gone repos and placeholders)
+    /// Count repos without metadata (excluding gone repos)
     pub fn count_repos_without_metadata(&self) -> Result<usize> {
         let count: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM repos WHERE embedded_text IS NULL AND gone = 0 AND full_name NOT LIKE '%/__placeholder__'",
+            "SELECT COUNT(*) FROM repos WHERE embedded_text IS NULL AND gone = 0",
             [],
             |row| row.get(0),
         )?;
@@ -631,10 +717,10 @@ impl Database {
         Ok(count)
     }
 
-    /// Count placeholder repos
-    pub fn count_placeholders(&self) -> Result<usize> {
+    /// Count owners in the owners_to_explore table
+    pub fn count_owners_to_explore(&self) -> Result<usize> {
         let count: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM repos WHERE full_name LIKE '%/__placeholder__'",
+            "SELECT COUNT(*) FROM owners_to_explore",
             [],
             |row| row.get(0),
         )?;
@@ -725,10 +811,16 @@ impl Database {
 
     /// Mark an owner as explored (completed)
     pub fn mark_owner_explored(&self, owner: &str, repo_count: usize) -> Result<()> {
+        let owner_lower = owner.to_lowercase();
         let now = Utc::now().timestamp();
         self.conn.execute(
             "INSERT OR REPLACE INTO explored_owners (owner, repo_count, explored_at, status) VALUES (?1, ?2, ?3, 'done')",
-            params![owner.to_lowercase(), repo_count as i64, now],
+            params![&owner_lower, repo_count as i64, now],
+        )?;
+        // Clean up from owners_to_explore since they're now explored
+        self.conn.execute(
+            "DELETE FROM owners_to_explore WHERE owner = ?1",
+            params![&owner_lower],
         )?;
         Ok(())
     }
@@ -752,18 +844,27 @@ impl Database {
         results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Get distinct owners from repos that haven't been explored yet
+    /// Get distinct owners that haven't been explored yet
+    /// Combines owners from real repos and the owners_to_explore table
     pub fn get_unexplored_owners(&self, limit: Option<usize>) -> Result<Vec<String>> {
         let sql = match limit {
             Some(lim) => format!(
-                "SELECT DISTINCT LOWER(substr(full_name, 1, instr(full_name, '/') - 1)) as owner
-                 FROM repos
-                 WHERE owner NOT IN (SELECT owner FROM explored_owners)
-                 LIMIT {}",
+                "SELECT owner FROM (
+                    SELECT DISTINCT LOWER(substr(full_name, 1, instr(full_name, '/') - 1)) as owner
+                    FROM repos
+                    UNION
+                    SELECT owner FROM owners_to_explore
+                )
+                WHERE owner NOT IN (SELECT owner FROM explored_owners)
+                LIMIT {}",
                 lim
             ),
-            None => "SELECT DISTINCT LOWER(substr(full_name, 1, instr(full_name, '/') - 1)) as owner
-                     FROM repos
+            None => "SELECT owner FROM (
+                        SELECT DISTINCT LOWER(substr(full_name, 1, instr(full_name, '/') - 1)) as owner
+                        FROM repos
+                        UNION
+                        SELECT owner FROM owners_to_explore
+                     )
                      WHERE owner NOT IN (SELECT owner FROM explored_owners)".to_string(),
         };
 
@@ -775,9 +876,15 @@ impl Database {
     /// Count unexplored owners
     pub fn count_unexplored_owners(&self) -> Result<usize> {
         let count: usize = self.conn.query_row(
-            "SELECT COUNT(DISTINCT LOWER(substr(full_name, 1, instr(full_name, '/') - 1)))
-             FROM repos
-             WHERE LOWER(substr(full_name, 1, instr(full_name, '/') - 1)) NOT IN (SELECT owner FROM explored_owners)",
+            "SELECT COUNT(*) FROM (
+                SELECT owner FROM (
+                    SELECT DISTINCT LOWER(substr(full_name, 1, instr(full_name, '/') - 1)) as owner
+                    FROM repos
+                    UNION
+                    SELECT owner FROM owners_to_explore
+                )
+                WHERE owner NOT IN (SELECT owner FROM explored_owners)
+            )",
             [],
             |row| row.get(0),
         )?;
@@ -886,35 +993,141 @@ impl Database {
             return Ok(false);
         }
 
-        // Check if we already have a placeholder for this owner
-        let has_placeholder: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM repos WHERE full_name = ?1",
-            params![format!("{}/__placeholder__", &follower_lower)],
+        // Check if already in owners_to_explore
+        let in_to_explore: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM owners_to_explore WHERE owner = ?1",
+            params![&follower_lower],
             |row| row.get(0),
         )?;
 
-        if has_placeholder > 0 {
+        if in_to_explore > 0 {
             return Ok(false);
         }
 
-        // Add a placeholder repo so the owner appears in unexplored_owners
-        self.add_repo_stub(&format!("{}/__placeholder__", follower_lower))?;
+        // Check if we already have repos for this owner (using indexed owner column)
+        let has_repos: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM repos WHERE owner = ?1 LIMIT 1)",
+            params![&follower_lower],
+            |row| row.get(0),
+        )?;
+
+        if has_repos > 0 {
+            return Ok(false);
+        }
+
+        // Add to owners_to_explore table
+        let now = Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT INTO owners_to_explore (owner, added_at, source) VALUES (?1, ?2, 'follower')",
+            params![&follower_lower, now],
+        )?;
         Ok(true)
     }
 
-    /// Bulk add followers as owners
+    /// Bulk add followers as owners (optimized with batch filtering)
     pub fn add_followers_as_owners_bulk(&self, followers: &[String]) -> Result<(usize, usize)> {
-        let mut added = 0;
-        let mut skipped = 0;
+        if followers.is_empty() {
+            return Ok((0, 0));
+        }
 
-        for follower in followers {
-            if self.add_follower_as_owner(follower)? {
-                added += 1;
-            } else {
-                skipped += 1;
+        // Lowercase all followers upfront
+        let followers_lower: Vec<String> = followers.iter().map(|f| f.to_lowercase()).collect();
+
+        // Build a set of candidates, then filter out known owners in bulk
+        let mut candidates: std::collections::HashSet<String> = followers_lower.iter().cloned().collect();
+
+        // Filter 1: Remove those already in explored_owners
+        {
+            let placeholders: String = (0..followers_lower.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT owner FROM explored_owners WHERE owner IN ({})", placeholders);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> = followers_lower.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| row.get::<_, String>(0))?;
+            for row in rows {
+                if let Ok(owner) = row {
+                    candidates.remove(&owner);
+                }
             }
         }
 
+        if candidates.is_empty() {
+            return Ok((0, followers.len()));
+        }
+
+        // Filter 2: Remove those already in owner_followers_fetched
+        {
+            let candidate_vec: Vec<&String> = candidates.iter().collect();
+            let placeholders: String = (0..candidate_vec.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT owner FROM owner_followers_fetched WHERE owner IN ({})", placeholders);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> = candidate_vec.iter().map(|s| *s as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| row.get::<_, String>(0))?;
+            for row in rows {
+                if let Ok(owner) = row {
+                    candidates.remove(&owner);
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return Ok((0, followers.len()));
+        }
+
+        // Filter 3: Remove those already in owners_to_explore
+        {
+            let candidate_vec: Vec<&String> = candidates.iter().collect();
+            let placeholders: String = (0..candidate_vec.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT owner FROM owners_to_explore WHERE owner IN ({})", placeholders);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> = candidate_vec.iter().map(|s| *s as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| row.get::<_, String>(0))?;
+            for row in rows {
+                if let Ok(owner) = row {
+                    candidates.remove(&owner);
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return Ok((0, followers.len()));
+        }
+
+        // Filter 4: Remove those who already have repos (batch query using owner column)
+        {
+            let candidate_vec: Vec<&String> = candidates.iter().collect();
+            let placeholders: String = (0..candidate_vec.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT DISTINCT owner FROM repos WHERE owner IN ({})", placeholders);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> = candidate_vec.iter().map(|s| *s as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| row.get::<_, String>(0))?;
+            for row in rows {
+                if let Ok(owner) = row {
+                    candidates.remove(&owner);
+                }
+            }
+        }
+
+        let final_candidates: Vec<String> = candidates.into_iter().collect();
+
+        if final_candidates.is_empty() {
+            return Ok((0, followers.len()));
+        }
+
+        // Insert all remaining candidates in a single transaction
+        let now = Utc::now().timestamp();
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+
+        for candidate in &final_candidates {
+            self.conn.execute(
+                "INSERT INTO owners_to_explore (owner, added_at, source) VALUES (?1, ?2, 'follower')",
+                params![candidate, now],
+            )?;
+        }
+
+        self.conn.execute("COMMIT", [])?;
+
+        let added = final_candidates.len();
+        let skipped = followers.len() - added;
         Ok((added, skipped))
     }
 
@@ -928,7 +1141,6 @@ impl Database {
                 "SELECT id, full_name, readme_excerpt FROM repos
                  WHERE readme_excerpt IS NOT NULL
                    AND gone = 0
-                   AND full_name NOT LIKE '%/__placeholder__'
                    AND (papers_extracted_at IS NULL OR papers_extracted_at < last_indexed)
                  LIMIT {}",
                 lim
@@ -936,7 +1148,6 @@ impl Database {
             None => "SELECT id, full_name, readme_excerpt FROM repos
                      WHERE readme_excerpt IS NOT NULL
                        AND gone = 0
-                       AND full_name NOT LIKE '%/__placeholder__'
                        AND (papers_extracted_at IS NULL OR papers_extracted_at < last_indexed)".to_string(),
         };
 
@@ -958,7 +1169,6 @@ impl Database {
             "SELECT COUNT(*) FROM repos
              WHERE readme_excerpt IS NOT NULL
                AND gone = 0
-               AND full_name NOT LIKE '%/__placeholder__'
                AND (papers_extracted_at IS NULL OR papers_extracted_at < last_indexed)",
             [],
             |row| row.get(0),
@@ -1345,27 +1555,44 @@ mod tests {
         assert_eq!(gone_count, 1);
     }
 
-    // === Placeholders ===
+    // === Owners to Explore ===
 
     #[test]
-    fn test_placeholders_excluded() {
+    fn test_owners_to_explore() {
         let db = test_db();
 
-        db.add_repo_stub("owner/real-repo").unwrap();
-        db.add_repo_stub("owner/__placeholder__").unwrap();
+        // Add a follower as owner (should go to owners_to_explore table)
+        let added = db.add_follower_as_owner("newuser").unwrap();
+        assert!(added);
 
-        // Placeholders should not count as needing metadata
-        let need_meta = db.get_repos_without_metadata(None).unwrap();
-        assert_eq!(need_meta.len(), 1);
-        assert_eq!(need_meta[0], "owner/real-repo");
+        // Adding again should return false
+        let added_again = db.add_follower_as_owner("newuser").unwrap();
+        assert!(!added_again);
 
-        // Count should also exclude placeholders
-        let count = db.count_repos_without_metadata().unwrap();
+        // Count should reflect the addition
+        let count = db.count_owners_to_explore().unwrap();
         assert_eq!(count, 1);
 
-        // Count placeholders specifically
-        let placeholder_count = db.count_placeholders().unwrap();
-        assert_eq!(placeholder_count, 1);
+        // Should appear in unexplored owners
+        let unexplored = db.get_unexplored_owners(None).unwrap();
+        assert!(unexplored.contains(&"newuser".to_string()));
+    }
+
+    #[test]
+    fn test_owners_to_explore_cleaned_on_explore() {
+        let db = test_db();
+
+        // Add a follower as owner
+        db.add_follower_as_owner("testuser").unwrap();
+        assert_eq!(db.count_owners_to_explore().unwrap(), 1);
+
+        // Mark as explored - should clean up from owners_to_explore
+        db.mark_owner_explored("testuser", 5).unwrap();
+        assert_eq!(db.count_owners_to_explore().unwrap(), 0);
+
+        // Should no longer appear in unexplored owners
+        let unexplored = db.get_unexplored_owners(None).unwrap();
+        assert!(!unexplored.contains(&"testuser".to_string()));
     }
 
     // === Papers ===
@@ -1439,15 +1666,19 @@ mod tests {
     }
 
     #[test]
-    fn test_count_distinct_owners_excludes_placeholders() {
+    fn test_owners_to_explore_not_in_distinct_count() {
         let db = test_db();
 
         db.add_repo_stub("owner1/repo1").unwrap();
-        db.add_repo_stub("owner2/__placeholder__").unwrap();
+        db.add_follower_as_owner("owner2").unwrap(); // Goes to owners_to_explore, not repos
 
-        // owner2 only has a placeholder, so should still count as distinct
-        // but the placeholder shouldn't count as a real repo
+        // owner2 is in owners_to_explore but has no repos yet
+        // count_distinct_owners should only count owners with real repos
         let count = db.count_distinct_owners().unwrap();
         assert_eq!(count, 1); // Only owner1 has real repos
+
+        // But owner2 should appear in unexplored owners
+        let unexplored = db.get_unexplored_owners(None).unwrap();
+        assert!(unexplored.contains(&"owner2".to_string()));
     }
 }
