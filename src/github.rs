@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use base64::Engine;
 use futures::stream::{self, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -184,7 +184,7 @@ impl GitHubClient {
         let parallel_count = 5; // Try 5 proxies at once
         let max_rounds = 10; // Up to 10 rounds = 50 proxies total
 
-        for round in 0..max_rounds {
+        for _round in 0..max_rounds {
             // Get batch of proxies to try
             let mut proxies_to_try = Vec::with_capacity(parallel_count);
             for _ in 0..parallel_count {
@@ -242,20 +242,6 @@ impl GitHubClient {
         }
 
         Err(format!("All {} proxy attempts failed", max_rounds * parallel_count))
-    }
-
-    /// Build GraphQL request
-    fn graphql_request(&self) -> reqwest::RequestBuilder {
-        let mut req = self.client.post("https://api.github.com/graphql");
-        if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {}", token));
-        }
-        req.header("User-Agent", "goto-gh/0.1.0")
-    }
-
-    /// Send GraphQL request (timing is handled by caller for parallel-safe output)
-    async fn send_graphql<T: serde::Serialize>(&self, _debug_context: &str, body: &T) -> Result<reqwest::Response, reqwest::Error> {
-        self.graphql_request().json(body).send().await
     }
 
     /// Get repository details
@@ -560,9 +546,7 @@ impl GitHubClient {
                                     anyhow::bail!("404 not found");
                                 }
                             }
-                            Err(e) => {
-                                last_error = Some(format!("Proxy rotation failed: {}", e));
-                            }
+                            Err(_) => {}
                         }
                     }
 
@@ -746,9 +730,7 @@ impl GitHubClient {
                                     anyhow::bail!("User {} not found (404)", owner);
                                 }
                             }
-                            Err(e) => {
-                                last_error = Some(format!("Proxy rotation failed: {}", e));
-                            }
+                            Err(_) => {}
                         }
                     }
 
@@ -865,120 +847,126 @@ struct RateLimitResponse {
 
 // === GraphQL Types ===
 
-#[derive(Serialize)]
-struct GraphQLRequest {
-    query: String,
-    variables: GraphQLVariables,
-}
-
-#[derive(Serialize)]
-struct GraphQLVariables {
-    query: String,
-    first: u32,
-    after: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GraphQLResponse {
-    data: Option<GraphQLData>,
-    errors: Option<Vec<GraphQLError>>,
-}
-
 #[derive(Debug, Deserialize)]
 struct GraphQLError {
     message: String,
 }
 
+// Response type for direct repository queries (dynamic JSON)
 #[derive(Debug, Deserialize)]
-struct GraphQLData {
-    search: GraphQLSearch,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GraphQLSearch {
-    nodes: Vec<Option<GraphQLRepo>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GraphQLRepo {
-    name_with_owner: String,
-    description: Option<String>,
-    url: String,
-    stargazer_count: u64,
-    primary_language: Option<PrimaryLanguage>,
-    repository_topics: RepositoryTopics,
-    pushed_at: Option<String>,
-    created_at: Option<String>,
-    readme: Option<BlobContent>,
-    readme_lower: Option<BlobContent>,
-    readme_rst: Option<BlobContent>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PrimaryLanguage {
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RepositoryTopics {
-    nodes: Vec<TopicNode>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TopicNode {
-    topic: Topic,
-}
-
-#[derive(Debug, Deserialize)]
-struct Topic {
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BlobContent {
-    text: Option<String>,
+struct DirectRepoResponse {
+    data: Option<serde_json::Value>,
+    errors: Option<Vec<GraphQLError>>,
 }
 
 impl GitHubClient {
-    /// GraphQL query for repos with README - gets 100 repos + READMEs in ONE call
-    const GRAPHQL_QUERY: &'static str = r#"
-query SearchRepos($query: String!, $first: Int!, $after: String) {
-  search(query: $query, type: REPOSITORY, first: $first, after: $after) {
-    pageInfo {
-      hasNextPage
-      endCursor
+    /// Build a direct repository GraphQL query with aliases
+    /// Returns query like: query { r0: repository(owner: "x", name: "y") { ... } r1: ... }
+    fn build_direct_repo_query(repo_names: &[String]) -> String {
+        let repo_fragment = r#"
+            nameWithOwner
+            description
+            url
+            stargazerCount
+            primaryLanguage { name }
+            repositoryTopics(first: 10) {
+              nodes { topic { name } }
+            }
+            pushedAt
+            createdAt
+            readme: object(expression: "HEAD:README.md") {
+              ... on Blob { text }
+            }
+            readme_lower: object(expression: "HEAD:readme.md") {
+              ... on Blob { text }
+            }
+            readme_rst: object(expression: "HEAD:README.rst") {
+              ... on Blob { text }
+            }
+        "#;
+
+        let repo_queries: Vec<String> = repo_names
+            .iter()
+            .enumerate()
+            .filter_map(|(i, name)| {
+                let parts: Vec<&str> = name.splitn(2, '/').collect();
+                if parts.len() != 2 {
+                    return None;
+                }
+                let owner = parts[0];
+                let repo = parts[1];
+                Some(format!(
+                    "r{}: repository(owner: \"{}\", name: \"{}\") {{ {} }}",
+                    i, owner, repo, repo_fragment
+                ))
+            })
+            .collect();
+
+        format!("query {{ {} }}", repo_queries.join("\n"))
     }
-    nodes {
-      ... on Repository {
-        nameWithOwner
-        description
-        url
-        stargazerCount
-        primaryLanguage { name }
-        repositoryTopics(first: 10) {
-          nodes { topic { name } }
-        }
-        pushedAt
-        createdAt
-        readme: object(expression: "HEAD:README.md") {
-          ... on Blob { text }
-        }
-        readme_lower: object(expression: "HEAD:readme.md") {
-          ... on Blob { text }
-        }
-        readme_rst: object(expression: "HEAD:README.rst") {
-          ... on Blob { text }
-        }
-      }
+
+    /// Parse a GraphQL repo from JSON value
+    fn parse_repo_from_json(value: &serde_json::Value) -> Option<RepoWithReadme> {
+        let name_with_owner = value.get("nameWithOwner")?.as_str()?.to_string();
+        let description = value.get("description").and_then(|v| v.as_str()).map(String::from);
+        let url = value.get("url")?.as_str()?.to_string();
+        let stars = value.get("stargazerCount")?.as_u64().unwrap_or(0);
+        let language = value
+            .get("primaryLanguage")
+            .and_then(|v| v.get("name"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let topics: Vec<String> = value
+            .get("repositoryTopics")
+            .and_then(|v| v.get("nodes"))
+            .and_then(|v| v.as_array())
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .filter_map(|n| n.get("topic").and_then(|t| t.get("name")).and_then(|n| n.as_str()))
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let pushed_at = value.get("pushedAt").and_then(|v| v.as_str()).map(String::from);
+        let created_at = value.get("createdAt").and_then(|v| v.as_str()).map(String::from);
+
+        // Try multiple README locations
+        let readme = value
+            .get("readme")
+            .and_then(|v| v.get("text"))
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                value
+                    .get("readme_lower")
+                    .and_then(|v| v.get("text"))
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| {
+                value
+                    .get("readme_rst")
+                    .and_then(|v| v.get("text"))
+                    .and_then(|v| v.as_str())
+            })
+            .map(String::from);
+
+        Some(RepoWithReadme {
+            full_name: name_with_owner,
+            description,
+            html_url: url,
+            stars,
+            language,
+            topics,
+            readme,
+            pushed_at,
+            created_at,
+        })
     }
-  }
-}
-"#;
 
     /// Fetch multiple repos by owner/name using GraphQL (batched, efficient)
-    /// Uses the search API with "repo:" filters to fetch up to 100 repos in one call
+    /// Uses direct repository queries instead of search for accurate results
     /// Parallelizes chunk fetching with concurrency limit to maximize throughput
     pub async fn fetch_repos_batch(&self, repo_names: &[String], concurrency: usize) -> Result<Vec<RepoWithReadme>> {
         if repo_names.is_empty() {
@@ -989,8 +977,8 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
             anyhow::bail!("GraphQL requires authentication");
         }
 
-        // Build search query with multiple repo: filters (limit to ~30 per query to avoid URL length issues)
-        let chunk_size = 30;
+        // Use direct repository queries (50 repos per query for efficiency)
+        let chunk_size = 50;
         let batch_start = std::time::Instant::now();
         let chunks: Vec<_> = repo_names.chunks(chunk_size).collect();
         let total_chunks = chunks.len();
@@ -1010,19 +998,14 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                 // Acquire semaphore permit (limits concurrency)
                 let _permit = semaphore.acquire().await.unwrap();
 
-                let query = chunk.iter()
-                    .map(|name| format!("repo:{}", name))
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                // Small stagger delay to avoid burst requests hitting rate limits
+                // Chunks start ~200ms apart instead of all at once
+                if chunk_idx > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200 * chunk_idx as u64)).await;
+                }
 
-                let request = GraphQLRequest {
-                    query: GitHubClient::GRAPHQL_QUERY.to_string(),
-                    variables: GraphQLVariables {
-                        query,
-                        first: 100,
-                        after: None,
-                    },
-                };
+                // Build direct repository query with aliases
+                let query = Self::build_direct_repo_query(&chunk);
 
                 // Retry with exponential backoff
                 let mut last_error = None;
@@ -1038,8 +1021,17 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                     }
 
                     let req_start = std::time::Instant::now();
-                    let debug_ctx = format!("chunk {}/{}, {} repos", chunk_idx + 1, total_chunks, chunk.len());
-                    let response = match gh_client.send_graphql(&debug_ctx, &request).await {
+
+                    // Send raw GraphQL query (no variables needed)
+                    let request_body = serde_json::json!({ "query": query });
+                    let response = match gh_client.client
+                        .post("https://api.github.com/graphql")
+                        .header("Authorization", format!("Bearer {}", gh_client.token.as_ref().unwrap()))
+                        .header("User-Agent", "goto-gh")
+                        .json(&request_body)
+                        .send()
+                        .await
+                    {
                         Ok(r) => r,
                         Err(e) => {
                             last_error = Some(format!("Request failed: {}", e));
@@ -1096,7 +1088,7 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                         return Err(anyhow::anyhow!("GraphQL error {}: {}", status, body));
                     }
 
-                    let gql_response: GraphQLResponse = match response.json().await {
+                    let gql_response: DirectRepoResponse = match response.json().await {
                         Ok(r) => r,
                         Err(e) => {
                             last_error = Some(format!("Parse error: {}", e));
@@ -1104,7 +1096,7 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                         }
                     };
 
-                    if let Some(errors) = gql_response.errors {
+                    if let Some(errors) = &gql_response.errors {
                         let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
 
                         // Check if any error is a rate limit error
@@ -1146,51 +1138,43 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                             continue;
                         }
 
-                        // Non-rate-limit errors - just log them
-                        eprintln!("  \x1b[90mGraphQL warnings: {}\x1b[0m", msgs.join(", "));
-                    }
-
-                    if let Some(data) = gql_response.data {
-                        let repos: Vec<RepoWithReadme> = data.search.nodes
-                            .into_iter()
-                            .filter_map(|node| {
-                                let repo = node?;
-                                let readme = repo.readme
-                                    .and_then(|b| b.text)
-                                    .or_else(|| repo.readme_lower.and_then(|b| b.text))
-                                    .or_else(|| repo.readme_rst.and_then(|b| b.text));
-
-                                Some(RepoWithReadme {
-                                    full_name: repo.name_with_owner,
-                                    description: repo.description,
-                                    html_url: repo.url,
-                                    stars: repo.stargazer_count,
-                                    language: repo.primary_language.map(|l| l.name),
-                                    topics: repo.repository_topics.nodes
-                                        .into_iter()
-                                        .map(|t| t.topic.name)
-                                        .collect(),
-                                    readme,
-                                    pushed_at: repo.pushed_at,
-                                    created_at: repo.created_at,
-                                })
-                            })
-                            .collect();
-
-                        // Atomic debug output (single line, parallel-safe)
-                        let done = completed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        let with_readme = repos.iter().filter(|r| r.readme.is_some()).count();
-                        if gh_client.debug {
-                            eprintln!("  \x1b[90m✓ [{}/{}] {}ms - {} repos ({} README){}\x1b[0m",
-                                done, total_chunks, req_elapsed.as_millis(),
-                                repos.len(), with_readme,
-                                if attempt > 0 { format!(", {} retries", attempt) } else { String::new() });
+                        // Log non-fatal errors (e.g., "Could not resolve to a Repository")
+                        // These are expected for deleted/renamed repos
+                        if gh_client.debug && !msgs.is_empty() {
+                            let not_found_count = errors.iter()
+                                .filter(|e| e.message.contains("Could not resolve"))
+                                .count();
+                            if not_found_count > 0 {
+                                eprintln!("  \x1b[90m({} repos not found)\x1b[0m", not_found_count);
+                            }
                         }
-
-                        return Ok(repos);
                     }
 
-                    return Ok(vec![]);
+                    // Parse repos from dynamic JSON response
+                    let mut repos: Vec<RepoWithReadme> = Vec::new();
+                    if let Some(data) = gql_response.data {
+                        if let Some(obj) = data.as_object() {
+                            for (_key, value) in obj {
+                                // Skip null values (repos that don't exist)
+                                if value.is_null() {
+                                    continue;
+                                }
+                                if let Some(repo) = Self::parse_repo_from_json(value) {
+                                    repos.push(repo);
+                                }
+                            }
+                        }
+                    }
+
+                    // Atomic debug output (single line, parallel-safe)
+                    let done = completed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let with_readme = repos.iter().filter(|r| r.readme.is_some()).count();
+                    eprintln!("  \x1b[90m✓ [{}/{}] {}ms - {} repos ({} README){}\x1b[0m",
+                        done, total_chunks, req_elapsed.as_millis(),
+                        repos.len(), with_readme,
+                        if attempt > 0 { format!(", {} retries", attempt) } else { String::new() });
+
+                    return Ok(repos);
                 }
 
                 Err(anyhow::anyhow!("Failed to fetch chunk after 5 retries: {}",

@@ -1007,6 +1007,7 @@ impl Database {
     }
 
     /// Get papers needing metadata fetch (no title yet)
+    #[allow(dead_code)]
     pub fn get_papers_needing_metadata(&self, limit: Option<usize>) -> Result<Vec<(i64, String, Option<String>, Option<String>)>> {
         let sql = match limit {
             Some(lim) => format!(
@@ -1030,6 +1031,7 @@ impl Database {
     }
 
     /// Update paper metadata
+    #[allow(dead_code)]
     pub fn update_paper_metadata(
         &self,
         paper_id: i64,

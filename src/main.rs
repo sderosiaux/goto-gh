@@ -118,8 +118,8 @@ enum Commands {
         #[arg(short, long, default_value = "300")]
         batch_size: usize,
 
-        /// Number of parallel GraphQL requests (default: 4)
-        #[arg(short = 'j', long, default_value = "4")]
+        /// Number of parallel GraphQL requests (default: 2)
+        #[arg(short = 'j', long, default_value = "2")]
         concurrency: usize,
 
         /// Show API calls for debugging
@@ -247,7 +247,7 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Fetch { limit, batch_size, concurrency, debug }) => {
             let client = GitHubClient::new_with_options(token.clone(), debug, None, false);
-            fetch_from_db(&client, &db, limit, batch_size, concurrency).await
+            fetch_from_db(&client, &db, limit, batch_size, concurrency, debug).await
         }
         Some(Commands::Embed { batch_size, limit, delay }) => {
             embed_missing(&db, batch_size, limit, delay)
@@ -1026,6 +1026,7 @@ async fn fetch_from_db(
     limit: Option<usize>,
     batch_size: usize,
     concurrency: usize,
+    debug: bool,
 ) -> Result<()> {
     let need_fetch = db.count_repos_without_metadata()?;
 
@@ -1060,6 +1061,17 @@ async fn fetch_from_db(
             "\x1b[36m..\x1b[0m Batch {}: fetching {} repos via GraphQL...",
             batch_num, repos_to_fetch.len()
         );
+
+        // Debug: show sample of repos being fetched
+        if debug {
+            eprintln!("  [DEBUG] Sample repos to fetch:");
+            for (i, name) in repos_to_fetch.iter().take(5).enumerate() {
+                eprintln!("    {}. {}", i + 1, name);
+            }
+            if repos_to_fetch.len() > 5 {
+                eprintln!("    ... and {} more", repos_to_fetch.len() - 5);
+            }
+        }
 
         // Fetch via GraphQL
         let fetched_repos = match client.fetch_repos_batch(&repos_to_fetch, concurrency).await {
@@ -1108,7 +1120,24 @@ async fn fetch_from_db(
         if !missing.is_empty() {
             let gone_count = db.mark_as_gone_bulk(&missing)?;
             errors += gone_count;
-            eprintln!("  ... marked {} repos as gone (deleted/renamed)", gone_count);
+            let gone_pct = (gone_count as f64 / repos_to_fetch.len() as f64 * 100.0) as u32;
+            eprintln!("  ... marked {} repos as gone ({}% of batch)", gone_count, gone_pct);
+
+            // Warn if too many repos are gone
+            if gone_pct >= 80 {
+                eprintln!("  \x1b[33m⚠ Warning: {}% of batch is gone - queue may be mostly stale repos\x1b[0m", gone_pct);
+            }
+
+            // Debug: show sample of gone repos
+            if debug {
+                eprintln!("  [DEBUG] Sample gone repos:");
+                for (i, name) in missing.iter().take(5).enumerate() {
+                    eprintln!("    {}. {}", i + 1, name);
+                }
+                if missing.len() > 5 {
+                    eprintln!("    ... and {} more", missing.len() - 5);
+                }
+            }
         }
 
         eprintln!("  ... stored {} repos (total: {})", fetched_count, stored);
@@ -1370,7 +1399,7 @@ fn extract_papers(db: &Database, limit: Option<usize>, batch_size: usize) -> Res
         let mut batch_papers = 0;
         let mut batch_new = 0;
 
-        for (repo_id, full_name, readme) in &repos {
+        for (repo_id, _full_name, readme) in &repos {
             let papers = papers::extract_paper_links(readme);
             batch_papers += papers.len();
 
