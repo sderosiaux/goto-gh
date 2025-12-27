@@ -388,9 +388,14 @@ impl GitHubClient {
         let wait_mins = wait_secs / 60;
         let wait_remainder = wait_secs % 60;
 
+        // Format reset time as HH:MM local time
+        let reset_time = chrono::DateTime::from_timestamp(rate.reset as i64, 0)
+            .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
+            .unwrap_or_else(|| "??:??".to_string());
+
         eprintln!(
-            "  \x1b[33m⏸ {} rate limit low ({}/{}), waiting {}m{}s for reset...\x1b[0m",
-            api_name, rate.remaining, rate.limit, wait_mins, wait_remainder
+            "  \x1b[33m⏸ {} rate limit low ({}/{}), waiting {}m{}s for reset (at {})...\x1b[0m",
+            api_name, rate.remaining, rate.limit, wait_mins, wait_remainder, reset_time
         );
 
         tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
@@ -1067,9 +1072,12 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                                     let wait_secs = rate.reset - now + 5;
                                     let wait_mins = wait_secs / 60;
                                     let wait_remainder = wait_secs % 60;
+                                    let reset_time = chrono::DateTime::from_timestamp(rate.reset as i64, 0)
+                                        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                                        .unwrap_or_else(|| "??:??".to_string());
                                     eprintln!(
-                                        "  \x1b[33m⏸ GraphQL rate limit low ({}/{}), waiting {}m{}s for reset...\x1b[0m",
-                                        rate.remaining, rate.limit, wait_mins, wait_remainder
+                                        "  \x1b[33m⏸ GraphQL rate limit low ({}/{}), waiting {}m{}s for reset (at {})...\x1b[0m",
+                                        rate.remaining, rate.limit, wait_mins, wait_remainder, reset_time
                                     );
                                     tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
                                     eprintln!("  \x1b[32m▶ Rate limit reset, resuming\x1b[0m");
@@ -1119,9 +1127,12 @@ query SearchRepos($query: String!, $first: Int!, $after: String) {
                                         let wait_secs = rate.reset - now + 5;
                                         let wait_mins = wait_secs / 60;
                                         let wait_remainder = wait_secs % 60;
+                                        let reset_time = chrono::DateTime::from_timestamp(rate.reset as i64, 0)
+                                            .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                                            .unwrap_or_else(|| "??:??".to_string());
                                         eprintln!(
-                                            "  \x1b[33m⏸ GraphQL rate limit exceeded ({}/{}), waiting {}m{}s for reset...\x1b[0m",
-                                            rate.remaining, rate.limit, wait_mins, wait_remainder
+                                            "  \x1b[33m⏸ GraphQL rate limit exceeded ({}/{}), waiting {}m{}s for reset (at {})...\x1b[0m",
+                                            rate.remaining, rate.limit, wait_mins, wait_remainder, reset_time
                                         );
                                         tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
                                         eprintln!("  \x1b[32m▶ Rate limit reset, resuming\x1b[0m");
