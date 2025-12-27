@@ -1,43 +1,33 @@
 mod config;
 mod db;
+mod discovery;
 mod embedding;
+mod formatting;
 mod github;
 mod papers;
 mod proxy;
+mod search;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::collections::HashMap;
-use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use config::Config;
 use db::Database;
+use discovery::{discover_from_owners, discover_owner_repos};
 use embedding::{build_embedding_text, embed_text, embed_texts};
+use formatting::{format_repo_link, format_stars, truncate_str};
 use github::GitHubClient;
+use papers::extract_github_repos;
 use proxy::ProxyManager;
+use search::{expand_query, search};
 
-/// Format repo name as clickable hyperlink (only if stdout is a TTY)
-fn format_repo_link(name: &str, url: &str) -> String {
-    use std::io::IsTerminal;
-    if std::io::stdout().is_terminal() {
-        // OSC 8 hyperlink: \x1b]8;;URL\x1b\\TEXT\x1b]8;;\x1b\\
-        format!("\x1b]8;;{}\x1b\\\x1b[1m{}\x1b[0m\x1b]8;;\x1b\\", url, name)
-    } else {
-        name.to_string()
-    }
-}
-
-/// Format owner name as clickable hyperlink (checks stderr since discover outputs there)
-fn format_owner_link(name: &str, url: &str) -> String {
-    use std::io::IsTerminal;
-    if std::io::stderr().is_terminal() {
-        format!("\x1b]8;;{}\x1b\\\x1b[1m{}\x1b[0m\x1b]8;;\x1b\\", url, name)
-    } else {
-        name.to_string()
-    }
+/// Configuration for fetching repo metadata from GitHub
+struct FetchConfig {
+    limit: Option<usize>,
+    batch_size: usize,
+    concurrency: usize,
+    debug: bool,
 }
 
 #[derive(Parser)]
@@ -247,7 +237,8 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Fetch { limit, batch_size, concurrency, debug }) => {
             let client = GitHubClient::new_with_options(token.clone(), debug, None, false);
-            fetch_from_db(&client, &db, limit, batch_size, concurrency, debug).await
+            let config = FetchConfig { limit, batch_size, concurrency, debug };
+            fetch_from_db(&client, &db, &config).await
         }
         Some(Commands::Embed { batch_size, limit, delay }) => {
             embed_missing(&db, batch_size, limit, delay)
@@ -297,177 +288,6 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Expand a search query using Claude CLI for better semantic understanding
-fn expand_query(query: &str) -> Result<String> {
-    use std::process::Command;
-
-    let prompt = format!(
-        r#"Expand this GitHub search query into technical keywords.
-
-Query: "{}"
-
-Output ONLY comma-separated keywords (no intro, no explanation, no quotes). Include:
-- Original terms
-- Related tools/libraries (e.g., metasploit, nmap, burpsuite)
-- Technical concepts (e.g., buffer overflow, RCE, SSRF)
-- File types/languages when relevant
-
-Example input: "web security"
-Example output: web security, OWASP, XSS, SQL injection, CSRF, burpsuite, ZAP, web application firewall, penetration testing
-
-Keywords:"#,
-        query
-    );
-
-    eprintln!("\x1b[36m..\x1b[0m Expanding query with Claude...");
-
-    // Try to find claude in common locations
-    let claude_paths = [
-        "claude",  // In PATH
-        "/usr/local/bin/claude",
-        &format!("{}/.nvm/versions/node/v22.20.0/bin/claude", std::env::var("HOME").unwrap_or_default()),
-    ];
-
-    let mut output = None;
-    for claude_path in &claude_paths {
-        let result = Command::new(claude_path)
-            .args(["--dangerously-skip-permissions", "--model", "haiku", "-p", &prompt])
-            .output();
-        if result.is_ok() {
-            output = Some(result);
-            break;
-        }
-    }
-
-    let output = match output {
-        Some(o) => o,
-        None => return Ok(query.to_string()),  // Fallback silently
-    };
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let expanded = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if expanded.is_empty() {
-                eprintln!("\x1b[33m!\x1b[0m Claude returned empty, using original query");
-                Ok(query.to_string())
-            } else {
-                eprintln!("\x1b[32m✓\x1b[0m Expanded: {}", expanded);
-                Ok(expanded)
-            }
-        }
-        Ok(out) => {
-            let err = String::from_utf8_lossy(&out.stderr);
-            eprintln!("\x1b[33m!\x1b[0m Claude failed ({}), using original query", err.trim());
-            Ok(query.to_string())
-        }
-        Err(e) => {
-            eprintln!("\x1b[33m!\x1b[0m Claude not available ({}), using original query", e);
-            Ok(query.to_string())
-        }
-    }
-}
-
-/// Hybrid search (semantic + keyword + name match with RRF fusion)
-fn search(query: &str, limit: usize, semantic_only: bool, db: &Database) -> Result<()> {
-    let (_total, indexed) = db.stats()?;
-
-    if indexed == 0 {
-        eprintln!("\x1b[31mx\x1b[0m No repositories indexed yet.");
-        eprintln!("  Run: goto-gh index \"<query>\" to index some repos first.");
-        std::process::exit(1);
-    }
-
-    let mode = if semantic_only { "semantic" } else { "hybrid" };
-    let dots = Dots::start(&format!("Searching {} repos ({})", indexed, mode));
-
-    // 1. Semantic search via embeddings
-    let query_embedding = embed_text(query)?;
-    let vector_results = db.find_similar(&query_embedding, limit * 3)?;
-
-    // 2. Name match search (strongest signal - repos with query in name)
-    let name_results = if semantic_only {
-        vec![]
-    } else {
-        db.find_by_name_match(query, limit * 3)?
-    };
-
-    // 3. Content keyword search via LIKE on embedded_text
-    let keyword_results = if semantic_only {
-        vec![]
-    } else {
-        db.find_by_keywords(query, limit * 3)?
-    };
-
-    dots.stop();
-
-    // RRF (Reciprocal Rank Fusion) with weighted signals
-    // Lower k = higher weight for top ranks
-    let k_name = 20.0;    // Strong boost for name matches
-    let k_vector = 60.0;  // Standard weight for semantic
-    let k_keyword = 80.0; // Lower weight for keyword (often noisy)
-
-    let mut scores: HashMap<i64, f32> = HashMap::new();
-
-    // Add name match scores (strongest signal)
-    for (rank, repo_id) in name_results.iter().enumerate() {
-        *scores.entry(*repo_id).or_default() += 1.0 / (k_name + rank as f32 + 1.0);
-    }
-
-    // Add vector search scores
-    for (rank, (repo_id, _distance)) in vector_results.iter().enumerate() {
-        *scores.entry(*repo_id).or_default() += 1.0 / (k_vector + rank as f32 + 1.0);
-    }
-
-    // Add keyword search scores (weakest signal)
-    for (rank, repo_id) in keyword_results.iter().enumerate() {
-        *scores.entry(*repo_id).or_default() += 1.0 / (k_keyword + rank as f32 + 1.0);
-    }
-
-    if scores.is_empty() {
-        eprintln!("\x1b[31mx\x1b[0m No matching repositories found.");
-        return Ok(());
-    }
-
-    // Sort by combined RRF score
-    let mut combined: Vec<_> = scores.into_iter().collect();
-    combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Display results
-    // Max score depends on mode
-    let max_score = if semantic_only {
-        1.0 / (k_vector + 1.0)  // Only vector contributes
-    } else {
-        1.0 / (k_name + 1.0) + 1.0 / (k_vector + 1.0) + 1.0 / (k_keyword + 1.0)
-    };
-
-    for (i, (repo_id, rrf_score)) in combined.iter().take(limit).enumerate() {
-        let repo = match db.get_repo_by_id(*repo_id)? {
-            Some(r) => r,
-            None => continue,
-        };
-
-        let lang = repo.language.as_deref().unwrap_or("?");
-        let stars = format_stars(repo.stars);
-        let desc = repo.description.as_deref().unwrap_or("No description");
-        let desc_truncated = truncate_str(desc, 60);
-
-        let display_score = (rrf_score / max_score * 100.0).min(100.0);
-        let repo_link = format_repo_link(&repo.full_name, &repo.url);
-
-        println!(
-            "\x1b[35m{:>2}.\x1b[0m {} \x1b[33m{}\x1b[0m \x1b[90m[{}]\x1b[0m \x1b[90m({:.0}%)\x1b[0m \x1b[90m{}\x1b[0m",
-            i + 1,
-            repo_link,
-            stars,
-            lang,
-            display_score,
-            desc_truncated
-        );
-    }
-
-    Ok(())
-}
-
 /// Add a single repository
 async fn add_repo(client: &GitHubClient, db: &Database, full_name: &str) -> Result<()> {
     eprintln!("\x1b[36m..\x1b[0m Fetching {}", full_name);
@@ -499,254 +319,6 @@ async fn add_repo(client: &GitHubClient, db: &Database, full_name: &str) -> Resu
     Ok(())
 }
 
-/// Discover and queue all repos from an owner (user/org) for later fetching
-async fn discover_owner_repos(client: &GitHubClient, db: &Database, full_name: &str) -> Result<()> {
-    let owner = full_name.split('/').next().unwrap_or("");
-    if owner.is_empty() {
-        return Ok(());
-    }
-
-    // Skip if already explored
-    if db.is_owner_repos_fetched(owner)? {
-        return Ok(());
-    }
-
-    eprintln!("\x1b[36m..\x1b[0m Discovering repos from {}", owner);
-
-    match client.list_owner_repos(owner).await {
-        Ok(repos) => {
-            let count = repos.len();
-            let (inserted, _skipped) = db.add_repo_stubs_bulk(&repos)?;
-            db.mark_owner_explored(owner, count)?;
-
-            if inserted > 0 {
-                eprintln!(
-                    "  \x1b[90m+{} new repos queued from {} ({} total)\x1b[0m",
-                    inserted, owner, count
-                );
-            }
-        }
-        Err(e) => {
-            // Don't fail the add if discovery fails, just log it
-            eprintln!("  \x1b[33m⚠\x1b[0m Could not discover repos from {}: {}", owner, e);
-        }
-    }
-
-    Ok(())
-}
-
-/// Discover more repos by exploring owners of existing repos (also fetches followers)
-async fn discover_from_owners(
-    client: &GitHubClient,
-    db: &Database,
-    limit: Option<usize>,
-    _concurrency: usize,
-) -> Result<()> {
-    // First, check for any interrupted owners and resume them
-    let in_progress_repos = db.get_in_progress_owners()?;
-    let in_progress_followers = db.get_in_progress_followers_fetch()?;
-
-    if !in_progress_repos.is_empty() || !in_progress_followers.is_empty() {
-        let total = in_progress_repos.len() + in_progress_followers.len();
-        eprintln!("\x1b[33m..\x1b[0m Resuming {} interrupted owner(s)", total);
-
-        let mut all_in_progress: Vec<String> = in_progress_repos;
-        all_in_progress.extend(in_progress_followers);
-        all_in_progress.sort();
-        all_in_progress.dedup();
-
-        for owner in &all_in_progress {
-            discover_single_owner(client, db, owner).await?;
-        }
-    }
-
-    // Get owners that need either repos OR followers fetched
-    let unexplored = db.count_unexplored_owners()?;
-    let without_followers = db.count_owners_without_followers()?;
-
-    if unexplored == 0 && without_followers == 0 {
-        println!("\x1b[32mok\x1b[0m All owners fully explored (repos + followers)");
-        return Ok(());
-    }
-
-    // Get owners: prioritize unexplored, then those missing followers
-    let mut owners_to_process: Vec<String> = db.get_unexplored_owners(limit)?;
-
-    // If limit allows, add owners that have repos but no followers
-    if let Some(lim) = limit {
-        if owners_to_process.len() < lim {
-            let remaining = lim - owners_to_process.len();
-            let more = db.get_owners_without_followers(Some(remaining))?;
-            owners_to_process.extend(more);
-        }
-    } else {
-        // No limit - add all owners without followers
-        let more = db.get_owners_without_followers(None)?;
-        owners_to_process.extend(more);
-    }
-
-    // Dedupe (some might be in both lists)
-    owners_to_process.sort();
-    owners_to_process.dedup();
-
-    let to_process = owners_to_process.len();
-    eprintln!(
-        "\x1b[36m..\x1b[0m Discovering from {} owners ({} need repos, {} need followers)",
-        to_process, unexplored, without_followers
-    );
-
-    let mut total_repos = 0;
-    let mut total_profiles = 0;
-    let mut processed = 0;
-
-    for owner in owners_to_process {
-        let (repos, profiles) = discover_single_owner(client, db, &owner).await?;
-        total_repos += repos;
-        total_profiles += profiles;
-        processed += 1;
-
-        // Checkpoint WAL periodically to prevent unbounded growth
-        if processed % 50 == 0 {
-            let _ = db.checkpoint();
-        }
-    }
-
-    // Final checkpoint before exit
-    let _ = db.checkpoint();
-
-    println!(
-        "\x1b[32mok\x1b[0m Processed {} owners: +{} repos, +{} profiles",
-        processed, total_repos, total_profiles
-    );
-
-    let still_unexplored = db.count_unexplored_owners()?;
-    let still_without_followers = db.count_owners_without_followers()?;
-
-    if still_unexplored > 0 || still_without_followers > 0 {
-        eprintln!(
-            "\x1b[36m..\x1b[0m {} still need repos, {} need followers",
-            still_unexplored, still_without_followers
-        );
-    }
-
-    Ok(())
-}
-
-/// Discover repos AND followers from a single owner with streaming saves
-async fn discover_single_owner(
-    client: &GitHubClient,
-    db: &Database,
-    owner: &str,
-) -> Result<(usize, usize)> {
-    use std::cell::RefCell;
-    use std::io::IsTerminal;
-
-    let owner_url = format!("https://github.com/{}", owner);
-    let owner_link = format_owner_link(owner, &owner_url);
-    let is_tty = std::io::stderr().is_terminal();
-
-    let needs_repos = !db.is_owner_repos_fetched(owner)?;
-    let needs_followers = !db.is_owner_followers_fetched(owner)?;
-
-    let mut repos_inserted = 0usize;
-    let mut followers_added = 0usize;
-
-    // === REPOS ===
-    if needs_repos {
-        db.mark_owner_in_progress(owner)?;
-
-        let inserted_count = RefCell::new(0usize);
-        let total_repos = RefCell::new(0usize);
-        let last_page = RefCell::new(0usize);
-
-        let result = client
-            .list_owner_repos_streaming(owner, |repos, progress| {
-                let (inserted, _) = db.add_repo_stubs_bulk(&repos)?;
-                *inserted_count.borrow_mut() += inserted;
-                *total_repos.borrow_mut() = progress.total_so_far;
-                *last_page.borrow_mut() = progress.page;
-
-                if is_tty && progress.page > 1 {
-                    eprint!(
-                        "\r  {} \x1b[90mrepos: {} (+{} new)...\x1b[0m\x1b[K",
-                        owner_link, progress.total_so_far, *inserted_count.borrow()
-                    );
-                    let _ = std::io::stderr().flush();
-                }
-                Ok(())
-            })
-            .await;
-
-        if is_tty && *last_page.borrow() >= 1 {
-            eprint!("\r\x1b[K");
-        }
-
-        repos_inserted = *inserted_count.borrow();
-        let total = *total_repos.borrow();
-
-        match result {
-            Ok(_) => db.mark_owner_explored(owner, total)?,
-            Err(_) => db.mark_owner_explored(owner, total)?,
-        }
-    }
-
-    // === FOLLOWERS ===
-    if needs_followers {
-        db.mark_owner_followers_in_progress(owner)?;
-
-        let added_count = RefCell::new(0usize);
-        let total_followers = RefCell::new(0usize);
-        let last_page = RefCell::new(0usize);
-
-        let result = client
-            .list_owner_followers_streaming(owner, |followers, progress| {
-                let (added, _) = db.add_followers_as_owners_bulk(&followers)?;
-                *added_count.borrow_mut() += added;
-                *total_followers.borrow_mut() = progress.total_so_far;
-                *last_page.borrow_mut() = progress.page;
-
-                if is_tty {
-                    eprint!(
-                        "\r  {} \x1b[90mfollowers: {} (+{} new)...\x1b[0m\x1b[K",
-                        owner_link, progress.total_so_far, *added_count.borrow()
-                    );
-                    let _ = std::io::stderr().flush();
-                }
-                Ok(())
-            })
-            .await;
-
-        if is_tty && *last_page.borrow() >= 1 {
-            eprint!("\r\x1b[K");
-        }
-
-        followers_added = *added_count.borrow();
-        let total = *total_followers.borrow();
-
-        match result {
-            Ok(_) => db.mark_owner_followers_fetched(owner, total)?,
-            Err(_) => db.mark_owner_followers_fetched(owner, total)?,
-        }
-    }
-
-    // Print summary
-    let mut parts = Vec::new();
-    if repos_inserted > 0 {
-        parts.push(format!("+{} repos", repos_inserted));
-    }
-    if followers_added > 0 {
-        parts.push(format!("+{} profiles", followers_added));
-    }
-
-    if !parts.is_empty() {
-        eprintln!("  {} \x1b[32m{}\x1b[0m", owner_link, parts.join(", "));
-    } else if needs_repos || needs_followers {
-        eprintln!("  {} \x1b[90m(all known)\x1b[0m", owner_link);
-    }
-
-    Ok((repos_inserted, followers_added))
-}
-
 /// Fuzzy search by repo name
 fn find_by_name(db: &Database, pattern: &str, limit: usize) -> Result<()> {
     let repos = db.find_by_name(pattern, limit)?;
@@ -772,16 +344,6 @@ fn find_by_name(db: &Database, pattern: &str, limit: usize) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Truncate string safely at char boundary
-fn truncate_str(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_chars - 3).collect();
-        format!("{}...", truncated)
-    }
 }
 
 /// Show statistics
@@ -904,15 +466,6 @@ fn revectorize(db: &Database) -> Result<()> {
     Ok(())
 }
 
-/// Format star count (e.g., 1.2k, 15k)
-fn format_stars(stars: u64) -> String {
-    if stars >= 1000 {
-        format!("{}k", stars / 1000)
-    } else {
-        format!("{}", stars)
-    }
-}
-
 /// Load repo stubs from file (no API calls, just stores names in DB)
 fn load_repo_stubs(db: &Database, file_path: &str) -> Result<()> {
     use std::fs::File;
@@ -1023,10 +576,7 @@ fn load_user_stubs(db: &Database, file_path: &str) -> Result<()> {
 async fn fetch_from_db(
     client: &GitHubClient,
     db: &Database,
-    limit: Option<usize>,
-    batch_size: usize,
-    concurrency: usize,
-    debug: bool,
+    config: &FetchConfig,
 ) -> Result<()> {
     let need_fetch = db.count_repos_without_metadata()?;
 
@@ -1035,10 +585,10 @@ async fn fetch_from_db(
         return Ok(());
     }
 
-    let to_fetch = limit.map(|l| l.min(need_fetch)).unwrap_or(need_fetch);
+    let to_fetch = config.limit.map(|l| l.min(need_fetch)).unwrap_or(need_fetch);
     eprintln!(
         "\x1b[36m..\x1b[0m Fetching metadata for {} repos (batch size: {}, concurrency: {}) - NO EMBEDDINGS",
-        to_fetch, batch_size, concurrency
+        to_fetch, config.batch_size, config.concurrency
     );
 
     let mut stored = 0;
@@ -1048,7 +598,7 @@ async fn fetch_from_db(
     while stored + errors < to_fetch {
         batch_num += 1;
         let remaining = to_fetch - stored - errors;
-        let this_batch_size = remaining.min(batch_size);
+        let this_batch_size = remaining.min(config.batch_size);
 
         // Get next batch of repos without metadata
         let repos_to_fetch = db.get_repos_without_metadata(Some(this_batch_size))?;
@@ -1063,7 +613,7 @@ async fn fetch_from_db(
         );
 
         // Debug: show sample of repos being fetched
-        if debug {
+        if config.debug {
             eprintln!("  [DEBUG] Sample repos to fetch:");
             for (i, name) in repos_to_fetch.iter().take(5).enumerate() {
                 eprintln!("    {}. {}", i + 1, name);
@@ -1074,7 +624,7 @@ async fn fetch_from_db(
         }
 
         // Fetch via GraphQL
-        let fetched_repos = match client.fetch_repos_batch(&repos_to_fetch, concurrency).await {
+        let fetched_repos = match client.fetch_repos_batch(&repos_to_fetch, config.concurrency).await {
             Ok(repos) => repos,
             Err(e) => {
                 eprintln!("\x1b[31mx\x1b[0m Batch {} failed: {}", batch_num, e);
@@ -1129,7 +679,7 @@ async fn fetch_from_db(
             }
 
             // Debug: show sample of gone repos
-            if debug {
+            if config.debug {
                 eprintln!("  [DEBUG] Sample gone repos:");
                 for (i, name) in missing.iter().take(5).enumerate() {
                     eprintln!("    {}. {}", i + 1, name);
@@ -1248,52 +798,6 @@ fn embed_missing(db: &Database, batch_size: usize, limit: Option<usize>, delay_s
     Ok(())
 }
 
-/// Extract GitHub repo names from markdown content
-fn extract_github_repos(markdown: &str) -> Vec<String> {
-    let mut repos = Vec::new();
-
-    // Match patterns like:
-    // - https://github.com/owner/repo
-    // - [text](https://github.com/owner/repo)
-    // - github.com/owner/repo
-
-    let re_patterns = [
-        r"https?://github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)",
-        r"github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)",
-    ];
-
-    for pattern in re_patterns {
-        for cap in regex_lite::Regex::new(pattern)
-            .unwrap()
-            .captures_iter(markdown)
-        {
-            if let Some(m) = cap.get(1) {
-                let repo = m.as_str();
-                // Filter out non-repo paths (issues, pulls, blob, tree, etc.)
-                if !repo.contains('/')
-                    || repo.ends_with(".git")
-                    || repo.split('/').nth(1).map_or(true, |s| {
-                        ["issues", "pull", "blob", "tree", "wiki", "releases", "actions", "discussions"]
-                            .contains(&s.split('/').next().unwrap_or(""))
-                            || s.contains('#')
-                            || s.contains('?')
-                    })
-                {
-                    continue;
-                }
-
-                // Clean up: take only owner/repo part
-                let parts: Vec<&str> = repo.split('/').take(2).collect();
-                if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                    repos.push(format!("{}/{}", parts[0], parts[1]));
-                }
-            }
-        }
-    }
-
-    repos
-}
-
 /// Discover and add repo stubs from a single README
 /// Returns the number of new repos added
 fn discover_repos_from_readme(db: &Database, readme: &str) -> usize {
@@ -1308,54 +812,6 @@ fn discover_repos_from_readme(db: &Database, readme: &str) -> usize {
     match db.add_repo_stubs_bulk(&repos_vec) {
         Ok((added, _)) => added,
         Err(_) => 0,
-    }
-}
-
-/// Animated dots spinner
-struct Dots {
-    running: Arc<AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Dots {
-    fn start(message: &str) -> Self {
-        let running = Arc::new(AtomicBool::new(true));
-        let running_clone = running.clone();
-        let msg = message.to_string();
-
-        let handle = std::thread::spawn(move || {
-            const FRAMES: &[&str] = &[
-                "\u{28CB}", "\u{28D9}", "\u{28F9}", "\u{28F8}",
-                "\u{28FC}", "\u{28F4}", "\u{28E6}", "\u{28E7}",
-                "\u{28C7}", "\u{28CF}",
-            ];
-            let mut i = 0;
-            while running_clone.load(Ordering::Relaxed) {
-                eprint!("\r\x1b[36m{}\x1b[0m {}", FRAMES[i % 10], msg);
-                let _ = io::stderr().flush();
-                std::thread::sleep(Duration::from_millis(80));
-                i += 1;
-            }
-        });
-
-        Self {
-            running,
-            handle: Some(handle),
-        }
-    }
-
-    fn stop(mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-        eprint!("\r\x1b[K"); // Clear line
-    }
-}
-
-impl Drop for Dots {
-    fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
     }
 }
 

@@ -1032,6 +1032,7 @@ dependencies = [
  "dirs 5.0.1",
  "fastembed",
  "futures",
+ "once_cell",
  "regex",
  "regex-lite",
  "reqwest",

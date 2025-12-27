@@ -45,6 +45,25 @@ impl Database {
         Ok(db)
     }
 
+    /// Open an in-memory database for testing
+    #[cfg(test)]
+    pub fn open_in_memory() -> Result<Self> {
+        // Initialize sqlite-vec extension
+        unsafe {
+            sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
+        }
+
+        let conn = Connection::open_in_memory()
+            .context("Failed to open in-memory database")?;
+
+        let db = Self {
+            conn,
+            path: std::path::PathBuf::from(":memory:"),
+        };
+        db.init()?;
+        Ok(db)
+    }
+
     /// Get the database file path
     pub fn path(&self) -> &std::path::Path {
         &self.path
@@ -1046,5 +1065,389 @@ impl Database {
             params![title, authors, abstract_text, published_at, now, paper_id],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper to create a test database
+    fn test_db() -> Database {
+        Database::open_in_memory().expect("Failed to create test database")
+    }
+
+    // === Basic Operations ===
+
+    #[test]
+    fn test_add_repo_stub() {
+        let db = test_db();
+
+        // First insert should succeed
+        let inserted = db.add_repo_stub("owner/repo").unwrap();
+        assert!(inserted);
+
+        // Duplicate should be skipped
+        let inserted_again = db.add_repo_stub("owner/repo").unwrap();
+        assert!(!inserted_again);
+    }
+
+    #[test]
+    fn test_add_repo_stub_case_insensitive() {
+        let db = test_db();
+
+        // Add with original case
+        let inserted = db.add_repo_stub("Owner/Repo").unwrap();
+        assert!(inserted);
+
+        // Same repo with different case should be deduplicated
+        let inserted_lower = db.add_repo_stub("owner/repo").unwrap();
+        assert!(!inserted_lower);
+
+        let inserted_upper = db.add_repo_stub("OWNER/REPO").unwrap();
+        assert!(!inserted_upper);
+    }
+
+    #[test]
+    fn test_add_repo_stubs_bulk() {
+        let db = test_db();
+
+        let names = vec![
+            "owner1/repo1".to_string(),
+            "owner2/repo2".to_string(),
+            "owner3/repo3".to_string(),
+        ];
+
+        let (inserted, skipped) = db.add_repo_stubs_bulk(&names).unwrap();
+        assert_eq!(inserted, 3);
+        assert_eq!(skipped, 0);
+
+        // Adding again should skip all
+        let (inserted2, skipped2) = db.add_repo_stubs_bulk(&names).unwrap();
+        assert_eq!(inserted2, 0);
+        assert_eq!(skipped2, 3);
+    }
+
+    #[test]
+    fn test_stats() {
+        let db = test_db();
+
+        let (total, indexed) = db.stats().unwrap();
+        assert_eq!(total, 0);
+        assert_eq!(indexed, 0);
+
+        // Add some stubs
+        db.add_repo_stub("owner/repo1").unwrap();
+        db.add_repo_stub("owner/repo2").unwrap();
+
+        let (total, indexed) = db.stats().unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(indexed, 0); // No embeddings yet
+    }
+
+    // === Metadata Operations ===
+
+    #[test]
+    fn test_get_repos_without_metadata() {
+        let db = test_db();
+
+        // Add stubs (no metadata)
+        db.add_repo_stub("owner/repo1").unwrap();
+        db.add_repo_stub("owner/repo2").unwrap();
+
+        let without_meta = db.get_repos_without_metadata(None).unwrap();
+        assert_eq!(without_meta.len(), 2);
+
+        // Test limit
+        let limited = db.get_repos_without_metadata(Some(1)).unwrap();
+        assert_eq!(limited.len(), 1);
+    }
+
+    #[test]
+    fn test_count_repos_without_metadata() {
+        let db = test_db();
+
+        db.add_repo_stub("owner/repo1").unwrap();
+        db.add_repo_stub("owner/repo2").unwrap();
+        db.add_repo_stub("owner/repo3").unwrap();
+
+        let count = db.count_repos_without_metadata().unwrap();
+        assert_eq!(count, 3);
+    }
+
+    // === Find Operations ===
+
+    #[test]
+    fn test_find_by_name() {
+        let db = test_db();
+
+        db.add_repo_stub("tensorflow/tensorflow").unwrap();
+        db.add_repo_stub("pytorch/pytorch").unwrap();
+        db.add_repo_stub("keras-team/keras").unwrap();
+
+        // Search for "tensor"
+        let results = db.find_by_name("tensor", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].full_name, "tensorflow/tensorflow");
+
+        // Search for "py"
+        let results = db.find_by_name("py", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].full_name, "pytorch/pytorch");
+    }
+
+    #[test]
+    fn test_find_by_name_case_insensitive() {
+        let db = test_db();
+
+        db.add_repo_stub("TensorFlow/TensorFlow").unwrap();
+
+        let results = db.find_by_name("tensorflow", 10).unwrap();
+        assert_eq!(results.len(), 1);
+
+        let results = db.find_by_name("TENSORFLOW", 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    // === Owner Exploration ===
+
+    #[test]
+    fn test_owner_exploration_tracking() {
+        let db = test_db();
+
+        // Initially not explored
+        assert!(!db.is_owner_repos_fetched("testowner").unwrap());
+
+        // Mark in progress
+        db.mark_owner_in_progress("testowner").unwrap();
+
+        // Still not "fetched" (in_progress != done)
+        assert!(!db.is_owner_repos_fetched("testowner").unwrap());
+
+        // Check in_progress list
+        let in_progress = db.get_in_progress_owners().unwrap();
+        assert_eq!(in_progress.len(), 1);
+        assert_eq!(in_progress[0], "testowner");
+
+        // Mark as explored/done
+        db.mark_owner_explored("testowner", 42).unwrap();
+
+        // Now should be fetched
+        assert!(db.is_owner_repos_fetched("testowner").unwrap());
+
+        // In progress list should be empty
+        let in_progress = db.get_in_progress_owners().unwrap();
+        assert!(in_progress.is_empty());
+    }
+
+    #[test]
+    fn test_unexplored_owners() {
+        let db = test_db();
+
+        // Add repos from different owners
+        db.add_repo_stub("owner1/repo1").unwrap();
+        db.add_repo_stub("owner2/repo2").unwrap();
+        db.add_repo_stub("owner3/repo3").unwrap();
+
+        // All 3 owners should be unexplored
+        let unexplored = db.get_unexplored_owners(None).unwrap();
+        assert_eq!(unexplored.len(), 3);
+
+        // Mark one as explored
+        db.mark_owner_explored("owner1", 1).unwrap();
+
+        // Now only 2 unexplored
+        let unexplored = db.get_unexplored_owners(None).unwrap();
+        assert_eq!(unexplored.len(), 2);
+        assert!(!unexplored.contains(&"owner1".to_string()));
+    }
+
+    #[test]
+    fn test_count_unexplored_owners() {
+        let db = test_db();
+
+        db.add_repo_stub("owner1/repo1").unwrap();
+        db.add_repo_stub("owner2/repo2").unwrap();
+
+        assert_eq!(db.count_unexplored_owners().unwrap(), 2);
+
+        db.mark_owner_explored("owner1", 1).unwrap();
+        assert_eq!(db.count_unexplored_owners().unwrap(), 1);
+    }
+
+    // === Follower Tracking ===
+
+    #[test]
+    fn test_follower_tracking() {
+        let db = test_db();
+
+        // Initially not fetched
+        assert!(!db.is_owner_followers_fetched("testowner").unwrap());
+
+        // Mark in progress
+        db.mark_owner_followers_in_progress("testowner").unwrap();
+        assert!(!db.is_owner_followers_fetched("testowner").unwrap());
+
+        // Check in_progress list
+        let in_progress = db.get_in_progress_followers_fetch().unwrap();
+        assert_eq!(in_progress.len(), 1);
+
+        // Mark as done
+        db.mark_owner_followers_fetched("testowner", 100).unwrap();
+        assert!(db.is_owner_followers_fetched("testowner").unwrap());
+    }
+
+    #[test]
+    fn test_add_follower_as_owner() {
+        let db = test_db();
+
+        // Add a new follower
+        let added = db.add_follower_as_owner("newfollower").unwrap();
+        assert!(added);
+
+        // Adding again should skip (placeholder exists)
+        let added_again = db.add_follower_as_owner("newfollower").unwrap();
+        assert!(!added_again);
+    }
+
+    // === Gone Repos ===
+
+    #[test]
+    fn test_mark_as_gone() {
+        let db = test_db();
+
+        db.add_repo_stub("owner/existing").unwrap();
+        db.add_repo_stub("owner/deleted").unwrap();
+
+        let marked = db.mark_as_gone_bulk(&["owner/deleted".to_string()]).unwrap();
+        assert_eq!(marked, 1);
+
+        let gone_count = db.count_gone().unwrap();
+        assert_eq!(gone_count, 1);
+
+        // Gone repos shouldn't appear in repos needing metadata
+        let need_meta = db.get_repos_without_metadata(None).unwrap();
+        assert_eq!(need_meta.len(), 1);
+        assert_eq!(need_meta[0], "owner/existing");
+    }
+
+    #[test]
+    fn test_mark_as_gone_case_insensitive() {
+        let db = test_db();
+
+        db.add_repo_stub("Owner/Repo").unwrap();
+
+        // Mark with different case
+        let marked = db.mark_as_gone_bulk(&["owner/repo".to_string()]).unwrap();
+        assert_eq!(marked, 1);
+
+        let gone_count = db.count_gone().unwrap();
+        assert_eq!(gone_count, 1);
+    }
+
+    // === Placeholders ===
+
+    #[test]
+    fn test_placeholders_excluded() {
+        let db = test_db();
+
+        db.add_repo_stub("owner/real-repo").unwrap();
+        db.add_repo_stub("owner/__placeholder__").unwrap();
+
+        // Placeholders should not count as needing metadata
+        let need_meta = db.get_repos_without_metadata(None).unwrap();
+        assert_eq!(need_meta.len(), 1);
+        assert_eq!(need_meta[0], "owner/real-repo");
+
+        // Count should also exclude placeholders
+        let count = db.count_repos_without_metadata().unwrap();
+        assert_eq!(count, 1);
+
+        // Count placeholders specifically
+        let placeholder_count = db.count_placeholders().unwrap();
+        assert_eq!(placeholder_count, 1);
+    }
+
+    // === Papers ===
+
+    #[test]
+    fn test_upsert_paper() {
+        let db = test_db();
+
+        let paper_id = db.upsert_paper(
+            "https://arxiv.org/abs/2301.12345",
+            "arxiv.org",
+            Some("2301.12345"),
+            None,
+        ).unwrap();
+
+        assert!(paper_id > 0);
+
+        // Upserting same URL should return same ID
+        let paper_id2 = db.upsert_paper(
+            "https://arxiv.org/abs/2301.12345",
+            "arxiv.org",
+            Some("2301.12345"),
+            None,
+        ).unwrap();
+
+        assert_eq!(paper_id, paper_id2);
+
+        let count = db.count_papers().unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_paper_sources() {
+        let db = test_db();
+
+        // Add a repo
+        db.add_repo_stub("owner/repo").unwrap();
+
+        // Add a paper
+        let paper_id = db.upsert_paper(
+            "https://arxiv.org/abs/2301.12345",
+            "arxiv.org",
+            Some("2301.12345"),
+            None,
+        ).unwrap();
+
+        // Link paper to repo (repo_id = 1 since it's the first)
+        db.add_paper_source(paper_id, 1, Some("Found in README")).unwrap();
+
+        let source_count = db.count_paper_sources().unwrap();
+        assert_eq!(source_count, 1);
+
+        // Adding same link again should be ignored (ON CONFLICT)
+        db.add_paper_source(paper_id, 1, Some("Duplicate")).unwrap();
+        let source_count = db.count_paper_sources().unwrap();
+        assert_eq!(source_count, 1);
+    }
+
+    // === Distinct Owners ===
+
+    #[test]
+    fn test_count_distinct_owners() {
+        let db = test_db();
+
+        db.add_repo_stub("owner1/repo1").unwrap();
+        db.add_repo_stub("owner1/repo2").unwrap();
+        db.add_repo_stub("owner2/repo1").unwrap();
+
+        let count = db.count_distinct_owners().unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_count_distinct_owners_excludes_placeholders() {
+        let db = test_db();
+
+        db.add_repo_stub("owner1/repo1").unwrap();
+        db.add_repo_stub("owner2/__placeholder__").unwrap();
+
+        // owner2 only has a placeholder, so should still count as distinct
+        // but the placeholder shouldn't count as a real repo
+        let count = db.count_distinct_owners().unwrap();
+        assert_eq!(count, 1); // Only owner1 has real repos
     }
 }

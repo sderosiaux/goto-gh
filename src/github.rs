@@ -3,9 +3,81 @@ use base64::Engine;
 use futures::stream::{self, StreamExt};
 use serde::Deserialize;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use crate::proxy::ProxyManager;
+
+// === Configuration Constants ===
+
+/// Maximum repos per GraphQL query chunk
+const GRAPHQL_CHUNK_SIZE: usize = 50;
+
+/// Number of proxies to race in parallel
+const PROXY_PARALLEL_COUNT: usize = 5;
+
+/// Maximum rounds of proxy rotation before giving up
+const PROXY_MAX_ROUNDS: usize = 10;
+
+/// Retry configuration
+pub struct RetryConfig {
+    pub max_attempts: u32,
+    pub base_delay_ms: u64,
+}
+
+/// Which rate limit API to check
+pub enum RateLimitApi {
+    Core,
+    GraphQL,
+}
+
+impl RateLimitApi {
+    pub fn name(&self) -> &'static str {
+        match self {
+            RateLimitApi::Core => "REST API",
+            RateLimitApi::GraphQL => "GraphQL",
+        }
+    }
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            base_delay_ms: 500,
+        }
+    }
+}
+
+/// Execute an operation with exponential backoff retry
+/// Returns the last error if all attempts fail
+pub async fn retry_with_backoff<F, Fut, T, E>(
+    config: &RetryConfig,
+    mut operation: F,
+) -> std::result::Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let mut last_error = None;
+
+    for attempt in 0..config.max_attempts {
+        if attempt > 0 {
+            let delay = config.base_delay_ms * (1 << attempt.min(3));
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                last_error = Some(e);
+            }
+        }
+    }
+
+    Err(last_error.expect("At least one attempt should have been made"))
+}
 
 /// GitHub repository metadata (REST API)
 #[derive(Debug, Clone, Deserialize)]
@@ -181,13 +253,10 @@ impl GitHubClient {
         }
 
         // Race multiple proxies in parallel - first successful response wins
-        let parallel_count = 5; // Try 5 proxies at once
-        let max_rounds = 10; // Up to 10 rounds = 50 proxies total
-
-        for _round in 0..max_rounds {
+        for _round in 0..PROXY_MAX_ROUNDS {
             // Get batch of proxies to try
-            let mut proxies_to_try = Vec::with_capacity(parallel_count);
-            for _ in 0..parallel_count {
+            let mut proxies_to_try = Vec::with_capacity(PROXY_PARALLEL_COUNT);
+            for _ in 0..PROXY_PARALLEL_COUNT {
                 if let Some(p) = pm.get_next() {
                     proxies_to_try.push(p);
                 }
@@ -241,7 +310,7 @@ impl GitHubClient {
             }
         }
 
-        Err(format!("All {} proxy attempts failed", max_rounds * parallel_count))
+        Err(format!("All {} proxy attempts failed", PROXY_MAX_ROUNDS * PROXY_PARALLEL_COUNT))
     }
 
     /// Get repository details
@@ -268,22 +337,11 @@ impl GitHubClient {
     /// Get README content (decoded) with retry logic
     pub async fn get_readme(&self, full_name: &str) -> Result<Option<String>> {
         let url = format!("https://api.github.com/repos/{}/readme", full_name);
+        let config = RetryConfig::default();
 
-        // Retry with exponential backoff for transient errors
-        let mut last_error = None;
-        for attempt in 0..5 {
-            if attempt > 0 {
-                let delay = std::time::Duration::from_millis(500 * (1 << attempt.min(3)));
-                tokio::time::sleep(delay).await;
-            }
-
-            let response = match self.send_request(&url).await {
-                Ok(r) => r,
-                Err(e) => {
-                    last_error = Some(format!("Request failed: {}", e));
-                    continue;
-                }
-            };
+        let result = retry_with_backoff(&config, || async {
+            let response = self.send_request(&url).await
+                .map_err(|e| format!("Request failed: {}", e))?;
 
             let status = response.status();
 
@@ -296,28 +354,21 @@ impl GitHubClient {
                 || status == reqwest::StatusCode::GATEWAY_TIMEOUT
                 || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
             {
-                last_error = Some(format!("GitHub API error {}", status));
-                continue;
+                return Err(format!("GitHub API error {}", status));
             }
 
-            // Retry on rate limit (403) with extra delay
+            // Retry on rate limit (403)
             if status == reqwest::StatusCode::FORBIDDEN {
-                last_error = Some("Rate limited (403)".to_string());
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                continue;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                return Err("Rate limited (403)".to_string());
             }
 
             if !status.is_success() {
-                anyhow::bail!("GitHub API error {}: failed to fetch README", status);
+                return Err(format!("GitHub API error {}: failed to fetch README", status));
             }
 
-            let readme: ReadmeResponse = match response.json().await {
-                Ok(r) => r,
-                Err(e) => {
-                    last_error = Some(format!("JSON parse error: {}", e));
-                    continue;
-                }
-            };
+            let readme: ReadmeResponse = response.json().await
+                .map_err(|e| format!("JSON parse error: {}", e))?;
 
             if readme.encoding != "base64" {
                 return Ok(None);
@@ -327,16 +378,15 @@ impl GitHubClient {
             let cleaned = readme.content.replace('\n', "");
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(&cleaned)
-                .context("Failed to decode base64 README")?;
+                .map_err(|e| format!("Base64 decode error: {}", e))?;
 
             let text = String::from_utf8(decoded)
-                .context("README is not valid UTF-8")?;
+                .map_err(|e| format!("UTF-8 decode error: {}", e))?;
 
-            return Ok(Some(text));
-        }
+            Ok(Some(text))
+        }).await;
 
-        // All retries failed
-        anyhow::bail!("Failed to fetch README after 5 retries: {}", last_error.unwrap_or_default())
+        result.map_err(|e| anyhow::anyhow!("Failed to fetch README after retries: {}", e))
     }
 
     /// Check rate limit status (returns both REST and GraphQL limits)
@@ -360,6 +410,12 @@ impl GitHubClient {
             return false;
         }
 
+        Self::wait_for_rate_reset(rate, api_name).await;
+        true
+    }
+
+    /// Wait for rate limit reset (unconditionally)
+    async fn wait_for_rate_reset(rate: &RateLimit, api_name: &str) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -367,7 +423,7 @@ impl GitHubClient {
 
         if rate.reset <= now {
             // Reset time already passed, should be fine
-            return false;
+            return;
         }
 
         let wait_secs = rate.reset - now + 5; // +5s buffer
@@ -387,6 +443,38 @@ impl GitHubClient {
         tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
 
         eprintln!("  \x1b[32m▶ Rate limit reset, resuming\x1b[0m");
+    }
+
+    /// Check rate limit and wait if necessary
+    /// Returns true if we had to wait
+    pub async fn check_and_wait_rate_limit(&self, api: RateLimitApi, min_remaining: u32) -> Result<bool> {
+        let rates = self.rate_limit().await?;
+        let rate = match api {
+            RateLimitApi::Core => &rates.core,
+            RateLimitApi::GraphQL => &rates.graphql,
+        };
+        Ok(self.wait_for_rate_limit(rate, api.name(), min_remaining).await)
+    }
+
+    /// Handle GraphQL rate limit: check current limits and wait if needed
+    /// Returns true if we should retry, false if we should give up
+    async fn handle_graphql_rate_limit(&self, fallback_wait_secs: u64) -> bool {
+        if let Ok(rates) = self.rate_limit().await {
+            let rate = &rates.graphql;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            if rate.reset > now {
+                Self::wait_for_rate_reset(rate, "GraphQL").await;
+                return true;
+            }
+        }
+
+        // Fallback: wait fixed time if we can't get rate limit info
+        eprintln!("  \x1b[33m⏸ Rate limited, waiting {}s...\x1b[0m", fallback_wait_secs);
+        tokio::time::sleep(Duration::from_secs(fallback_wait_secs)).await;
         true
     }
 
@@ -412,7 +500,6 @@ impl GitHubClient {
     {
         // Try as user first
         match self.list_repos_paginated_streaming(
-            owner,
             &format!(
                 "https://api.github.com/users/{}/repos?per_page=100&page={{page}}&type=owner",
                 owner
@@ -425,7 +512,6 @@ impl GitHubClient {
                 let err_str = e.to_string();
                 if err_str.contains("404") {
                     return self.list_repos_paginated_streaming(
-                        owner,
                         &format!(
                             "https://api.github.com/orgs/{}/repos?per_page=100&page={{page}}&type=public",
                             owner
@@ -441,7 +527,6 @@ impl GitHubClient {
     /// Paginated repo listing with streaming callback and retry logic
     async fn list_repos_paginated_streaming<F>(
         &self,
-        _owner: &str,
         url_template: &str,
         on_page: &mut F,
     ) -> Result<usize>
@@ -813,19 +898,16 @@ struct FollowerInfo {
     login: String,
 }
 
-/// Progress update for streaming repo discovery
+/// Progress update for streaming pagination (repos or followers)
 #[derive(Debug, Clone)]
-pub struct DiscoveryProgress {
+pub struct PaginationProgress {
     pub page: usize,
     pub total_so_far: usize,
 }
 
-/// Progress update for streaming follower discovery
-#[derive(Debug, Clone)]
-pub struct FollowerProgress {
-    pub page: usize,
-    pub total_so_far: usize,
-}
+/// Type alias for backward compatibility
+pub type DiscoveryProgress = PaginationProgress;
+pub type FollowerProgress = PaginationProgress;
 
 #[derive(Debug, Deserialize)]
 pub struct RateLimit {
@@ -965,6 +1047,23 @@ impl GitHubClient {
         })
     }
 
+    /// Parse all repos from a GraphQL response data object
+    fn parse_graphql_response(data: &serde_json::Value) -> Vec<RepoWithReadme> {
+        let mut repos = Vec::new();
+        if let Some(obj) = data.as_object() {
+            for (_key, value) in obj {
+                // Skip null values (repos that don't exist)
+                if value.is_null() {
+                    continue;
+                }
+                if let Some(repo) = Self::parse_repo_from_json(value) {
+                    repos.push(repo);
+                }
+            }
+        }
+        repos
+    }
+
     /// Fetch multiple repos by owner/name using GraphQL (batched, efficient)
     /// Uses direct repository queries instead of search for accurate results
     /// Parallelizes chunk fetching with concurrency limit to maximize throughput
@@ -977,10 +1076,9 @@ impl GitHubClient {
             anyhow::bail!("GraphQL requires authentication");
         }
 
-        // Use direct repository queries (50 repos per query for efficiency)
-        let chunk_size = 50;
+        // Use direct repository queries
         let batch_start = std::time::Instant::now();
-        let chunks: Vec<_> = repo_names.chunks(chunk_size).collect();
+        let chunks: Vec<_> = repo_names.chunks(GRAPHQL_CHUNK_SIZE).collect();
         let total_chunks = chunks.len();
 
         // Concurrency limit for parallel GraphQL requests
@@ -1051,35 +1149,7 @@ impl GitHubClient {
 
                     if status == reqwest::StatusCode::FORBIDDEN {
                         last_error = Some(format!("Rate limited (403) after {}ms", req_elapsed.as_millis()));
-                        // Check rate limit and wait for reset
-                        let rate_url = "https://api.github.com/rate_limit";
-                        if let Ok(resp) = gh_client.send_request(rate_url).await {
-                            if let Ok(data) = resp.json::<RateLimitResponse>().await {
-                                let rate = &data.resources.graphql;
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs();
-                                if rate.remaining < 10 && rate.reset > now {
-                                    let wait_secs = rate.reset - now + 5;
-                                    let wait_mins = wait_secs / 60;
-                                    let wait_remainder = wait_secs % 60;
-                                    let reset_time = chrono::DateTime::from_timestamp(rate.reset as i64, 0)
-                                        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
-                                        .unwrap_or_else(|| "??:??".to_string());
-                                    eprintln!(
-                                        "  \x1b[33m⏸ GraphQL rate limit low ({}/{}), waiting {}m{}s for reset (at {})...\x1b[0m",
-                                        rate.remaining, rate.limit, wait_mins, wait_remainder, reset_time
-                                    );
-                                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
-                                    eprintln!("  \x1b[32m▶ Rate limit reset, resuming\x1b[0m");
-                                    continue;
-                                }
-                            }
-                        }
-                        // Fallback: short wait
-                        eprintln!("  \x1b[33m⏸ Rate limited, waiting 30s...\x1b[0m");
-                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        gh_client.handle_graphql_rate_limit(30).await;
                         continue;
                     }
 
@@ -1106,35 +1176,7 @@ impl GitHubClient {
 
                         if is_rate_limit {
                             last_error = Some("Rate limited (GraphQL error)".to_string());
-                            // Check rate limit and wait for reset
-                            let rate_url = "https://api.github.com/rate_limit";
-                            if let Ok(resp) = gh_client.send_request(rate_url).await {
-                                if let Ok(data) = resp.json::<RateLimitResponse>().await {
-                                    let rate = &data.resources.graphql;
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
-                                        .as_secs();
-                                    if rate.reset > now {
-                                        let wait_secs = rate.reset - now + 5;
-                                        let wait_mins = wait_secs / 60;
-                                        let wait_remainder = wait_secs % 60;
-                                        let reset_time = chrono::DateTime::from_timestamp(rate.reset as i64, 0)
-                                            .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
-                                            .unwrap_or_else(|| "??:??".to_string());
-                                        eprintln!(
-                                            "  \x1b[33m⏸ GraphQL rate limit exceeded ({}/{}), waiting {}m{}s for reset (at {})...\x1b[0m",
-                                            rate.remaining, rate.limit, wait_mins, wait_remainder, reset_time
-                                        );
-                                        tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
-                                        eprintln!("  \x1b[32m▶ Rate limit reset, resuming\x1b[0m");
-                                        continue;
-                                    }
-                                }
-                            }
-                            // Fallback: wait 60s if we can't get rate limit info
-                            eprintln!("  \x1b[33m⏸ GraphQL rate limit exceeded, waiting 60s...\x1b[0m");
-                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                            gh_client.handle_graphql_rate_limit(60).await;
                             continue;
                         }
 
@@ -1151,20 +1193,9 @@ impl GitHubClient {
                     }
 
                     // Parse repos from dynamic JSON response
-                    let mut repos: Vec<RepoWithReadme> = Vec::new();
-                    if let Some(data) = gql_response.data {
-                        if let Some(obj) = data.as_object() {
-                            for (_key, value) in obj {
-                                // Skip null values (repos that don't exist)
-                                if value.is_null() {
-                                    continue;
-                                }
-                                if let Some(repo) = Self::parse_repo_from_json(value) {
-                                    repos.push(repo);
-                                }
-                            }
-                        }
-                    }
+                    let repos = gql_response.data
+                        .map(|data| Self::parse_graphql_response(&data))
+                        .unwrap_or_default();
 
                     // Atomic debug output (single line, parallel-safe)
                     let done = completed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;

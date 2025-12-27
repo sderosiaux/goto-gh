@@ -1,4 +1,6 @@
+use once_cell::sync::Lazy;
 use regex::Regex;
+use regex_lite::Regex as RegexLite;
 use std::collections::HashSet;
 
 /// Extracted paper link with metadata
@@ -11,66 +13,52 @@ pub struct ExtractedPaper {
     pub context: Option<String>,
 }
 
+// === Lazy-compiled regex patterns (compiled once, reused forever) ===
+
+/// arxiv patterns: https://arxiv.org/abs/2301.12345, https://arxiv.org/pdf/2301.12345.pdf
+static ARXIV_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5}(?:v\d+)?)").unwrap()
+});
+
+/// DOI patterns: https://doi.org/10.1234/something, https://dx.doi.org/10.1234/something
+static DOI_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"https?://(?:dx\.)?doi\.org/(10\.\d{4,}/[^\s\)\]>"]+)"#).unwrap()
+});
+
+/// MIT Press journals: https://direct.mit.edu/neco/article/35/12/1234/...
+static MIT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(https?://direct\.mit\.edu/[^\s\)\]>"]+)"#).unwrap()
+});
+
+/// OpenReview: https://openreview.net/forum?id=xxx, https://openreview.net/pdf?id=xxx
+static OPENREVIEW_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(https?://(?:www\.)?openreview\.net/(?:forum|pdf)\?id=[^\s\)\]>"]+)"#).unwrap()
+});
+
+/// ACL Anthology: https://aclanthology.org/2023.acl-long.1/
+static ACL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(https?://(?:www\.)?aclanthology\.org/[^\s\)\]>"]+)"#).unwrap()
+});
+
+/// NeurIPS / ICML / ICLR proceedings: https://proceedings.neurips.cc/paper/2023/...
+static NEURIPS_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(https?://proceedings\.(?:neurips\.cc|mlr\.press)/[^\s\)\]>"]+)"#).unwrap()
+});
+
+/// Semantic Scholar: https://www.semanticscholar.org/paper/...
+static SEMANTIC_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(https?://(?:www\.)?semanticscholar\.org/paper/[^\s\)\]>"]+)"#).unwrap()
+});
+
+/// PapersWithCode: https://paperswithcode.com/paper/...
+static PWC_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(https?://(?:www\.)?paperswithcode\.com/paper/[^\s\)\]>"]+)"#).unwrap()
+});
+
 /// Extract paper links from README content
 pub fn extract_paper_links(content: &str) -> Vec<ExtractedPaper> {
     let mut papers = Vec::new();
     let mut seen_urls = HashSet::new();
-
-    // arxiv patterns:
-    // - https://arxiv.org/abs/2301.12345
-    // - https://arxiv.org/pdf/2301.12345.pdf
-    // - http://arxiv.org/abs/2301.12345v2
-    let arxiv_re = Regex::new(
-        r"https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5}(?:v\d+)?)"
-    ).unwrap();
-
-    // DOI patterns:
-    // - https://doi.org/10.1234/something
-    // - https://dx.doi.org/10.1234/something
-    let doi_re = Regex::new(
-        r#"https?://(?:dx\.)?doi\.org/(10\.\d{4,}/[^\s\)\]>"]+)"#
-    ).unwrap();
-
-    // direct.mit.edu (MIT Press journals)
-    // - https://direct.mit.edu/neco/article/35/12/1234/...
-    let mit_re = Regex::new(
-        r#"(https?://direct\.mit\.edu/[^\s\)\]>"]+)"#
-    ).unwrap();
-
-    // OpenReview
-    // - https://openreview.net/forum?id=xxx
-    // - https://openreview.net/pdf?id=xxx
-    let openreview_re = Regex::new(
-        r#"(https?://(?:www\.)?openreview\.net/(?:forum|pdf)\?id=[^\s\)\]>"]+)"#
-    ).unwrap();
-
-    // ACL Anthology
-    // - https://aclanthology.org/2023.acl-long.1/
-    let acl_re = Regex::new(
-        r#"(https?://(?:www\.)?aclanthology\.org/[^\s\)\]>"]+)"#
-    ).unwrap();
-
-    // NeurIPS / ICML / ICLR proceedings
-    // - https://proceedings.neurips.cc/paper/2023/...
-    // - https://proceedings.mlr.press/v...
-    let neurips_re = Regex::new(
-        r#"(https?://proceedings\.(?:neurips\.cc|mlr\.press)/[^\s\)\]>"]+)"#
-    ).unwrap();
-
-    // Semantic Scholar
-    // - https://www.semanticscholar.org/paper/...
-    let semantic_re = Regex::new(
-        r#"(https?://(?:www\.)?semanticscholar\.org/paper/[^\s\)\]>"]+)"#
-    ).unwrap();
-
-    // PapersWithCode
-    // - https://paperswithcode.com/paper/...
-    let pwc_re = Regex::new(
-        r#"(https?://(?:www\.)?paperswithcode\.com/paper/[^\s\)\]>"]+)"#
-    ).unwrap();
-
-    // PMLR (Proceedings of Machine Learning Research)
-    // Already covered by neurips_re (proceedings.mlr.press)
 
     // Helper to get context around a match (safe for UTF-8)
     let get_context = |start: usize, end: usize| -> Option<String> {
@@ -109,7 +97,7 @@ pub fn extract_paper_links(content: &str) -> Vec<ExtractedPaper> {
     };
 
     // Extract arxiv
-    for cap in arxiv_re.captures_iter(content) {
+    for cap in ARXIV_RE.captures_iter(content) {
         let full_match = cap.get(0).unwrap();
         let url = full_match.as_str().to_string();
 
@@ -131,7 +119,7 @@ pub fn extract_paper_links(content: &str) -> Vec<ExtractedPaper> {
     }
 
     // Extract DOI
-    for cap in doi_re.captures_iter(content) {
+    for cap in DOI_RE.captures_iter(content) {
         let full_match = cap.get(0).unwrap();
         let url = full_match.as_str().to_string();
 
@@ -180,14 +168,74 @@ pub fn extract_paper_links(content: &str) -> Vec<ExtractedPaper> {
         };
     }
 
-    extract_domain!(mit_re, "direct.mit.edu");
-    extract_domain!(openreview_re, "openreview.net");
-    extract_domain!(acl_re, "aclanthology.org");
-    extract_domain!(neurips_re, "proceedings.neurips.cc");
-    extract_domain!(semantic_re, "semanticscholar.org");
-    extract_domain!(pwc_re, "paperswithcode.com");
+    extract_domain!(&MIT_RE, "direct.mit.edu");
+    extract_domain!(&OPENREVIEW_RE, "openreview.net");
+    extract_domain!(&ACL_RE, "aclanthology.org");
+    extract_domain!(&NEURIPS_RE, "proceedings.neurips.cc");
+    extract_domain!(&SEMANTIC_RE, "semanticscholar.org");
+    extract_domain!(&PWC_RE, "paperswithcode.com");
 
     papers
+}
+
+// === GitHub Repository Link Extraction ===
+
+/// Lazy-compiled regex patterns for GitHub repo extraction
+static GITHUB_HTTPS_RE: Lazy<RegexLite> = Lazy::new(|| {
+    RegexLite::new(r"https?://github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)").unwrap()
+});
+
+static GITHUB_SHORT_RE: Lazy<RegexLite> = Lazy::new(|| {
+    RegexLite::new(r"github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)").unwrap()
+});
+
+/// Paths that indicate non-repo URLs (issues, pulls, etc.)
+const NON_REPO_PATHS: &[&str] = &[
+    "issues", "pull", "blob", "tree", "wiki", "releases", "actions", "discussions"
+];
+
+/// Extract GitHub repo names from markdown content
+/// Returns vec of "owner/repo" strings
+/// Note: Extracts repo references from deep links too (e.g., /issues/123 -> owner/repo)
+pub fn extract_github_repos(markdown: &str) -> Vec<String> {
+    let mut repos = Vec::new();
+    let mut seen = HashSet::new();
+
+    for re in [&*GITHUB_HTTPS_RE, &*GITHUB_SHORT_RE] {
+        for cap in re.captures_iter(markdown) {
+            if let Some(m) = cap.get(1) {
+                let repo = m.as_str();
+
+                // Filter out clearly invalid patterns
+                if !repo.contains('/') || repo.ends_with(".git") {
+                    continue;
+                }
+
+                // Clean up: take only owner/repo part (first two segments)
+                let parts: Vec<&str> = repo.split('/').take(2).collect();
+                if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                    let repo_name = parts[1];
+
+                    // Skip if repo name is actually a non-repo path like "issues", "pull", etc.
+                    // This handles edge cases like github.com/issues (not a real repo)
+                    if NON_REPO_PATHS.contains(&repo_name)
+                        || repo_name.contains('#')
+                        || repo_name.contains('?')
+                    {
+                        continue;
+                    }
+
+                    let full_name = format!("{}/{}", parts[0], repo_name);
+                    if !seen.contains(&full_name) {
+                        seen.insert(full_name.clone());
+                        repos.push(full_name);
+                    }
+                }
+            }
+        }
+    }
+
+    repos
 }
 
 #[cfg(test)]
@@ -233,5 +281,39 @@ mod tests {
         let papers = extract_paper_links(content);
         // Should dedupe the abs URLs, but pdf is different... actually we normalize to abs
         assert!(papers.len() <= 2);
+    }
+
+    #[test]
+    fn test_extract_github_repos() {
+        let markdown = "Check out https://github.com/owner/repo and github.com/foo/bar";
+        let repos = extract_github_repos(markdown);
+        assert_eq!(repos.len(), 2);
+        assert!(repos.contains(&"owner/repo".to_string()));
+        assert!(repos.contains(&"foo/bar".to_string()));
+    }
+
+    #[test]
+    fn test_extract_from_deep_links() {
+        // Deep links like /issues, /pull, /blob still contain valid repo refs
+        // The function should extract owner/repo from these URLs
+        let markdown = r#"
+        https://github.com/owner/repo/issues/123
+        https://github.com/owner/repo/pull/456
+        https://github.com/owner/repo/blob/main/file.txt
+        "#;
+        let repos = extract_github_repos(markdown);
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0], "owner/repo");
+    }
+
+    #[test]
+    fn test_github_repo_dedup() {
+        let markdown = r#"
+        https://github.com/owner/repo
+        https://github.com/owner/repo
+        github.com/owner/repo
+        "#;
+        let repos = extract_github_repos(markdown);
+        assert_eq!(repos.len(), 1);
     }
 }
