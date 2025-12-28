@@ -819,6 +819,11 @@ async fn embed_missing(
 
         total_embedded += batch_len;
 
+        // Checkpoint WAL periodically to prevent unbounded growth
+        if batch_num % 10 == 0 {
+            let _ = db.checkpoint();
+        }
+
         // Calculate ETA
         let elapsed = start_time.elapsed();
         let eta = if total_embedded > 0 {
@@ -860,6 +865,9 @@ async fn embed_missing(
             total_embedded
         );
     }
+
+    // Final checkpoint
+    let _ = db.checkpoint();
 
     let still_need = db.count_repos_without_embeddings()?;
     if still_need > 0 {
