@@ -344,17 +344,11 @@ async fn run_embed_cycle(state: &ServerState, shutdown: &AtomicBool) -> Result<b
         &db,
         &config,
         |progress| {
-            if progress.total_tokens > 0 {
-                eprintln!(
-                    "\x1b[33m[embed]\x1b[0m Batch {}: {} repos, {} tokens",
-                    progress.batch_num, progress.embedded_this_batch, progress.tokens_this_batch
-                );
-            } else {
-                eprintln!(
-                    "\x1b[33m[embed]\x1b[0m Batch {}: {} repos",
-                    progress.batch_num, progress.embedded_this_batch
-                );
-            }
+            // Summary line after each batch (similar to discover summary)
+            eprintln!(
+                "\x1b[33m[embed]\x1b[0m +{} repos ({} tokens)",
+                progress.embedded_this_batch, progress.tokens_this_batch
+            );
         },
         || shutdown.load(Ordering::SeqCst),
     )
@@ -362,20 +356,11 @@ async fn run_embed_cycle(state: &ServerState, shutdown: &AtomicBool) -> Result<b
 
     match result {
         Ok(run_result) => {
-            if run_result.total_embedded > 0 {
-                if run_result.total_tokens > 0 {
-                    eprintln!(
-                        "\x1b[33m[embed]\x1b[0m Done: {} embeddings, {} tokens",
-                        run_result.total_embedded, run_result.total_tokens
-                    );
-                } else {
-                    eprintln!(
-                        "\x1b[33m[embed]\x1b[0m Done: {} embeddings",
-                        run_result.total_embedded
-                    );
-                }
-            } else if state.config.debug {
-                eprintln!("\x1b[33m[embed]\x1b[0m \x1b[90mNo repos to embed\x1b[0m");
+            if run_result.total_embedded > 0 && state.config.debug {
+                eprintln!(
+                    "\x1b[33m[embed]\x1b[0m Done: {} embeddings, {} tokens",
+                    run_result.total_embedded, run_result.total_tokens
+                );
             }
             Ok(run_result.total_embedded > 0)
         }

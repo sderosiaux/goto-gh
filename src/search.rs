@@ -64,18 +64,22 @@ pub fn expand_query(query: &str) -> Result<String> {
     use std::process::Command;
 
     let prompt = format!(
-        r#"Expand this GitHub search query into technical keywords.
+        r#"Expand this GitHub search query into 8-10 keywords for semantic search.
 
 Query: "{}"
 
-Output ONLY comma-separated keywords (no intro, no explanation, no quotes). Include:
-- Original terms
-- Related tools/libraries (e.g., metasploit, nmap, burpsuite)
-- Technical concepts (e.g., buffer overflow, RCE, SSRF)
-- File types/languages when relevant
+Rules:
+- Output ONLY comma-separated keywords (no intro, no explanation)
+- STAY TRUE to the user's intent: if they say "low-level", only output low-level terms
+- If they say "advanced/experimental", skip beginner/common terms
+- Prefer concrete library/tool names over abstract concepts
+- Don't add generic topic keywords the user didn't ask for
 
-Example input: "web security"
-Example output: web security, OWASP, XSS, SQL injection, CSRF, burpsuite, ZAP, web application firewall, penetration testing
+Example input: "advanced low-level kafka internals"
+Example output: librdkafka, kafka protocol, broker internals, partition leader election, ISR, log segment, fetch request, produce request, coordinator
+
+Example input: "simple beginner python web"
+Example output: flask, django, fastapi, jinja2, html templates, routing, hello world, tutorial
 
 Keywords:"#,
         query
@@ -147,10 +151,7 @@ pub fn search(query: &str, limit: usize, semantic_only: bool, db: &Database) -> 
     let current_dim = db.get_embedding_dimension()?;
     let query_embedding = match current_dim {
         Some(dim) if dim == OPENAI_EMBEDDING_DIM => {
-            // OpenAI embeddings - no prefix needed, but we need to call OpenAI API
-            // For now, fall back to returning empty if OpenAI was used
-            // (sync search can't easily call async OpenAI API)
-            eprintln!("\x1b[33m!\x1b[0m OpenAI embeddings detected - semantic search requires OPENAI_API_KEY");
+            // OpenAI embeddings - need to call OpenAI API for query embedding
             if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
                 // Use blocking reqwest for sync context
                 let client = reqwest::blocking::Client::new();

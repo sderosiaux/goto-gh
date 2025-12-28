@@ -89,13 +89,6 @@ impl OpenAIClient {
         // Split into token-aware chunks
         let chunks = self.split_by_tokens(texts);
 
-        if chunks.len() > 1 {
-            eprintln!(
-                "    \x1b[90m(splitting into {} sub-batches due to token limit)\x1b[0m",
-                chunks.len()
-            );
-        }
-
         let mut all_embeddings = Vec::with_capacity(texts.len());
         let mut total_tokens = 0u32;
 
@@ -152,16 +145,6 @@ impl OpenAIClient {
     /// Send a single batch to OpenAI (assumes it fits within limits)
     /// Retries on transient errors (502, 503, 504, 429) with exponential backoff
     async fn embed_single_batch(&self, texts: &[String]) -> Result<(Vec<Vec<f32>>, u32)> {
-        let estimated_tokens: usize = texts.iter().map(|t| count_tokens(t)).sum();
-
-        if self.debug {
-            eprintln!(
-                "    \x1b[90m[DEBUG] POST /v1/embeddings ({} texts, ~{} tokens)...\x1b[0m",
-                texts.len(),
-                estimated_tokens
-            );
-        }
-
         let request = EmbeddingRequest {
             model: "text-embedding-3-small",
             input: texts,
@@ -174,14 +157,6 @@ impl OpenAIClient {
         for attempt in 0..max_retries {
             if attempt > 0 {
                 let delay_ms = 1000 * (1 << attempt.min(4)); // 2s, 4s, 8s, 16s
-                if self.debug {
-                    eprintln!(
-                        "    \x1b[33m[DEBUG] Retry {}/{} after {}ms...\x1b[0m",
-                        attempt + 1,
-                        max_retries,
-                        delay_ms
-                    );
-                }
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
 
@@ -219,13 +194,13 @@ impl OpenAIClient {
                 let vectors: Vec<Vec<f32>> = embeddings.into_iter().map(|e| e.embedding).collect();
                 let tokens_used = result.usage.total_tokens;
 
+                // Log in same style as discover: [timestamp] URL ... timing
                 if self.debug {
-                    let tok_per_sec = tokens_used as f64 / elapsed.as_secs_f64();
+                    let now = chrono::Local::now().format("%H:%M:%S%.3f");
+                    let retry_info = if attempt > 0 { format!(" (retry {})", attempt) } else { String::new() };
                     eprintln!(
-                        "    \x1b[90m[DEBUG] OK in {:.1}s ({} tokens, {:.0} tok/s)\x1b[0m",
-                        elapsed.as_secs_f64(),
-                        tokens_used,
-                        tok_per_sec
+                        "\x1b[90m[{}] POST /v1/embeddings ({} texts) ... {}ms{}\x1b[0m",
+                        now, texts.len(), elapsed.as_millis(), retry_info
                     );
                 }
 
@@ -240,22 +215,12 @@ impl OpenAIClient {
                 || status == reqwest::StatusCode::GATEWAY_TIMEOUT
                 || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
 
-            if self.debug {
-                eprintln!(
-                    "    \x1b[31m[DEBUG] API error in {:.1}s: {} {}\x1b[0m",
-                    elapsed.as_secs_f64(),
-                    status,
-                    if body.len() > 100 { &body[..100] } else { &body }
-                );
+            if !is_transient {
+                // Non-transient error, fail immediately
+                return Err(anyhow::anyhow!("OpenAI API error ({}): {}", status, body));
             }
 
-            if is_transient {
-                last_error = Some(format!("OpenAI API error ({})", status));
-                continue;
-            }
-
-            // Non-transient error, fail immediately
-            return Err(anyhow::anyhow!("OpenAI API error ({}): {}", status, body));
+            last_error = Some(format!("OpenAI API error ({})", status));
         }
 
         Err(anyhow::anyhow!(

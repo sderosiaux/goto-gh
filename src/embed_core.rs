@@ -192,9 +192,7 @@ where
             .unwrap_or(usize::MAX);
         let batch_size = config.batch_size.min(remaining);
 
-        let query_start = std::time::Instant::now();
         let repos = db.get_repos_without_embeddings(Some(batch_size))?;
-        let query_ms = query_start.elapsed().as_millis();
 
         if repos.is_empty() {
             break;
@@ -202,27 +200,13 @@ where
 
         result.batches_processed += 1;
 
-        if config.debug {
-            eprintln!(
-                "\x1b[33m[embed]\x1b[0m \x1b[90mBatch {}: found {} repos in {}ms\x1b[0m",
-                result.batches_processed, repos.len(), query_ms
-            );
-        }
-
         let batch_result = embed_batch(db, &repos, &config.provider, config.debug).await?;
 
         result.total_embedded += batch_result.embedded;
         result.total_tokens += batch_result.tokens;
 
         // Re-query total_to_process each batch (may have grown from fetch/discover)
-        let count_start = std::time::Instant::now();
         let current_need = db.count_repos_without_embeddings()?;
-        if config.debug && count_start.elapsed().as_millis() > 100 {
-            eprintln!(
-                "\x1b[33m[embed]\x1b[0m \x1b[90mcount query took {}ms\x1b[0m",
-                count_start.elapsed().as_millis()
-            );
-        }
         let total_to_process = if let Some(limit) = config.limit {
             limit.min(current_need + result.total_embedded)
         } else {
