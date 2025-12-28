@@ -185,7 +185,26 @@ impl GitHubClient {
             eprintln!("\x1b[90m[{} PROXY {}] GET {} ... {}ms\x1b[0m", now, proxy, url, start.elapsed().as_millis());
         }
 
-        result.map_err(|e| e.to_string())
+        result.map_err(|e| {
+            use std::error::Error;
+            let mut details = e.to_string();
+            // Add error type indicators
+            if e.is_timeout() {
+                details.push_str(" [TIMEOUT]");
+            } else if e.is_connect() {
+                details.push_str(" [CONNECT]");
+            } else if e.is_request() {
+                details.push_str(" [REQUEST]");
+            }
+            // Add root cause if available
+            if let Some(source) = e.source() {
+                details.push_str(&format!(" <- {}", source));
+                if let Some(inner) = source.source() {
+                    details.push_str(&format!(" <- {}", inner));
+                }
+            }
+            details
+        })
     }
 
     /// Send REST request via proxy with debug output
@@ -361,9 +380,40 @@ impl GitHubClient {
                 continue;
             }
 
-            // Retry on rate limit (403)
-            if status == reqwest::StatusCode::FORBIDDEN {
-                tokio::time::sleep(Duration::from_secs(2)).await;
+            // Retry on rate limit (403 or 429)
+            if status == reqwest::StatusCode::FORBIDDEN
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            {
+                // Try to get X-RateLimit-Reset header for smart waiting
+                let wait_secs = if let Some(reset_header) = response.headers().get("x-ratelimit-reset") {
+                    if let Ok(reset_str) = reset_header.to_str() {
+                        if let Ok(reset_timestamp) = reset_str.parse::<u64>() {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            if reset_timestamp > now {
+                                let wait = (reset_timestamp - now).min(120); // Cap at 2 minutes
+                                if self.debug {
+                                    eprintln!(
+                                        "\x1b[33m[rate-limit]\x1b[0m {} - waiting {}s until reset",
+                                        full_name, wait
+                                    );
+                                }
+                                wait
+                            } else {
+                                2 // Already past reset time, short wait
+                            }
+                        } else {
+                            60 // Default 60s if can't parse
+                        }
+                    } else {
+                        60
+                    }
+                } else {
+                    60 // Default 60s if no header
+                };
+                tokio::time::sleep(Duration::from_secs(wait_secs)).await;
                 continue;
             }
 
