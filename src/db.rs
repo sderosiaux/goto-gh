@@ -40,6 +40,10 @@ impl Database {
         let conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
 
+        // Set busy timeout to handle concurrent access from multiple CLI instances
+        // SQLite will retry for up to 30 seconds before returning SQLITE_BUSY
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+
         let db = Self { conn, path: db_path };
         db.init()?;
         Ok(db)

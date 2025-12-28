@@ -148,6 +148,7 @@ impl OpenAIClient {
     }
 
     /// Send a single batch to OpenAI (assumes it fits within limits)
+    /// Retries on transient errors (502, 503, 504, 429) with exponential backoff
     async fn embed_single_batch(&self, texts: &[String]) -> Result<(Vec<Vec<f32>>, u32)> {
         let estimated_tokens: usize = texts.iter().map(|t| count_tokens(t)).sum();
 
@@ -159,66 +160,107 @@ impl OpenAIClient {
             );
         }
 
-        let start = std::time::Instant::now();
-
         let request = EmbeddingRequest {
             model: "text-embedding-3-small",
             input: texts,
         };
 
-        let response = self
-            .client
-            .post("https://api.openai.com/v1/embeddings")
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send OpenAI request")?;
+        // Retry with exponential backoff for transient errors
+        let max_retries = 5;
+        let mut last_error = None;
 
-        let elapsed = start.elapsed();
+        for attempt in 0..max_retries {
+            if attempt > 0 {
+                let delay_ms = 1000 * (1 << attempt.min(4)); // 2s, 4s, 8s, 16s
+                if self.debug {
+                    eprintln!(
+                        "    \x1b[33m[DEBUG] Retry {}/{} after {}ms...\x1b[0m",
+                        attempt + 1,
+                        max_retries,
+                        delay_ms
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
 
-        if !response.status().is_success() {
+            let start = std::time::Instant::now();
+
+            let response = match self
+                .client
+                .post("https://api.openai.com/v1/embeddings")
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&request)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = Some(format!("Request failed: {}", e));
+                    continue;
+                }
+            };
+
+            let elapsed = start.elapsed();
             let status = response.status();
+
+            if status.is_success() {
+                let result: EmbeddingResponse = response
+                    .json()
+                    .await
+                    .context("Failed to parse OpenAI response")?;
+
+                // Sort by index to ensure correct order
+                let mut embeddings: Vec<_> = result.data.into_iter().collect();
+                embeddings.sort_by_key(|e| e.index);
+
+                let vectors: Vec<Vec<f32>> = embeddings.into_iter().map(|e| e.embedding).collect();
+                let tokens_used = result.usage.total_tokens;
+
+                if self.debug {
+                    let tok_per_sec = tokens_used as f64 / elapsed.as_secs_f64();
+                    eprintln!(
+                        "    \x1b[90m[DEBUG] OK in {:.1}s ({} tokens, {:.0} tok/s)\x1b[0m",
+                        elapsed.as_secs_f64(),
+                        tokens_used,
+                        tok_per_sec
+                    );
+                }
+
+                return Ok((vectors, tokens_used));
+            }
+
             let body = response.text().await.unwrap_or_default();
+
+            // Retry on transient errors
+            let is_transient = status == reqwest::StatusCode::BAD_GATEWAY
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+
             if self.debug {
                 eprintln!(
                     "    \x1b[31m[DEBUG] API error in {:.1}s: {} {}\x1b[0m",
                     elapsed.as_secs_f64(),
                     status,
-                    body
+                    if body.len() > 100 { &body[..100] } else { &body }
                 );
             }
-            return Err(anyhow::anyhow!(
-                "OpenAI API error ({}): {}",
-                status,
-                body
-            ));
+
+            if is_transient {
+                last_error = Some(format!("OpenAI API error ({})", status));
+                continue;
+            }
+
+            // Non-transient error, fail immediately
+            return Err(anyhow::anyhow!("OpenAI API error ({}): {}", status, body));
         }
 
-        let result: EmbeddingResponse = response
-            .json()
-            .await
-            .context("Failed to parse OpenAI response")?;
-
-        // Sort by index to ensure correct order
-        let mut embeddings: Vec<_> = result.data.into_iter().collect();
-        embeddings.sort_by_key(|e| e.index);
-
-        let vectors: Vec<Vec<f32>> = embeddings.into_iter().map(|e| e.embedding).collect();
-        let tokens_used = result.usage.total_tokens;
-
-        if self.debug {
-            let tokens_per_sec = tokens_used as f64 / elapsed.as_secs_f64();
-            eprintln!(
-                "    \x1b[32m[DEBUG] OK in {:.1}s ({} tokens, {:.0} tok/s)\x1b[0m",
-                elapsed.as_secs_f64(),
-                tokens_used,
-                tokens_per_sec
-            );
-        }
-
-        Ok((vectors, tokens_used))
+        Err(anyhow::anyhow!(
+            "OpenAI API failed after {} retries: {}",
+            max_retries,
+            last_error.unwrap_or_else(|| "unknown error".to_string())
+        ))
     }
 
 }
