@@ -136,6 +136,7 @@ impl GitHubClient {
             .proxy(reqwest::Proxy::all(proxy_url).ok()?)
             .timeout(std::time::Duration::from_secs(15)) // 15s total timeout (some proxies are slow)
             .connect_timeout(std::time::Duration::from_secs(3)) // 3s connect timeout
+            .danger_accept_invalid_certs(true) // Required for some rotating proxies (MITM)
             .build()
             .ok()
     }

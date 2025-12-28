@@ -1042,6 +1042,13 @@ async fn fetch_missing_readmes(
         match result {
             ReadmeResult::Found(content) => {
                 let len = content.len();
+                // Treat empty README as "no readme" - don't retry
+                if len == 0 {
+                    eprintln!("\x1b[90m-\x1b[0m {} (empty readme)", full_name);
+                    let _ = db.mark_repo_no_readme(repo_id);
+                    not_found += 1;
+                    continue;
+                }
                 if let Err(e) = db.update_repo_readme(repo_id, &content) {
                     eprintln!("\x1b[31mx\x1b[0m {} - db error: {}", full_name, e);
                 } else {

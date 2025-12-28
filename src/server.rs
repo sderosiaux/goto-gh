@@ -511,6 +511,12 @@ async fn run_readme_cycle(state: &ServerState, shutdown: &AtomicBool) -> Result<
 
         match result {
             ReadmeResult::Found(content) => {
+                // Treat empty README as "no readme" - don't retry
+                if content.is_empty() {
+                    let _ = db.mark_repo_no_readme(repo_id);
+                    not_found += 1;
+                    continue;
+                }
                 if let Err(e) = db.update_repo_readme(repo_id, &content) {
                     eprintln!("\x1b[32m[readme]\x1b[0m \x1b[31m{} db error: {}\x1b[0m", full_name, e);
                 } else {

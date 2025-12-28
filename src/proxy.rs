@@ -90,7 +90,8 @@ impl ProxyManager {
         }
     }
 
-    /// Load proxies from a file (one proxy per line, ip:port format).
+    /// Load proxies from a file (one proxy per line).
+    /// Supports formats: ip:port, user:pass@host:port, ip:port:user:pass (Webshare)
     pub fn from_file(path: &PathBuf) -> anyhow::Result<Self> {
         let file = fs::File::open(path)?;
         let reader = BufReader::new(file);
@@ -99,7 +100,8 @@ impl ProxyManager {
             .lines()
             .map_while(Result::ok)
             .map(|line| line.trim().to_string())
-            .filter(|line| !line.is_empty() && !line.starts_with('#') && Self::is_valid_format(line))
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| Self::normalize_proxy(&line))
             .collect();
 
         if proxies.is_empty() {
@@ -111,32 +113,53 @@ impl ProxyManager {
         Ok(Self::new(proxies, true))
     }
 
-    /// Validate proxy format (ip:port or user:pass@host:port)
+    /// Validate proxy format and normalize to user:pass@host:port or host:port
+    /// Supports:
+    /// - ip:port (simple proxy)
+    /// - user:pass@host:port (authenticated proxy)
+    /// - ip:port:user:pass (Webshare format, converted to user:pass@ip:port)
     fn is_valid_format(proxy: &str) -> bool {
+        Self::normalize_proxy(proxy).is_some()
+    }
+
+    /// Normalize proxy string to standard format for reqwest
+    /// Returns None if format is invalid
+    fn normalize_proxy(proxy: &str) -> Option<String> {
         if !proxy.contains(':') {
-            return false;
+            return None;
         }
 
-        // Format: user:pass@host:port (authenticated proxy)
+        // Format: user:pass@host:port (already normalized)
         if proxy.contains('@') {
             let parts: Vec<&str> = proxy.split('@').collect();
             if parts.len() != 2 {
-                return false;
+                return None;
             }
-            // Check host:port part
             let host_port: Vec<&str> = parts[1].split(':').collect();
-            if host_port.len() != 2 {
-                return false;
+            if host_port.len() != 2 || host_port[1].parse::<u16>().is_err() {
+                return None;
             }
-            return host_port[1].parse::<u16>().is_ok();
+            return Some(proxy.to_string());
+        }
+
+        let parts: Vec<&str> = proxy.split(':').collect();
+
+        // Format: ip:port:user:pass (Webshare format)
+        if parts.len() == 4 {
+            let port = parts[1].parse::<u16>();
+            if port.is_err() {
+                return None;
+            }
+            // Convert to user:pass@ip:port
+            return Some(format!("{}:{}@{}:{}", parts[2], parts[3], parts[0], parts[1]));
         }
 
         // Format: ip:port (simple proxy)
-        let parts: Vec<&str> = proxy.split(':').collect();
-        if parts.len() != 2 {
-            return false;
+        if parts.len() == 2 && parts[1].parse::<u16>().is_ok() {
+            return Some(proxy.to_string());
         }
-        parts[1].parse::<u16>().is_ok()
+
+        None
     }
 
     /// Get current sticky proxy if set (without rotation fallback).
