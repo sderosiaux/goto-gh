@@ -57,7 +57,7 @@ impl Default for ServerConfig {
 /// Shared state for all workers
 pub struct ServerState {
     pub config: ServerConfig,
-    pub github_token: Option<String>,
+    pub github_tokens: Vec<String>,
 }
 
 impl ServerState {
@@ -66,8 +66,8 @@ impl ServerState {
         Database::open()
     }
 
-    /// Create a GitHub client with the configured options
-    fn create_github_client(&self) -> Result<GitHubClient> {
+    /// Create a GitHub client with a specific token
+    fn create_github_client_with_token(&self, token: Option<String>) -> Result<GitHubClient> {
         let proxy_manager = if let Some(ref path) = self.config.proxy_file {
             let path = std::path::PathBuf::from(path);
             Some(ProxyManager::from_file(&path)?)
@@ -76,21 +76,27 @@ impl ServerState {
         };
 
         Ok(GitHubClient::new_with_options(
-            self.github_token.clone(),
+            token,
             self.config.debug,
             proxy_manager,
             self.config.force_proxy,
         ))
     }
+
+    /// Create a GitHub client with the first available token (for single-token operations)
+    fn create_github_client(&self) -> Result<GitHubClient> {
+        self.create_github_client_with_token(self.github_tokens.first().cloned())
+    }
 }
 
 /// Start the server with all workers
 pub async fn start_server(config: ServerConfig) -> Result<()> {
-    let github_token = Config::github_token();
+    let github_tokens = Config::github_tokens();
+    let token_count = github_tokens.len();
 
     let state = Arc::new(ServerState {
         config,
-        github_token,
+        github_tokens,
     });
 
     // Initial stats
@@ -109,7 +115,10 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         eprintln!("    {} repos need embeddings (embed)", without_embeddings);
         eprintln!("    {} owners to explore (discover)", unexplored);
         eprintln!();
-        eprintln!("  \x1b[90mWorkers:\x1b[0m fetch, discover, embed (continuous)");
+        if token_count > 1 {
+            eprintln!("  \x1b[90mTokens:\x1b[0m {} ({}x throughput)", token_count, token_count);
+        }
+        eprintln!("  \x1b[90mWorkers:\x1b[0m fetch x{}, discover, embed", token_count.max(1));
         eprintln!();
         eprintln!("  \x1b[33mPress Ctrl+C to stop gracefully\x1b[0m");
         eprintln!();
@@ -118,16 +127,36 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
     // Shutdown flag
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Spawn workers with separate tokio runtimes in threads
-    let fetch_shutdown = shutdown.clone();
-    let fetch_state = state.clone();
-    let fetch_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(run_fetch_worker_loop(fetch_state, fetch_shutdown));
-    });
+    // Spawn one fetch worker per token (parallel throughput)
+    let mut fetch_handles = Vec::new();
+    if state.github_tokens.is_empty() {
+        // No tokens - spawn single worker without auth
+        let fetch_shutdown = shutdown.clone();
+        let fetch_state = state.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(run_fetch_worker_loop(fetch_state, fetch_shutdown, None, 0));
+        });
+        fetch_handles.push(handle);
+    } else {
+        // Spawn one worker per token
+        for (idx, token) in state.github_tokens.iter().enumerate() {
+            let fetch_shutdown = shutdown.clone();
+            let fetch_state = state.clone();
+            let token = token.clone();
+            let handle = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(run_fetch_worker_loop(fetch_state, fetch_shutdown, Some(token), idx));
+            });
+            fetch_handles.push(handle);
+        }
+    }
 
     let discover_shutdown = shutdown.clone();
     let discover_state = state.clone();
@@ -157,7 +186,9 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
     shutdown.store(true, Ordering::SeqCst);
 
     // Wait for workers to finish (they check shutdown flag frequently)
-    let _ = fetch_handle.join();
+    for handle in fetch_handles {
+        let _ = handle.join();
+    }
     let _ = discover_handle.join();
     let _ = embed_handle.join();
 
@@ -171,25 +202,36 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
     Ok(())
 }
 
-/// Fetch worker loop - runs continuously
-async fn run_fetch_worker_loop(state: Arc<ServerState>, shutdown: Arc<AtomicBool>) {
-    eprintln!("\x1b[36m[fetch]\x1b[0m Worker started");
+/// Fetch worker loop - runs continuously with a specific token
+async fn run_fetch_worker_loop(
+    state: Arc<ServerState>,
+    shutdown: Arc<AtomicBool>,
+    token: Option<String>,
+    worker_idx: usize,
+) {
+    let worker_label = if state.github_tokens.len() > 1 {
+        format!("fetch:{}", worker_idx + 1)
+    } else {
+        "fetch".to_string()
+    };
+
+    eprintln!("\x1b[36m[{}]\x1b[0m Worker started", worker_label);
 
     while !shutdown.load(Ordering::SeqCst) {
-        match run_fetch_cycle(&state, &shutdown).await {
+        match run_fetch_cycle(&state, &shutdown, token.clone(), &worker_label).await {
             Ok(had_work) => {
                 if !had_work {
                     tokio::time::sleep(Duration::from_secs(10)).await;
                 }
             }
             Err(e) => {
-                eprintln!("\x1b[36m[fetch]\x1b[0m \x1b[31mError: {}\x1b[0m", e);
+                eprintln!("\x1b[36m[{}]\x1b[0m \x1b[31mError: {}\x1b[0m", worker_label, e);
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
     }
 
-    eprintln!("\x1b[36m[fetch]\x1b[0m Shutting down");
+    eprintln!("\x1b[36m[{}]\x1b[0m Shutting down", worker_label);
 }
 
 /// Discover worker loop - runs continuously
@@ -234,10 +276,15 @@ async fn run_embed_worker_loop(state: Arc<ServerState>, shutdown: Arc<AtomicBool
     eprintln!("\x1b[33m[embed]\x1b[0m Shutting down");
 }
 
-/// Fetch cycle using core functions
-async fn run_fetch_cycle(state: &ServerState, shutdown: &AtomicBool) -> Result<bool> {
+/// Fetch cycle using core functions with a specific token
+async fn run_fetch_cycle(
+    state: &ServerState,
+    shutdown: &AtomicBool,
+    token: Option<String>,
+    worker_label: &str,
+) -> Result<bool> {
     let db = state.open_db()?;
-    let client = state.create_github_client()?;
+    let client = state.create_github_client_with_token(token)?;
 
     let config = FetchRunnerConfig {
         batch_size: state.config.fetch_batch_size,
@@ -247,6 +294,7 @@ async fn run_fetch_cycle(state: &ServerState, shutdown: &AtomicBool) -> Result<b
         delay_ms: 50,
     };
 
+    let label = worker_label.to_string();
     let result = fetch::run_fetch_loop(
         &client,
         &db,
@@ -259,8 +307,8 @@ async fn run_fetch_cycle(state: &ServerState, shutdown: &AtomicBool) -> Result<b
                 String::new()
             };
             eprintln!(
-                "\x1b[36m[fetch]\x1b[0m +{} repos{}",
-                progress.fetched_this_batch, discovered_info
+                "\x1b[36m[{}]\x1b[0m +{} repos{}",
+                label, progress.fetched_this_batch, discovered_info
             );
         },
         || shutdown.load(Ordering::SeqCst),
@@ -271,8 +319,8 @@ async fn run_fetch_cycle(state: &ServerState, shutdown: &AtomicBool) -> Result<b
         Ok(run_result) => {
             if run_result.total_fetched > 0 && state.config.debug {
                 eprintln!(
-                    "\x1b[36m[fetch]\x1b[0m Done: {} fetched, {} gone",
-                    run_result.total_fetched, run_result.total_gone
+                    "\x1b[36m[{}]\x1b[0m Done: {} fetched, {} gone",
+                    worker_label, run_result.total_fetched, run_result.total_gone
                 );
             }
             Ok(run_result.total_fetched > 0 || run_result.total_gone > 0)
