@@ -733,12 +733,21 @@ impl Database {
 
     /// Get repos that need metadata fetch (have no embedded_text = never fetched, not gone)
     pub fn get_repos_without_metadata(&self, limit: Option<usize>) -> Result<Vec<String>> {
+        // Skip repos that already have README (fetched via REST API)
+        // Those have readme_excerpt set but no embedded_text yet
         let sql = match limit {
             Some(lim) => format!(
-                "SELECT full_name FROM repos WHERE embedded_text IS NULL AND gone = 0 LIMIT {}",
+                "SELECT full_name FROM repos
+                 WHERE embedded_text IS NULL
+                   AND gone = 0
+                   AND (readme_excerpt IS NULL OR readme_excerpt = '' OR readme_excerpt = '[NO_README]')
+                 LIMIT {}",
                 lim
             ),
-            None => "SELECT full_name FROM repos WHERE embedded_text IS NULL AND gone = 0".to_string(),
+            None => "SELECT full_name FROM repos
+                     WHERE embedded_text IS NULL
+                       AND gone = 0
+                       AND (readme_excerpt IS NULL OR readme_excerpt = '' OR readme_excerpt = '[NO_README]')".to_string(),
         };
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -747,10 +756,28 @@ impl Database {
         results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Count repos without metadata (excluding gone repos)
+    /// Count repos without metadata (excluding gone repos and those with README already fetched)
     pub fn count_repos_without_metadata(&self) -> Result<usize> {
         let count: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM repos WHERE embedded_text IS NULL AND gone = 0",
+            "SELECT COUNT(*) FROM repos
+             WHERE embedded_text IS NULL
+               AND gone = 0
+               AND (readme_excerpt IS NULL OR readme_excerpt = '' OR readme_excerpt = '[NO_README]')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Count repos that have README but still need GraphQL fetch for other metadata
+    pub fn count_repos_with_readme_needing_metadata(&self) -> Result<usize> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM repos
+             WHERE embedded_text IS NULL
+               AND gone = 0
+               AND readme_excerpt IS NOT NULL
+               AND readme_excerpt != ''
+               AND readme_excerpt != '[NO_README]'",
             [],
             |row| row.get(0),
         )?;
@@ -1325,6 +1352,91 @@ impl Database {
             "UPDATE papers SET title = ?1, authors = ?2, abstract = ?3, published_at = ?4, fetched_at = ?5 WHERE id = ?6",
             params![title, authors, abstract_text, published_at, now, paper_id],
         )?;
+        Ok(())
+    }
+
+    // === Missing README Fetch ===
+
+    /// Get repos that have metadata but no README content
+    /// Returns (repo_id, full_name) pairs
+    pub fn get_repos_without_readme(&self, limit: Option<usize>) -> Result<Vec<(i64, String)>> {
+        let sql = match limit {
+            Some(lim) => format!(
+                "SELECT id, full_name FROM repos
+                 WHERE gone = 0
+                   AND embedded_text IS NOT NULL
+                   AND (readme_excerpt IS NULL OR readme_excerpt = '')
+                 ORDER BY stars DESC
+                 LIMIT {}",
+                lim
+            ),
+            None => "SELECT id, full_name FROM repos
+                     WHERE gone = 0
+                       AND embedded_text IS NOT NULL
+                       AND (readme_excerpt IS NULL OR readme_excerpt = '')
+                     ORDER BY stars DESC".to_string(),
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let results = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Count repos without README
+    pub fn count_repos_without_readme(&self) -> Result<usize> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM repos
+             WHERE gone = 0
+               AND embedded_text IS NOT NULL
+               AND (readme_excerpt IS NULL OR readme_excerpt = '')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Mark a repo as having no README (so we don't retry)
+    pub fn mark_repo_no_readme(&self, repo_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE repos SET readme_excerpt = '[NO_README]' WHERE id = ?",
+            [repo_id],
+        )?;
+        Ok(())
+    }
+
+    /// Update README content for a repo and regenerate embedded_text
+    pub fn update_repo_readme(&self, repo_id: i64, readme: &str) -> Result<()> {
+        // Get current repo data to rebuild embedded_text
+        let (full_name, description, topics_json, language): (String, Option<String>, Option<String>, Option<String>) =
+            self.conn.query_row(
+                "SELECT full_name, description, topics, language FROM repos WHERE id = ?",
+                [repo_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+
+        // Parse topics
+        let topics: Vec<String> = topics_json
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+
+        // Rebuild embedded_text with the full README (embedding function handles truncation)
+        let embedded_text = crate::embedding::build_embedding_text(
+            &full_name,
+            description.as_deref(),
+            &topics,
+            language.as_deref(),
+            Some(readme),
+        );
+
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE repos SET readme_excerpt = ?1, embedded_text = ?2, last_indexed = ?3, has_embedding = 0 WHERE id = ?4",
+            params![readme, embedded_text, now, repo_id],
+        )?;
+
         Ok(())
     }
 }

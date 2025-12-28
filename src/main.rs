@@ -175,6 +175,30 @@ enum Commands {
         batch_size: usize,
     },
 
+    /// Fetch README for repos that don't have one (uses REST API /repos/{owner}/{repo}/readme)
+    #[command(name = "fetch-missing-readmes")]
+    FetchMissingReadmes {
+        /// Maximum repos to process (default: all)
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Number of concurrent requests (default: 5)
+        #[arg(short, long, default_value = "5")]
+        concurrency: usize,
+
+        /// Show API calls for debugging
+        #[arg(long)]
+        debug: bool,
+
+        /// Path to proxy list file (one ip:port per line)
+        #[arg(long)]
+        proxy_file: Option<String>,
+
+        /// Force using proxies for all requests (don't use token)
+        #[arg(long)]
+        force_proxy: bool,
+    },
+
     /// Start HTTP server with SQL explorer interface
     #[command(hide = true)]
     Http {
@@ -337,6 +361,30 @@ async fn run_main(cli: Cli, db: Database) -> Result<()> {
         }
         Some(Commands::ExtractPapers { limit, batch_size }) => {
             extract_papers(&db, limit, batch_size)
+        }
+        Some(Commands::FetchMissingReadmes { limit, concurrency, debug, proxy_file, force_proxy }) => {
+            let proxy_manager = if let Some(path) = proxy_file {
+                let path = std::path::PathBuf::from(&path);
+                match ProxyManager::from_file(&path) {
+                    Ok(pm) => {
+                        eprintln!("\x1b[36m..\x1b[0m {}", pm);
+                        Some(pm)
+                    }
+                    Err(e) => {
+                        eprintln!("\x1b[31mx\x1b[0m Failed to load proxies: {}", e);
+                        return Err(e);
+                    }
+                }
+            } else {
+                if force_proxy {
+                    eprintln!("\x1b[31mx\x1b[0m --force-proxy requires --proxy-file");
+                    std::process::exit(1);
+                }
+                None
+            };
+
+            let client = GitHubClient::new_with_options(token.clone(), debug, proxy_manager, force_proxy);
+            fetch_missing_readmes(&client, &db, limit, concurrency).await
         }
         Some(Commands::Http { port }) => {
             http::start_server(db.path().to_path_buf(), port).await
@@ -912,6 +960,107 @@ fn extract_papers(db: &Database, limit: Option<usize>, batch_size: usize) -> Res
         "    Total: {} unique papers from {} repo mentions",
         total_papers, total_sources
     );
+
+    Ok(())
+}
+
+/// Fetch README for repos that don't have one using REST API
+async fn fetch_missing_readmes(
+    client: &GitHubClient,
+    db: &Database,
+    limit: Option<usize>,
+    concurrency: usize,
+) -> Result<()> {
+    use futures::stream::{self, StreamExt};
+
+    let need_readme = db.count_repos_without_readme()?;
+
+    if need_readme == 0 {
+        eprintln!("\x1b[32mok\x1b[0m All repos already have README content");
+        return Ok(());
+    }
+
+    let to_process = limit.map(|l| l.min(need_readme)).unwrap_or(need_readme);
+    eprintln!(
+        "\x1b[36m..\x1b[0m Fetching README for {} repos via REST API (concurrency: {})",
+        to_process, concurrency
+    );
+
+    let repos = db.get_repos_without_readme(limit)?;
+    let total = repos.len();
+    let start = std::time::Instant::now();
+
+    let mut fetched = 0;
+    let mut not_found = 0;
+
+    #[derive(Debug)]
+    enum ReadmeResult {
+        Found(String),
+        NotFound,
+        Error(String),
+    }
+
+    let mut result_stream = stream::iter(repos)
+        .map(|(repo_id, full_name)| {
+            let client = client.clone();
+            async move {
+                match client.get_readme(&full_name).await {
+                    Ok(Some(readme)) => (repo_id, full_name, ReadmeResult::Found(readme)),
+                    Ok(None) => (repo_id, full_name, ReadmeResult::NotFound),
+                    Err(e) => (repo_id, full_name, ReadmeResult::Error(e.to_string())),
+                }
+            }
+        })
+        .buffer_unordered(concurrency);
+
+    let mut errors = 0;
+
+    while let Some((repo_id, full_name, result)) = result_stream.next().await {
+        match result {
+            ReadmeResult::Found(content) => {
+                let len = content.len();
+                if let Err(e) = db.update_repo_readme(repo_id, &content) {
+                    eprintln!("\x1b[31mx\x1b[0m {} - db error: {}", full_name, e);
+                } else {
+                    eprintln!("\x1b[32m✓\x1b[0m {} ({} bytes)", full_name, len);
+                    fetched += 1;
+                }
+            }
+            ReadmeResult::NotFound => {
+                eprintln!("\x1b[90m-\x1b[0m {} (no readme)", full_name);
+                let _ = db.mark_repo_no_readme(repo_id);
+                not_found += 1;
+            }
+            ReadmeResult::Error(e) => {
+                eprintln!("\x1b[31m!\x1b[0m {} - {}", full_name, e);
+                errors += 1;
+                // Don't mark as no_readme, we'll retry later
+            }
+        }
+
+        // Progress every 100 repos
+        let done = fetched + not_found;
+        if done % 100 == 0 && done > 0 {
+            let elapsed = start.elapsed().as_secs_f64();
+            let rate = done as f64 / elapsed;
+            let eta = (total - done) as f64 / rate;
+            eprintln!(
+                "  \x1b[36m{}/{}\x1b[0m ({:.0}/s, ETA: {})",
+                done, total, rate, format_duration(eta as u64)
+            );
+        }
+    }
+
+    let elapsed = start.elapsed();
+    eprintln!(
+        "\x1b[32mok\x1b[0m Fetched {} READMEs ({} not found, {} errors) in {:.1}s",
+        fetched, not_found, errors, elapsed.as_secs_f64()
+    );
+
+    if fetched > 0 {
+        eprintln!("    {} repos now need re-embedding", fetched);
+        eprintln!("    Run: goto-gh embed");
+    }
 
     Ok(())
 }

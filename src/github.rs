@@ -327,13 +327,42 @@ impl GitHubClient {
     }
 
     /// Get README content (decoded) with retry logic
+    /// Supports proxy mode when force_proxy is enabled
     pub async fn get_readme(&self, full_name: &str) -> Result<Option<String>> {
         let url = format!("https://api.github.com/repos/{}/readme", full_name);
-        let config = RetryConfig::default();
 
-        let result = retry_with_backoff(&config, || async {
-            let response = self.send_request(&url).await
-                .map_err(|e| format!("Request failed: {}", e))?;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                let delay = std::time::Duration::from_millis(500 * (1 << attempt.min(3)));
+                tokio::time::sleep(delay).await;
+            }
+
+            // Get response (via proxy or direct)
+            let response = if self.force_proxy {
+                if let Some(ref pm) = self.proxy_manager {
+                    match self.try_with_proxies(&url, pm).await {
+                        Ok((resp, _)) => resp,
+                        Err(e) => {
+                            if attempt == 4 {
+                                anyhow::bail!("Proxy failed: {}", e);
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    anyhow::bail!("force_proxy enabled but no proxy_manager configured");
+                }
+            } else {
+                match self.send_request(&url).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if attempt == 4 {
+                            anyhow::bail!("Request failed: {}", e);
+                        }
+                        continue;
+                    }
+                }
+            };
 
             let status = response.status();
 
@@ -341,26 +370,36 @@ impl GitHubClient {
                 return Ok(None);
             }
 
-            // Retry on transient errors (502, 503, 504)
+            // Retry on transient errors
             if status == reqwest::StatusCode::BAD_GATEWAY
                 || status == reqwest::StatusCode::GATEWAY_TIMEOUT
                 || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
             {
-                return Err(format!("GitHub API error {}", status));
+                continue;
             }
 
             // Retry on rate limit (403)
             if status == reqwest::StatusCode::FORBIDDEN {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                return Err("Rate limited (403)".to_string());
+                continue;
             }
 
             if !status.is_success() {
-                return Err(format!("GitHub API error {}: failed to fetch README", status));
+                if attempt == 4 {
+                    anyhow::bail!("GitHub API error {}", status);
+                }
+                continue;
             }
 
-            let readme: ReadmeResponse = response.json().await
-                .map_err(|e| format!("JSON parse error: {}", e))?;
+            let readme: ReadmeResponse = match response.json().await {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt == 4 {
+                        anyhow::bail!("JSON parse error: {}", e);
+                    }
+                    continue;
+                }
+            };
 
             if readme.encoding != "base64" {
                 return Ok(None);
@@ -370,15 +409,15 @@ impl GitHubClient {
             let cleaned = readme.content.replace('\n', "");
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(&cleaned)
-                .map_err(|e| format!("Base64 decode error: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Base64 decode error: {}", e))?;
 
             let text = String::from_utf8(decoded)
-                .map_err(|e| format!("UTF-8 decode error: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("UTF-8 decode error: {}", e))?;
 
-            Ok(Some(text))
-        }).await;
+            return Ok(Some(text));
+        }
 
-        result.map_err(|e| anyhow::anyhow!("Failed to fetch README after retries: {}", e))
+        anyhow::bail!("Failed to fetch README after 5 attempts")
     }
 
     /// Check rate limit status (returns both REST and GraphQL limits)
