@@ -8,7 +8,7 @@ use std::io::{IsTerminal, Write};
 
 use crate::db::Database;
 use crate::formatting::format_owner_link;
-use crate::github::GitHubClient;
+use crate::github::{DiscoveredRepo, GitHubClient};
 
 /// Result from discovering an owner's repos and followers
 #[derive(Debug, Default, Clone)]
@@ -59,6 +59,7 @@ pub struct DiscoveryProgress {
 /// Discover repos from an owner (core version, no progress output)
 ///
 /// Returns Ok(count) on success, Err on API error (owner stays in_progress for retry)
+/// Now captures full metadata (stars, description, language, etc.) from REST API
 pub async fn discover_owner_repos_core(
     client: &GitHubClient,
     db: &Database,
@@ -70,12 +71,18 @@ pub async fn discover_owner_repos_core(
 
     db.mark_owner_in_progress(owner)?;
 
-    let repos = client.list_owner_repos(owner).await;
+    // Collect all repos with full metadata
+    let mut all_repos: Vec<DiscoveredRepo> = Vec::new();
+    let result = client
+        .discover_owner_repos_streaming(owner, |repos, _progress| {
+            all_repos.extend(repos);
+            Ok(())
+        })
+        .await;
 
-    match repos {
-        Ok(repos) => {
-            let count = repos.len();
-            let (inserted, _) = db.add_repo_stubs_bulk(&repos)?;
+    match result {
+        Ok(count) => {
+            let (inserted, _) = db.save_discovered_repos(&all_repos)?;
             db.mark_owner_explored(owner, count)?;
             Ok(inserted)
         }
@@ -257,6 +264,7 @@ where
 // ============================================================================
 
 /// Discover and queue all repos from an owner (CLI version with output)
+/// Captures full metadata (stars, description, language, etc.) from REST API
 pub async fn discover_owner_repos(
     client: &GitHubClient,
     db: &Database,
@@ -273,10 +281,18 @@ pub async fn discover_owner_repos(
 
     eprintln!("\x1b[36m..\x1b[0m Discovering repos from {}", owner);
 
-    match client.list_owner_repos(owner).await {
-        Ok(repos) => {
-            let count = repos.len();
-            let (inserted, _skipped) = db.add_repo_stubs_bulk(&repos)?;
+    // Collect all repos with full metadata
+    let mut all_repos: Vec<DiscoveredRepo> = Vec::new();
+    let result = client
+        .discover_owner_repos_streaming(owner, |repos, _progress| {
+            all_repos.extend(repos);
+            Ok(())
+        })
+        .await;
+
+    match result {
+        Ok(count) => {
+            let (inserted, _skipped) = db.save_discovered_repos(&all_repos)?;
             db.mark_owner_explored(owner, count)?;
 
             if inserted > 0 {
@@ -407,13 +423,15 @@ pub async fn discover_single_owner_cli(
     if needs_repos {
         db.mark_owner_in_progress(owner)?;
 
+        let all_repos: RefCell<Vec<DiscoveredRepo>> = RefCell::new(Vec::new());
         let inserted_count = RefCell::new(0usize);
         let total_repos = RefCell::new(0usize);
         let last_page = RefCell::new(0usize);
 
         let result = client
-            .list_owner_repos_streaming(owner, |repos, progress| {
-                let (inserted, _) = db.add_repo_stubs_bulk(&repos)?;
+            .discover_owner_repos_streaming(owner, |repos, progress| {
+                let (inserted, _) = db.save_discovered_repos(&repos)?;
+                all_repos.borrow_mut().extend(repos);
                 *inserted_count.borrow_mut() += inserted;
                 *total_repos.borrow_mut() = progress.total_so_far;
                 *last_page.borrow_mut() = progress.page;

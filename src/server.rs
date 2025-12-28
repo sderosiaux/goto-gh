@@ -62,6 +62,8 @@ impl Default for ServerConfig {
 pub struct ServerState {
     pub config: ServerConfig,
     pub github_tokens: Vec<String>,
+    /// Shared proxy manager (loaded once at startup)
+    pub proxy_manager: Option<ProxyManager>,
 }
 
 impl ServerState {
@@ -72,17 +74,10 @@ impl ServerState {
 
     /// Create a GitHub client with a specific token
     fn create_github_client_with_token(&self, token: Option<String>) -> Result<GitHubClient> {
-        let proxy_manager = if let Some(ref path) = self.config.proxy_file {
-            let path = std::path::PathBuf::from(path);
-            Some(ProxyManager::from_file(&path)?)
-        } else {
-            None
-        };
-
         Ok(GitHubClient::new_with_options(
             token,
             self.config.debug,
-            proxy_manager,
+            self.proxy_manager.clone(),
             self.config.force_proxy,
         ))
     }
@@ -98,9 +93,18 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
     let github_tokens = Config::github_tokens();
     let token_count = github_tokens.len();
 
+    // Load proxy manager once at startup
+    let proxy_manager = if let Some(ref path) = config.proxy_file {
+        let path = std::path::PathBuf::from(path);
+        Some(ProxyManager::from_file(&path)?)
+    } else {
+        None
+    };
+
     let state = Arc::new(ServerState {
         config,
         github_tokens,
+        proxy_manager,
     });
 
     // Initial stats
@@ -511,8 +515,12 @@ async fn run_readme_cycle(state: &ServerState, shutdown: &AtomicBool) -> Result<
 
         match result {
             ReadmeResult::Found(content) => {
+                let len = content.len();
                 // Treat empty README as "no readme" - don't retry
-                if content.is_empty() {
+                if len == 0 {
+                    if state.config.debug {
+                        eprintln!("\x1b[32m[readme]\x1b[0m \x1b[90m- {} (empty)\x1b[0m", full_name);
+                    }
                     let _ = db.mark_repo_no_readme(repo_id);
                     not_found += 1;
                     continue;
@@ -525,9 +533,19 @@ async fn run_readme_cycle(state: &ServerState, shutdown: &AtomicBool) -> Result<
                     discovered += found;
                     let _ = db.mark_repos_extracted(repo_id);
                     fetched += 1;
+                    if state.config.debug {
+                        if found > 0 {
+                            eprintln!("\x1b[32m[readme]\x1b[0m ✓ {} ({} bytes, +{} repos)", full_name, len, found);
+                        } else {
+                            eprintln!("\x1b[32m[readme]\x1b[0m ✓ {} ({} bytes)", full_name, len);
+                        }
+                    }
                 }
             }
             ReadmeResult::NotFound => {
+                if state.config.debug {
+                    eprintln!("\x1b[32m[readme]\x1b[0m \x1b[90m- {} (no readme)\x1b[0m", full_name);
+                }
                 let _ = db.mark_repo_no_readme(repo_id);
                 not_found += 1;
             }

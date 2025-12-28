@@ -6,7 +6,7 @@ use zerocopy::AsBytes;
 
 use crate::config::Config;
 use crate::embedding::EMBEDDING_DIM;
-use crate::github::{GitHubRepo, RepoWithReadme};
+use crate::github::{DiscoveredRepo, GitHubRepo, RepoWithReadme};
 
 /// Stored repository with metadata
 #[derive(Debug, Clone)]
@@ -741,23 +741,121 @@ impl Database {
         Ok((inserted, skipped))
     }
 
-    /// Get repos that need metadata fetch (have no embedded_text = never fetched, not gone)
+    /// Save discovered repos with full metadata from REST API
+    /// Inserts new repos or updates existing ones with fresh metadata
+    /// Returns (inserted_count, updated_count)
+    pub fn save_discovered_repos(&self, repos: &[DiscoveredRepo]) -> Result<(usize, usize)> {
+        if repos.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut inserted = 0;
+        let mut updated = 0;
+
+        self.conn.execute("BEGIN TRANSACTION", [])?;
+
+        for repo in repos {
+            let owner = repo.full_name.split('/').next().unwrap_or("").to_lowercase();
+            let topics_json = serde_json::to_string(&repo.topics).unwrap_or_else(|_| "[]".to_string());
+
+            // Build embedded_text for semantic search (without README for now)
+            let embedded_text = format!(
+                "{}\n{}\n{}\n{}",
+                repo.full_name,
+                repo.description.as_deref().unwrap_or(""),
+                repo.topics.join(", "),
+                repo.language.as_deref().unwrap_or("")
+            );
+
+            // Check if repo exists (case-insensitive)
+            let existing_id: Option<i64> = self.conn.query_row(
+                "SELECT id FROM repos WHERE LOWER(full_name) = LOWER(?1) LIMIT 1",
+                params![&repo.full_name],
+                |row| row.get(0),
+            ).optional()?;
+
+            if let Some(id) = existing_id {
+                // Update existing row with fresh metadata (but preserve readme_excerpt if present)
+                self.conn.execute(
+                    "UPDATE repos SET
+                        description = ?2,
+                        url = ?3,
+                        stars = ?4,
+                        language = ?5,
+                        topics = ?6,
+                        pushed_at = ?7,
+                        created_at = ?8,
+                        last_indexed = ?9,
+                        owner = ?10,
+                        embedded_text = COALESCE(
+                            CASE WHEN readme_excerpt IS NOT NULL AND readme_excerpt != '' AND readme_excerpt != '[NO_README]'
+                                 THEN ?11 || '\n' || readme_excerpt
+                                 ELSE ?11
+                            END,
+                            embedded_text
+                        )
+                     WHERE id = ?1",
+                    params![
+                        id,
+                        repo.description,
+                        &repo.html_url,
+                        repo.stargazers_count as i64,
+                        repo.language,
+                        topics_json,
+                        repo.pushed_at,
+                        repo.created_at,
+                        &now,
+                        owner,
+                        embedded_text,
+                    ],
+                )?;
+                updated += 1;
+            } else {
+                // Insert new row with full metadata
+                self.conn.execute(
+                    "INSERT INTO repos (full_name, description, url, stars, language, topics, pushed_at, created_at, last_indexed, owner, embedded_text)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        &repo.full_name,
+                        repo.description,
+                        &repo.html_url,
+                        repo.stargazers_count as i64,
+                        repo.language,
+                        topics_json,
+                        repo.pushed_at,
+                        repo.created_at,
+                        &now,
+                        owner,
+                        embedded_text,
+                    ],
+                )?;
+                inserted += 1;
+            }
+        }
+
+        self.conn.execute("COMMIT", [])?;
+        Ok((inserted, updated))
+    }
+
+    /// Get repos that need metadata fetch (no stars/description/language = never fetched metadata)
+    /// This targets repos that were added as stubs but never got their metadata from REST or GraphQL
     pub fn get_repos_without_metadata(&self, limit: Option<usize>) -> Result<Vec<String>> {
-        // Skip repos that already have README (fetched via REST API)
-        // Those have readme_excerpt set but no embedded_text yet
         let sql = match limit {
             Some(lim) => format!(
                 "SELECT full_name FROM repos
-                 WHERE embedded_text IS NULL
-                   AND gone = 0
-                   AND (readme_excerpt IS NULL OR readme_excerpt = '' OR readme_excerpt = '[NO_README]')
+                 WHERE gone = 0
+                   AND (stars IS NULL OR stars = 0)
+                   AND description IS NULL
+                   AND language IS NULL
                  LIMIT {}",
                 lim
             ),
             None => "SELECT full_name FROM repos
-                     WHERE embedded_text IS NULL
-                       AND gone = 0
-                       AND (readme_excerpt IS NULL OR readme_excerpt = '' OR readme_excerpt = '[NO_README]')".to_string(),
+                     WHERE gone = 0
+                       AND (stars IS NULL OR stars = 0)
+                       AND description IS NULL
+                       AND language IS NULL".to_string(),
         };
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -766,13 +864,14 @@ impl Database {
         results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Count repos without metadata (excluding gone repos and those with README already fetched)
+    /// Count repos without metadata (no stars/description/language)
     pub fn count_repos_without_metadata(&self) -> Result<usize> {
         let count: usize = self.conn.query_row(
             "SELECT COUNT(*) FROM repos
-             WHERE embedded_text IS NULL
-               AND gone = 0
-               AND (readme_excerpt IS NULL OR readme_excerpt = '' OR readme_excerpt = '[NO_README]')",
+             WHERE gone = 0
+               AND (stars IS NULL OR stars = 0)
+               AND description IS NULL
+               AND language IS NULL",
             [],
             |row| row.get(0),
         )?;

@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use futures::stream::{self, StreamExt};
 use serde::Deserialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -113,6 +114,8 @@ pub struct GitHubClient {
     debug: bool,
     proxy_manager: Option<ProxyManager>,
     force_proxy: bool,
+    /// Token REST rate limit reset timestamp (0 = not rate limited)
+    token_rate_limited_until: Arc<AtomicU64>,
 }
 
 impl GitHubClient {
@@ -126,7 +129,57 @@ impl GitHubClient {
             .build()
             .expect("Failed to create HTTP client");
 
-        Self { client, token, debug, proxy_manager, force_proxy }
+        Self {
+            client,
+            token,
+            debug,
+            proxy_manager,
+            force_proxy,
+            token_rate_limited_until: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Check if token is currently rate-limited for REST API
+    fn is_token_rate_limited(&self) -> bool {
+        let reset = self.token_rate_limited_until.load(Ordering::SeqCst);
+        if reset == 0 {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        now < reset
+    }
+
+    /// Mark token as rate-limited until the given timestamp
+    fn mark_token_rate_limited(&self, reset_timestamp: u64) {
+        self.token_rate_limited_until.store(reset_timestamp, Ordering::SeqCst);
+        if self.debug {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let wait = if reset_timestamp > now { reset_timestamp - now } else { 0 };
+            eprintln!("\x1b[33m[token]\x1b[0m REST rate limited, using proxies for {}s", wait);
+        }
+    }
+
+    /// Clear token rate limit (it has reset)
+    fn clear_token_rate_limit(&self) {
+        let was_limited = self.token_rate_limited_until.swap(0, Ordering::SeqCst);
+        if was_limited > 0 && self.debug {
+            eprintln!("\x1b[32m[token]\x1b[0m REST rate limit reset, switching back to token");
+        }
+    }
+
+    /// Should use proxy for this REST request?
+    fn should_use_proxy(&self) -> bool {
+        if self.force_proxy {
+            return true;
+        }
+        // Use proxy if token is rate-limited and we have proxies
+        self.is_token_rate_limited() && self.proxy_manager.is_some()
     }
 
     /// Create a client configured to use a specific proxy
@@ -211,6 +264,113 @@ impl GitHubClient {
     /// Send REST request via proxy with debug output
     async fn send_request_via_proxy(&self, url: &str, proxy: &str) -> Result<reqwest::Response, String> {
         self.send_request_via_proxy_inner(url, proxy, true).await
+    }
+
+    /// Unified REST GET with dynamic proxy switching and retry logic
+    /// Returns the response or error after all retries exhausted
+    async fn rest_get(&self, url: &str) -> Result<reqwest::Response> {
+        for attempt in 0..5 {
+            if attempt > 0 {
+                let delay = std::time::Duration::from_millis(500 * (1 << attempt.min(3)));
+                tokio::time::sleep(delay).await;
+            }
+
+            // Dynamic proxy selection: use proxy if force_proxy OR token is rate-limited
+            let response = if self.should_use_proxy() {
+                if let Some(ref pm) = self.proxy_manager {
+                    match self.try_with_proxies(url, pm).await {
+                        Ok((resp, _)) => resp,
+                        Err(e) => {
+                            if attempt == 4 {
+                                anyhow::bail!("Proxy failed: {}", e);
+                            }
+                            continue;
+                        }
+                    }
+                } else if self.force_proxy {
+                    anyhow::bail!("force_proxy enabled but no proxy_manager configured");
+                } else {
+                    // Token rate-limited but no proxies, use direct request
+                    match self.send_request(url).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            if attempt == 4 {
+                                anyhow::bail!("Request failed: {}", e);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            } else {
+                match self.send_request(url).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if attempt == 4 {
+                            anyhow::bail!("Request failed: {}", e);
+                        }
+                        continue;
+                    }
+                }
+            };
+
+            let status = response.status();
+
+            // Success - return immediately
+            if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+                return Ok(response);
+            }
+
+            // Retry on transient errors
+            if status == reqwest::StatusCode::BAD_GATEWAY
+                || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            {
+                continue;
+            }
+
+            // On rate limit, mark token and retry (will use proxy if available)
+            if status == reqwest::StatusCode::FORBIDDEN
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            {
+                let reset_timestamp = response.headers()
+                    .get("x-ratelimit-reset")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or_else(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() + 60
+                    });
+
+                self.mark_token_rate_limited(reset_timestamp);
+
+                // If we have proxies, retry immediately
+                if self.proxy_manager.is_some() {
+                    continue;
+                }
+
+                // No proxies - wait for reset (capped at 2 min)
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let wait_secs = if reset_timestamp > now {
+                    (reset_timestamp - now).min(120)
+                } else {
+                    2
+                };
+                tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                continue;
+            }
+
+            // Other errors - retry
+            if attempt == 4 {
+                anyhow::bail!("GitHub API error {}", status);
+            }
+        }
+
+        anyhow::bail!("Request failed after 5 retries");
     }
 
     /// Try request through proxies - one proxy per request with automatic blacklisting
@@ -330,128 +490,33 @@ impl GitHubClient {
     }
 
     /// Get README content (decoded) with retry logic
-    /// Supports proxy mode when force_proxy is enabled
+    /// Supports dynamic proxy switching: uses token until rate-limited, then proxies
     pub async fn get_readme(&self, full_name: &str) -> Result<Option<String>> {
         let url = format!("https://api.github.com/repos/{}/readme", full_name);
 
-        for attempt in 0..5 {
-            if attempt > 0 {
-                let delay = std::time::Duration::from_millis(500 * (1 << attempt.min(3)));
-                tokio::time::sleep(delay).await;
-            }
+        let response = self.rest_get(&url).await?;
 
-            // Get response (via proxy or direct)
-            let response = if self.force_proxy {
-                if let Some(ref pm) = self.proxy_manager {
-                    match self.try_with_proxies(&url, pm).await {
-                        Ok((resp, _)) => resp,
-                        Err(e) => {
-                            if attempt == 4 {
-                                anyhow::bail!("Proxy failed: {}", e);
-                            }
-                            continue;
-                        }
-                    }
-                } else {
-                    anyhow::bail!("force_proxy enabled but no proxy_manager configured");
-                }
-            } else {
-                match self.send_request(&url).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        if attempt == 4 {
-                            anyhow::bail!("Request failed: {}", e);
-                        }
-                        continue;
-                    }
-                }
-            };
-
-            let status = response.status();
-
-            if status == reqwest::StatusCode::NOT_FOUND {
-                return Ok(None);
-            }
-
-            // Retry on transient errors
-            if status == reqwest::StatusCode::BAD_GATEWAY
-                || status == reqwest::StatusCode::GATEWAY_TIMEOUT
-                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            {
-                continue;
-            }
-
-            // Retry on rate limit (403 or 429)
-            if status == reqwest::StatusCode::FORBIDDEN
-                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            {
-                // Try to get X-RateLimit-Reset header for smart waiting
-                let wait_secs = if let Some(reset_header) = response.headers().get("x-ratelimit-reset") {
-                    if let Ok(reset_str) = reset_header.to_str() {
-                        if let Ok(reset_timestamp) = reset_str.parse::<u64>() {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs();
-                            if reset_timestamp > now {
-                                let wait = (reset_timestamp - now).min(120); // Cap at 2 minutes
-                                if self.debug {
-                                    eprintln!(
-                                        "\x1b[33m[rate-limit]\x1b[0m {} - waiting {}s until reset",
-                                        full_name, wait
-                                    );
-                                }
-                                wait
-                            } else {
-                                2 // Already past reset time, short wait
-                            }
-                        } else {
-                            60 // Default 60s if can't parse
-                        }
-                    } else {
-                        60
-                    }
-                } else {
-                    60 // Default 60s if no header
-                };
-                tokio::time::sleep(Duration::from_secs(wait_secs)).await;
-                continue;
-            }
-
-            if !status.is_success() {
-                if attempt == 4 {
-                    anyhow::bail!("GitHub API error {}", status);
-                }
-                continue;
-            }
-
-            let readme: ReadmeResponse = match response.json().await {
-                Ok(r) => r,
-                Err(e) => {
-                    if attempt == 4 {
-                        anyhow::bail!("JSON parse error: {}", e);
-                    }
-                    continue;
-                }
-            };
-
-            if readme.encoding != "base64" {
-                return Ok(None);
-            }
-
-            // Decode base64 content (GitHub sends it with newlines)
-            let cleaned = readme.content.replace('\n', "");
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(&cleaned)
-                .map_err(|e| anyhow::anyhow!("Base64 decode error: {}", e))?;
-
-            let text = String::from_utf8(decoded)
-                .map_err(|e| anyhow::anyhow!("UTF-8 decode error: {}", e))?;
-
-            return Ok(Some(text));
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
         }
 
-        anyhow::bail!("Failed to fetch README after 5 attempts")
+        let readme: ReadmeResponse = response.json().await
+            .context("Failed to parse README response")?;
+
+        if readme.encoding != "base64" {
+            return Ok(None);
+        }
+
+        // Decode base64 content (GitHub sends it with newlines)
+        let cleaned = readme.content.replace('\n', "");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&cleaned)
+            .map_err(|e| anyhow::anyhow!("Base64 decode error: {}", e))?;
+
+        let text = String::from_utf8(decoded)
+            .map_err(|e| anyhow::anyhow!("UTF-8 decode error: {}", e))?;
+
+        Ok(Some(text))
     }
 
     /// Check rate limit status (returns both REST and GraphQL limits)
@@ -547,27 +612,28 @@ impl GitHubClient {
     }
 
     /// List all public repos for a user or org (paginated, with retry)
+    /// Returns just repo names (for backward compatibility)
     pub async fn list_owner_repos(&self, owner: &str) -> Result<Vec<String>> {
         let mut all = Vec::new();
-        self.list_owner_repos_streaming(owner, |repos, _progress| {
-            all.extend(repos);
+        self.discover_owner_repos_streaming(owner, |repos, _progress| {
+            all.extend(repos.into_iter().map(|r| r.full_name));
             Ok(())
         }).await?;
         Ok(all)
     }
 
-    /// List repos with streaming: calls on_page for each page of results
-    /// This allows saving repos to DB as we fetch them (resumable)
-    pub async fn list_owner_repos_streaming<F>(
+    /// Discover repos with full metadata using REST API
+    /// Returns complete repo info (stars, description, language, etc.) for each repo
+    pub async fn discover_owner_repos_streaming<F>(
         &self,
         owner: &str,
         mut on_page: F,
     ) -> Result<usize>
     where
-        F: FnMut(Vec<String>, DiscoveryProgress) -> Result<()>,
+        F: FnMut(Vec<DiscoveredRepo>, DiscoveryProgress) -> Result<()>,
     {
         // Try as user first
-        match self.list_repos_paginated_streaming(
+        match self.discover_repos_paginated(
             &format!(
                 "https://api.github.com/users/{}/repos?per_page=100&page={{page}}&type=owner",
                 owner
@@ -579,7 +645,7 @@ impl GitHubClient {
                 // If user not found, try as org
                 let err_str = e.to_string();
                 if err_str.contains("404") {
-                    return self.list_repos_paginated_streaming(
+                    return self.discover_repos_paginated(
                         &format!(
                             "https://api.github.com/orgs/{}/repos?per_page=100&page={{page}}&type=public",
                             owner
@@ -592,14 +658,14 @@ impl GitHubClient {
         }
     }
 
-    /// Paginated repo listing with streaming callback and retry logic
-    async fn list_repos_paginated_streaming<F>(
+    /// Paginated repo discovery with full metadata
+    async fn discover_repos_paginated<F>(
         &self,
         url_template: &str,
         on_page: &mut F,
     ) -> Result<usize>
     where
-        F: FnMut(Vec<String>, DiscoveryProgress) -> Result<()>,
+        F: FnMut(Vec<DiscoveredRepo>, DiscoveryProgress) -> Result<()>,
     {
         let mut total_repos = 0;
         let mut page = 1;
@@ -608,157 +674,43 @@ impl GitHubClient {
         loop {
             let url = url_template.replace("{page}", &page.to_string());
 
-            // Retry with exponential backoff for transient errors
-            let mut last_error = None;
-            let mut repos_page: Option<Vec<OwnerRepoInfo>> = None;
-
-            for attempt in 0..5 {
-                if attempt > 0 {
-                    let delay = std::time::Duration::from_millis(500 * (1 << attempt.min(3)));
-                    tokio::time::sleep(delay).await;
-                }
-
-                // If force_proxy is enabled, go directly to proxy rotation
-                if self.force_proxy {
-                    if let Some(ref pm) = self.proxy_manager {
-                        match self.try_with_proxies(&url, pm).await {
-                            Ok((proxy_response, _proxy)) => {
-                                let proxy_status = proxy_response.status();
-                                if proxy_status.is_success() {
-                                    match proxy_response.json::<Vec<OwnerRepoInfo>>().await {
-                                        Ok(repos) => {
-                                            repos_page = Some(repos);
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            last_error = Some(format!("JSON parse error: {}", e));
-                                            continue;
-                                        }
-                                    }
-                                } else if proxy_status == reqwest::StatusCode::NOT_FOUND && page == 1 {
-                                    anyhow::bail!("404 not found");
-                                } else {
-                                    last_error = Some(format!("Proxy returned {}", proxy_status));
-                                    continue;
-                                }
-                            }
-                            Err(e) => {
-                                last_error = Some(format!("Proxy rotation failed: {}", e));
-                                continue;
-                            }
-                        }
-                    } else {
-                        anyhow::bail!("force_proxy enabled but no proxy_manager configured");
-                    }
-                }
-
-                let response = match self.send_request(&url).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        last_error = Some(format!("Request failed: {}", e));
-                        continue;
-                    }
-                };
-
-                let status = response.status();
-
-                // 404 = user/org not found (on first page only)
-                if status == reqwest::StatusCode::NOT_FOUND && page == 1 {
-                    anyhow::bail!("404 not found");
-                }
-
-                // Retry on transient errors (502, 503, 504)
-                if status == reqwest::StatusCode::BAD_GATEWAY
-                    || status == reqwest::StatusCode::GATEWAY_TIMEOUT
-                    || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                {
-                    last_error = Some(format!("GitHub API error {}", status));
-                    continue;
-                }
-
-                // On rate limit (403), try proxies if available, otherwise wait
-                if status == reqwest::StatusCode::FORBIDDEN {
-                    if let Some(ref pm) = self.proxy_manager {
-                        // Try via proxy rotation
-                        eprintln!("\x1b[33m[rest]\x1b[0m ⏸ rate limited, switching to proxy rotation...");
-                        match self.try_with_proxies(&url, pm).await {
-                            Ok((proxy_response, _proxy)) => {
-                                let proxy_status = proxy_response.status();
-                                if proxy_status.is_success() {
-                                    match proxy_response.json::<Vec<OwnerRepoInfo>>().await {
-                                        Ok(repos) => {
-                                            repos_page = Some(repos);
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            last_error = Some(format!("JSON parse error: {}", e));
-                                            continue;
-                                        }
-                                    }
-                                } else if proxy_status == reqwest::StatusCode::NOT_FOUND && page == 1 {
-                                    anyhow::bail!("404 not found");
-                                }
-                            }
-                            Err(_) => {}
-                        }
-                    }
-
-                    // No proxies or proxy failed - wait for rate limit reset
-                    last_error = Some("Rate limited (403)".to_string());
-                    if let Ok(rates) = self.rate_limit().await {
-                        self.wait_for_rate_limit(&rates.core, "REST API", 10).await;
-                    } else {
-                        eprintln!("\x1b[33m[rest]\x1b[0m ⏸ rate limited, waiting 60s...");
-                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    }
-                    continue;
-                }
-
-                // Other errors: if we have partial results, return them; otherwise fail
-                if !status.is_success() {
+            let response = match self.rest_get(&url).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // On error, return partial results if we have any
                     if total_repos > 0 {
                         return Ok(total_repos);
                     }
-                    anyhow::bail!("GitHub API error {}", status);
-                }
-
-                match response.json::<Vec<OwnerRepoInfo>>().await {
-                    Ok(repos) => {
-                        repos_page = Some(repos);
-                        break;
-                    }
-                    Err(e) => {
-                        last_error = Some(format!("JSON parse error: {}", e));
-                        continue;
-                    }
-                }
-            }
-
-            // All retries exhausted
-            let repos = match repos_page {
-                Some(r) => r,
-                None => {
-                    if total_repos > 0 {
-                        return Ok(total_repos);
-                    }
-                    anyhow::bail!("Failed after 5 retries: {}", last_error.unwrap_or_default());
+                    return Err(e);
                 }
             };
+
+            let status = response.status();
+
+            // 404 = user/org not found (on first page only)
+            if status == reqwest::StatusCode::NOT_FOUND {
+                if page == 1 {
+                    anyhow::bail!("404 not found");
+                }
+                break; // End of pagination
+            }
+
+            let repos: Vec<DiscoveredRepo> = response.json().await
+                .context("Failed to parse repos response")?;
 
             if repos.is_empty() {
                 break;
             }
 
-            let repo_names: Vec<String> = repos.iter().map(|r| r.full_name.clone()).collect();
-            let count = repo_names.len();
+            let count = repos.len();
             total_repos += count;
 
-            // Call the streaming callback with this page's repos
+            // Call the streaming callback with full repo metadata
             let progress = DiscoveryProgress {
                 page,
                 total_so_far: total_repos,
             };
-            on_page(repo_names, progress)?;
+            on_page(repos, progress)?;
 
             if count < per_page {
                 break;
@@ -789,144 +741,29 @@ impl GitHubClient {
                 owner, per_page, page
             );
 
-            // Retry with exponential backoff for transient errors
-            let mut last_error = None;
-            let mut followers_page: Option<Vec<FollowerInfo>> = None;
-
-            for attempt in 0..5 {
-                if attempt > 0 {
-                    let delay = std::time::Duration::from_millis(500 * (1 << attempt.min(3)));
-                    tokio::time::sleep(delay).await;
-                }
-
-                // If force_proxy is enabled, go directly to proxy rotation
-                if self.force_proxy {
-                    if let Some(ref pm) = self.proxy_manager {
-                        match self.try_with_proxies(&url, pm).await {
-                            Ok((proxy_response, _proxy)) => {
-                                let proxy_status = proxy_response.status();
-                                if proxy_status.is_success() {
-                                    match proxy_response.json::<Vec<FollowerInfo>>().await {
-                                        Ok(followers) => {
-                                            followers_page = Some(followers);
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            last_error = Some(format!("JSON parse error: {}", e));
-                                            continue;
-                                        }
-                                    }
-                                } else if proxy_status == reqwest::StatusCode::NOT_FOUND && page == 1 {
-                                    anyhow::bail!("User {} not found (404)", owner);
-                                } else {
-                                    last_error = Some(format!("Proxy returned {}", proxy_status));
-                                    continue;
-                                }
-                            }
-                            Err(e) => {
-                                last_error = Some(format!("Proxy rotation failed: {}", e));
-                                continue;
-                            }
-                        }
-                    } else {
-                        anyhow::bail!("force_proxy enabled but no proxy_manager configured");
-                    }
-                }
-
-                let response = match self.send_request(&url).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        last_error = Some(format!("Request failed: {}", e));
-                        continue;
-                    }
-                };
-
-                let status = response.status();
-
-                // 404 = user not found
-                if status == reqwest::StatusCode::NOT_FOUND {
-                    if page == 1 {
-                        anyhow::bail!("User {} not found (404)", owner);
-                    }
-                    break;
-                }
-
-                // Retry on transient errors (502, 503, 504)
-                if status == reqwest::StatusCode::BAD_GATEWAY
-                    || status == reqwest::StatusCode::GATEWAY_TIMEOUT
-                    || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                {
-                    last_error = Some(format!("GitHub API error {}", status));
-                    continue;
-                }
-
-                // On rate limit (403), try proxies if available, otherwise wait
-                if status == reqwest::StatusCode::FORBIDDEN {
-                    if let Some(ref pm) = self.proxy_manager {
-                        // Try via proxy rotation
-                        eprintln!("\x1b[33m[rest]\x1b[0m ⏸ rate limited, switching to proxy rotation...");
-                        match self.try_with_proxies(&url, pm).await {
-                            Ok((proxy_response, _proxy)) => {
-                                let proxy_status = proxy_response.status();
-                                if proxy_status.is_success() {
-                                    match proxy_response.json::<Vec<FollowerInfo>>().await {
-                                        Ok(followers) => {
-                                            followers_page = Some(followers);
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            last_error = Some(format!("JSON parse error: {}", e));
-                                            continue;
-                                        }
-                                    }
-                                } else if proxy_status == reqwest::StatusCode::NOT_FOUND && page == 1 {
-                                    anyhow::bail!("User {} not found (404)", owner);
-                                }
-                            }
-                            Err(_) => {}
-                        }
-                    }
-
-                    // No proxies or proxy failed - wait for rate limit reset
-                    last_error = Some("Rate limited (403)".to_string());
-                    if let Ok(rates) = self.rate_limit().await {
-                        self.wait_for_rate_limit(&rates.core, "REST API", 10).await;
-                    } else {
-                        eprintln!("\x1b[33m[rest]\x1b[0m ⏸ rate limited, waiting 60s...");
-                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    }
-                    continue;
-                }
-
-                if !status.is_success() {
+            let response = match self.rest_get(&url).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // On error, return partial results if we have any
                     if total_followers > 0 {
                         return Ok(total_followers);
                     }
-                    anyhow::bail!("GitHub API error {}", status);
-                }
-
-                match response.json::<Vec<FollowerInfo>>().await {
-                    Ok(followers) => {
-                        followers_page = Some(followers);
-                        break;
-                    }
-                    Err(e) => {
-                        last_error = Some(format!("JSON parse error: {}", e));
-                        continue;
-                    }
-                }
-            }
-
-            // All retries exhausted
-            let followers = match followers_page {
-                Some(f) => f,
-                None => {
-                    if total_followers > 0 {
-                        return Ok(total_followers);
-                    }
-                    anyhow::bail!("Failed after 5 retries: {}", last_error.unwrap_or_default());
+                    return Err(e);
                 }
             };
+
+            let status = response.status();
+
+            // 404 = user not found
+            if status == reqwest::StatusCode::NOT_FOUND {
+                if page == 1 {
+                    anyhow::bail!("User {} not found (404)", owner);
+                }
+                break; // End of pagination
+            }
+
+            let followers: Vec<FollowerInfo> = response.json().await
+                .context("Failed to parse followers response")?;
 
             if followers.is_empty() {
                 break;
@@ -954,10 +791,21 @@ impl GitHubClient {
     }
 }
 
-/// Minimal repo info for listing
-#[derive(Debug, Deserialize)]
-struct OwnerRepoInfo {
-    full_name: String,
+/// Full repo info from REST API (used during discovery)
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscoveredRepo {
+    pub full_name: String,
+    pub description: Option<String>,
+    pub html_url: String,
+    #[serde(default)]
+    pub stargazers_count: u64,
+    pub language: Option<String>,
+    #[serde(default)]
+    pub topics: Vec<String>,
+    pub pushed_at: Option<String>,
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub fork: bool,
 }
 
 /// Follower info from GitHub API
