@@ -82,7 +82,8 @@ pub async fn fetch_batch(
     })
 }
 
-/// Discover and add repo stubs from a README
+/// Discover and add repo stubs + owners from a README
+/// Returns number of new repos added
 pub fn discover_repos_from_readme(db: &Database, readme: &str) -> usize {
     let linked = extract_github_repos(readme);
     if linked.is_empty() {
@@ -92,6 +93,20 @@ pub fn discover_repos_from_readme(db: &Database, readme: &str) -> usize {
     let unique: HashSet<_> = linked.into_iter().collect();
     let repos_vec: Vec<String> = unique.into_iter().collect();
 
+    // Extract unique owners to add to owners_to_explore
+    // This allows discover to fetch their other repos + followers
+    let owners: Vec<String> = repos_vec
+        .iter()
+        .filter_map(|name| name.split('/').next())
+        .map(|s| s.to_string())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    // Add owners to explore queue (will be picked up by discover worker)
+    let _ = db.add_followers_as_owners_bulk(&owners);
+
+    // Add repo stubs (will be picked up by fetch worker)
     match db.add_repo_stubs_bulk(&repos_vec) {
         Ok((added, _)) => added,
         Err(_) => 0,

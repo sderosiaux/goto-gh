@@ -229,6 +229,10 @@ enum Commands {
         #[arg(long, default_value = "2")]
         fetch_concurrency: usize,
 
+        /// README fetch concurrency (default: 20)
+        #[arg(long, default_value = "20")]
+        readme_concurrency: usize,
+
         /// Discover limit per cycle (default: 50)
         #[arg(long, default_value = "50")]
         discover_limit: usize,
@@ -407,6 +411,7 @@ async fn run_main(cli: Cli, db: Database) -> Result<()> {
         Some(Commands::Server {
             fetch_batch_size,
             fetch_concurrency,
+            readme_concurrency,
             discover_limit,
             embed_batch_size,
             provider,
@@ -425,6 +430,7 @@ async fn run_main(cli: Cli, db: Database) -> Result<()> {
             let config = ServerConfig {
                 fetch_batch_size,
                 fetch_concurrency,
+                readme_concurrency,
                 discover_limit,
                 embed_batch_size: embed_provider.batch_size(embed_batch_size),
                 embed_delay_ms: 50,

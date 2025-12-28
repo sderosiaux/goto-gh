@@ -13,12 +13,6 @@ use crate::proxy::ProxyManager;
 /// Maximum repos per GraphQL query chunk
 const GRAPHQL_CHUNK_SIZE: usize = 50;
 
-/// Number of proxies to race in parallel
-const PROXY_PARALLEL_COUNT: usize = 5;
-
-/// Maximum rounds of proxy rotation before giving up
-const PROXY_MAX_ROUNDS: usize = 10;
-
 /// Retry configuration
 pub struct RetryConfig {
     pub max_attempts: u32,
@@ -199,110 +193,99 @@ impl GitHubClient {
         self.send_request_via_proxy_inner(url, proxy, true).await
     }
 
-    /// Try request through proxies - uses sticky proxy if available, otherwise races multiple proxies
+    /// Try request through proxies - one proxy per request with automatic blacklisting
+    /// Only blacklists on connection errors, not rate limits (tracks reset time from headers)
     async fn try_with_proxies(&self, url: &str, pm: &ProxyManager) -> Result<(reqwest::Response, Option<String>), String> {
-        // First, try the sticky proxy if we have one (with retry for timeouts)
-        if let Some(sticky_proxy) = pm.get_current_proxy() {
-            for retry in 0..2 {
-                match self.send_request_via_proxy(url, &sticky_proxy).await {
-                    Ok(response) => {
-                        let status = response.status();
+        // Try up to 3 rounds (with potential waiting between rounds)
+        for round in 0..3 {
+            // Check if we have any proxies left
+            if pm.is_empty() {
+                return Err("All proxies blacklisted".to_string());
+            }
 
-                        // Success or expected errors (404, etc.) - proxy worked, keep it sticky
-                        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-                            return Ok((response, Some(sticky_proxy)));
-                        }
-
-                        // Rate limit via this proxy - clear sticky and try others
-                        if status == reqwest::StatusCode::FORBIDDEN
-                            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                        {
-                            if self.debug {
-                                eprintln!("\x1b[33m[STICKY] {} rate limited, rotating...\x1b[0m", sticky_proxy);
-                            }
-                            pm.clear_current();
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let is_timeout = e.contains("timed out") || e.contains("timeout");
-                        if is_timeout && retry == 0 {
-                            // Retry once on timeout
-                            if self.debug {
-                                eprintln!("\x1b[33m[STICKY] {} timeout, retrying...\x1b[0m", sticky_proxy);
-                            }
-                            continue;
-                        }
-                        // Connection error or second timeout - clear sticky proxy
-                        if self.debug {
-                            eprintln!("\x1b[33m[STICKY] {} failed ({}), rotating...\x1b[0m", sticky_proxy, e);
-                        }
-                        pm.clear_current();
-                        break;
+            // Try to get an available proxy
+            let proxy = match pm.get_next() {
+                Some(p) => p,
+                None => {
+                    // All proxies are rate-limited, wait for the earliest one to reset
+                    if let Some(wait_secs) = pm.seconds_until_available() {
+                        let wait_secs = wait_secs.min(120); // Cap at 2 minutes
+                        // Coordinated waiting - only print message every 5 seconds
+                        pm.try_start_waiting(wait_secs);
+                        tokio::time::sleep(std::time::Duration::from_secs(wait_secs + 1)).await;
+                        pm.done_waiting();
+                        continue; // Try again after waiting
+                    } else {
+                        return Err("No proxies available".to_string());
                     }
                 }
-            }
-        }
+            };
 
-        // Race multiple proxies in parallel - first successful response wins
-        for _round in 0..PROXY_MAX_ROUNDS {
-            // Get batch of proxies to try
-            let mut proxies_to_try = Vec::with_capacity(PROXY_PARALLEL_COUNT);
-            for _ in 0..PROXY_PARALLEL_COUNT {
-                if let Some(p) = pm.get_next() {
-                    proxies_to_try.push(p);
-                }
-            }
-
-            if proxies_to_try.is_empty() {
-                return Err("No proxies available".to_string());
-            }
-
-            // Show what we're racing (compact)
-            if self.debug {
-                eprint!("\x1b[90m[RACE] {} proxies... \x1b[0m", proxies_to_try.len());
-                let _ = std::io::Write::flush(&mut std::io::stderr());
-            }
-
-            let race_start = std::time::Instant::now();
-
-            // Race all proxies in parallel (quiet mode - no per-request output)
-            let futures: Vec<_> = proxies_to_try
-                .iter()
-                .map(|proxy| {
-                    let proxy = proxy.clone();
-                    let url = url.to_string();
-                    async move {
-                        let result = self.send_request_via_proxy_inner(&url, &proxy, false).await;
-                        (proxy, result)
-                    }
-                })
-                .collect();
-
-            let results = futures::future::join_all(futures).await;
-
-            // Find first successful response
-            for (proxy, result) in results {
-                if let Ok(response) = result {
+            match self.send_request_via_proxy(url, &proxy).await {
+                Ok(response) => {
                     let status = response.status();
 
                     // Success or expected errors (404, etc.) - proxy worked
                     if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-                        if self.debug {
-                            eprintln!("\x1b[32m{} won ({}ms)\x1b[0m", proxy, race_start.elapsed().as_millis());
-                        }
-                        pm.mark_working(&proxy);
+                        pm.reset_failures(&proxy);
                         return Ok((response, Some(proxy)));
                     }
-                }
-            }
 
-            if self.debug {
-                eprintln!("\x1b[90mall failed ({}ms)\x1b[0m", race_start.elapsed().as_millis());
+                    // Rate limit - extract reset time from headers and mark proxy
+                    if status == reqwest::StatusCode::FORBIDDEN
+                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    {
+                        // Try to get X-RateLimit-Reset header
+                        if let Some(reset_header) = response.headers().get("x-ratelimit-reset") {
+                            if let Ok(reset_str) = reset_header.to_str() {
+                                if let Ok(reset_timestamp) = reset_str.parse::<u64>() {
+                                    pm.mark_rate_limited(&proxy, reset_timestamp);
+                                    if self.debug {
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_secs();
+                                        let wait = if reset_timestamp > now { reset_timestamp - now } else { 0 };
+                                        eprintln!(
+                                            "\x1b[33m[proxy]\x1b[0m {} rate limited for {}s",
+                                            proxy, wait
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        // No reset header, use default 60s
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        pm.mark_rate_limited(&proxy, now + 60);
+                        if self.debug {
+                            eprintln!("\x1b[33m[proxy]\x1b[0m {} rate limited (default 60s)", proxy);
+                        }
+                        continue;
+                    }
+
+                    // Other HTTP errors (5xx, etc.) - record failure
+                    if self.debug {
+                        eprintln!("\x1b[33m[proxy]\x1b[0m {} returned {}", proxy, status);
+                    }
+                    pm.record_failure(&proxy);
+                    continue;
+                }
+                Err(e) => {
+                    // Connection error, timeout, etc. - THIS is a real failure
+                    if self.debug {
+                        eprintln!("\x1b[31m[proxy]\x1b[0m {} failed: {}", proxy, e);
+                    }
+                    pm.record_failure(&proxy);
+                    continue;
+                }
             }
         }
 
-        Err(format!("All {} proxy attempts failed", PROXY_MAX_ROUNDS * PROXY_PARALLEL_COUNT))
+        Err("All proxy attempts failed".to_string())
     }
 
     /// Get repository details
@@ -989,9 +972,6 @@ impl GitHubClient {
             }
             pushedAt
             createdAt
-            readme: object(expression: "HEAD:README.md") {
-              ... on Blob { text }
-            }
         "#;
 
         let repo_queries: Vec<String> = repo_names
@@ -1042,11 +1022,8 @@ impl GitHubClient {
         let pushed_at = value.get("pushedAt").and_then(|v| v.as_str()).map(String::from);
         let created_at = value.get("createdAt").and_then(|v| v.as_str()).map(String::from);
 
-        let readme = value
-            .get("readme")
-            .and_then(|v| v.get("text"))
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        // README is now fetched separately via fetch-missing-readmes (REST API)
+        let readme = None;
 
         // Reconstruct URL from nameWithOwner
         let html_url = format!("https://github.com/{}", name_with_owner);
@@ -1139,6 +1116,11 @@ impl GitHubClient {
 
                     let req_start = std::time::Instant::now();
 
+                    if gh_client.debug && attempt == 0 {
+                        eprintln!("\x1b[90m[graphql]\x1b[0m chunk {}/{} ({} repos)...",
+                            chunk_idx + 1, total_chunks, chunk.len());
+                    }
+
                     // Send raw GraphQL query (no variables needed)
                     let request_body = serde_json::json!({ "query": query });
                     let response = match gh_client.client
@@ -1225,6 +1207,15 @@ impl GitHubClient {
                         if remaining < 500 {
                             eprintln!("\x1b[33m[fetch]\x1b[0m ⚠ GraphQL quota low: {} remaining", remaining);
                         }
+
+                        // Log chunk completion with timing and rate limit info
+                        if gh_client.debug {
+                            eprintln!("\x1b[90m[graphql]\x1b[0m chunk {}/{} done: {} repos in {}ms (cost: {}, remaining: {})",
+                                chunk_idx + 1, total_chunks, repos.len(), req_elapsed.as_millis(), cost, remaining);
+                        }
+                    } else if gh_client.debug {
+                        eprintln!("\x1b[90m[graphql]\x1b[0m chunk {}/{} done: {} repos in {}ms",
+                            chunk_idx + 1, total_chunks, repos.len(), req_elapsed.as_millis());
                     }
 
                     return Ok(repos);

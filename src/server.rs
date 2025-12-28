@@ -20,9 +20,12 @@ use crate::proxy::ProxyManager;
 /// Server configuration
 #[derive(Clone)]
 pub struct ServerConfig {
-    // Fetch settings
+    // Fetch settings (GraphQL - metadata only)
     pub fetch_batch_size: usize,
     pub fetch_concurrency: usize,
+
+    // Readme settings (REST API - README content)
+    pub readme_concurrency: usize,
 
     // Discover settings
     pub discover_limit: usize,
@@ -43,6 +46,7 @@ impl Default for ServerConfig {
         Self {
             fetch_batch_size: 300,
             fetch_concurrency: 2,
+            readme_concurrency: 20,
             discover_limit: 50,
             embed_batch_size: 200,
             embed_delay_ms: 50,
@@ -103,6 +107,7 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
     {
         let db = state.open_db()?;
         let without_metadata = db.count_repos_without_metadata()?;
+        let without_readme = db.count_repos_without_readme()?;
         let without_embeddings = db.count_repos_without_embeddings()?;
         let unexplored = db.count_unexplored_owners()?;
 
@@ -112,13 +117,14 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         eprintln!();
         eprintln!("  \x1b[90mQueue status:\x1b[0m");
         eprintln!("    {} repos need metadata (fetch)", without_metadata);
+        eprintln!("    {} repos need README (readme)", without_readme);
         eprintln!("    {} repos need embeddings (embed)", without_embeddings);
         eprintln!("    {} owners to explore (discover)", unexplored);
         eprintln!();
         if token_count > 1 {
             eprintln!("  \x1b[90mTokens:\x1b[0m {} ({}x throughput)", token_count, token_count);
         }
-        eprintln!("  \x1b[90mWorkers:\x1b[0m fetch x{}, discover, embed", token_count.max(1));
+        eprintln!("  \x1b[90mWorkers:\x1b[0m fetch x{}, readme, discover, embed", token_count.max(1));
         eprintln!();
         eprintln!("  \x1b[33mPress Ctrl+C to stop gracefully\x1b[0m");
         eprintln!();
@@ -178,6 +184,17 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         rt.block_on(run_embed_worker_loop(embed_state, embed_shutdown));
     });
 
+    // Readme worker (REST API for README content)
+    let readme_shutdown = shutdown.clone();
+    let readme_state = state.clone();
+    let readme_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(run_readme_worker_loop(readme_state, readme_shutdown));
+    });
+
     // Wait for Ctrl+C
     tokio::signal::ctrl_c().await?;
     eprintln!("\n\x1b[33m!\x1b[0m Shutting down workers...");
@@ -191,6 +208,7 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
     }
     let _ = discover_handle.join();
     let _ = embed_handle.join();
+    let _ = readme_handle.join();
 
     // Final checkpoint
     if let Ok(db) = Database::open() {
@@ -418,4 +436,112 @@ async fn run_embed_cycle(state: &ServerState, shutdown: &AtomicBool) -> Result<b
         }
         Err(e) => Err(e),
     }
+}
+
+/// Readme worker loop - fetches README content via REST API
+async fn run_readme_worker_loop(state: Arc<ServerState>, shutdown: Arc<AtomicBool>) {
+    eprintln!("\x1b[32m[readme]\x1b[0m Worker started");
+
+    while !shutdown.load(Ordering::SeqCst) {
+        match run_readme_cycle(&state, &shutdown).await {
+            Ok(had_work) => {
+                if !had_work {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+            }
+            Err(e) => {
+                eprintln!("\x1b[32m[readme]\x1b[0m \x1b[31mError: {}\x1b[0m", e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+
+    eprintln!("\x1b[32m[readme]\x1b[0m Shutting down");
+}
+
+/// Readme cycle - fetch README for repos that need it
+async fn run_readme_cycle(state: &ServerState, shutdown: &AtomicBool) -> Result<bool> {
+    use futures::stream::{self, StreamExt};
+
+    let db = state.open_db()?;
+    let client = state.create_github_client()?;
+
+    let need_readme = db.count_repos_without_readme()?;
+    if need_readme == 0 {
+        return Ok(false);
+    }
+
+    // Process in batches
+    let batch_size = 100;
+    let repos = db.get_repos_without_readme(Some(batch_size))?;
+    if repos.is_empty() {
+        return Ok(false);
+    }
+
+    let concurrency = state.config.readme_concurrency;
+
+    #[derive(Debug)]
+    enum ReadmeResult {
+        Found(String),
+        NotFound,
+        Error(String),
+    }
+
+    let mut fetched = 0;
+    let mut not_found = 0;
+    let mut discovered = 0;
+
+    let mut result_stream = stream::iter(repos)
+        .map(|(repo_id, full_name)| {
+            let client = client.clone();
+            async move {
+                match client.get_readme(&full_name).await {
+                    Ok(Some(readme)) => (repo_id, full_name, ReadmeResult::Found(readme)),
+                    Ok(None) => (repo_id, full_name, ReadmeResult::NotFound),
+                    Err(e) => (repo_id, full_name, ReadmeResult::Error(e.to_string())),
+                }
+            }
+        })
+        .buffer_unordered(concurrency);
+
+    while let Some((repo_id, full_name, result)) = result_stream.next().await {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        match result {
+            ReadmeResult::Found(content) => {
+                if let Err(e) = db.update_repo_readme(repo_id, &content) {
+                    eprintln!("\x1b[32m[readme]\x1b[0m \x1b[31m{} db error: {}\x1b[0m", full_name, e);
+                } else {
+                    // Extract linked repos from README
+                    let found = fetch::discover_repos_from_readme(&db, &content);
+                    discovered += found;
+                    let _ = db.mark_repos_extracted(repo_id);
+                    fetched += 1;
+                }
+            }
+            ReadmeResult::NotFound => {
+                let _ = db.mark_repo_no_readme(repo_id);
+                not_found += 1;
+            }
+            ReadmeResult::Error(_) => {
+                // Don't mark as no_readme, we'll retry later
+            }
+        }
+    }
+
+    if fetched > 0 || not_found > 0 {
+        let discovered_info = if discovered > 0 {
+            format!(", +{} discovered", discovered)
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "\x1b[32m[readme]\x1b[0m +{} READMEs ({} not found{}) [{} remaining]",
+            fetched, not_found, discovered_info, need_readme.saturating_sub(fetched + not_found)
+        );
+    }
+
+    Ok(fetched > 0 || not_found > 0)
 }
