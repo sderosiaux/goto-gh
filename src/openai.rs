@@ -199,7 +199,7 @@ impl OpenAIClient {
                     let now = chrono::Local::now().format("%H:%M:%S%.3f");
                     let retry_info = if attempt > 0 { format!(" (retry {})", attempt) } else { String::new() };
                     eprintln!(
-                        "\x1b[90m[{}] POST /v1/embeddings ({} texts) ... {}ms{}\x1b[0m",
+                        "\x1b[90m[{}] POST https://api.openai.com/v1/embeddings ({} repos) ... {}ms{}\x1b[0m",
                         now, texts.len(), elapsed.as_millis(), retry_info
                     );
                 }

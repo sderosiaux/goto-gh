@@ -428,13 +428,13 @@ impl GitHubClient {
             .unwrap_or_else(|| "??:??".to_string());
 
         eprintln!(
-            "  \x1b[33m⏸ {} rate limit low ({}/{}), waiting {}m{}s for reset (at {})...\x1b[0m",
-            api_name, rate.remaining, rate.limit, wait_mins, wait_remainder, reset_time
+            "\x1b[33m[{}]\x1b[0m ⏸ rate limit low ({}/{}), waiting {}m{}s for reset (at {})...",
+            api_name.to_lowercase(), rate.remaining, rate.limit, wait_mins, wait_remainder, reset_time
         );
 
         tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
 
-        eprintln!("  \x1b[32m▶ Rate limit reset, resuming\x1b[0m");
+        eprintln!("\x1b[32m[{}]\x1b[0m ▶ Rate limit reset, resuming", api_name.to_lowercase());
     }
 
     /// Check rate limit and wait if necessary
@@ -461,14 +461,14 @@ impl GitHubClient {
             }
 
             // We have quota but got an error - just do a short backoff
-            eprintln!("  \x1b[33m⏸ Got rate limit error but have {}/{} quota, backing off {}s...\x1b[0m",
+            eprintln!("\x1b[33m[graphql]\x1b[0m ⏸ rate limit error ({}/{} quota), backing off {}s...",
                 rate.remaining, rate.limit, fallback_wait_secs);
             tokio::time::sleep(Duration::from_secs(fallback_wait_secs)).await;
             return true;
         }
 
         // Fallback: wait fixed time if we can't get rate limit info
-        eprintln!("  \x1b[33m⏸ Rate limited, waiting {}s...\x1b[0m", fallback_wait_secs);
+        eprintln!("\x1b[33m[graphql]\x1b[0m ⏸ rate limited, waiting {}s...", fallback_wait_secs);
         tokio::time::sleep(Duration::from_secs(fallback_wait_secs)).await;
         true
     }
@@ -607,7 +607,7 @@ impl GitHubClient {
                 if status == reqwest::StatusCode::FORBIDDEN {
                     if let Some(ref pm) = self.proxy_manager {
                         // Try via proxy rotation
-                        eprintln!("  \x1b[33m⏸ Rate limited, switching to proxy rotation...\x1b[0m");
+                        eprintln!("\x1b[33m[rest]\x1b[0m ⏸ rate limited, switching to proxy rotation...");
                         match self.try_with_proxies(&url, pm).await {
                             Ok((proxy_response, _proxy)) => {
                                 let proxy_status = proxy_response.status();
@@ -635,7 +635,7 @@ impl GitHubClient {
                     if let Ok(rates) = self.rate_limit().await {
                         self.wait_for_rate_limit(&rates.core, "REST API", 10).await;
                     } else {
-                        eprintln!("  \x1b[33m⏸ Rate limited, waiting 60s...\x1b[0m");
+                        eprintln!("\x1b[33m[rest]\x1b[0m ⏸ rate limited, waiting 60s...");
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     }
                     continue;
@@ -791,7 +791,7 @@ impl GitHubClient {
                 if status == reqwest::StatusCode::FORBIDDEN {
                     if let Some(ref pm) = self.proxy_manager {
                         // Try via proxy rotation
-                        eprintln!("  \x1b[33m⏸ Rate limited, switching to proxy rotation...\x1b[0m");
+                        eprintln!("\x1b[33m[rest]\x1b[0m ⏸ rate limited, switching to proxy rotation...");
                         match self.try_with_proxies(&url, pm).await {
                             Ok((proxy_response, _proxy)) => {
                                 let proxy_status = proxy_response.status();
@@ -819,7 +819,7 @@ impl GitHubClient {
                     if let Ok(rates) = self.rate_limit().await {
                         self.wait_for_rate_limit(&rates.core, "REST API", 10).await;
                     } else {
-                        eprintln!("  \x1b[33m⏸ Rate limited, waiting 60s...\x1b[0m");
+                        eprintln!("\x1b[33m[rest]\x1b[0m ⏸ rate limited, waiting 60s...");
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     }
                     continue;
@@ -1108,9 +1108,11 @@ impl GitHubClient {
                     if attempt > 0 {
                         let delay_ms = 500 * (1 << attempt.min(3));
                         let delay = std::time::Duration::from_millis(delay_ms);
-                        eprintln!("  \x1b[33m⟳ Retry {}/5 for chunk {} after {}ms ({})\x1b[0m",
-                            attempt + 1, chunk_idx + 1, delay_ms,
-                            last_error.as_deref().unwrap_or("unknown"));
+                        if gh_client.debug {
+                            eprintln!("\x1b[33m[graphql]\x1b[0m ⟳ retry {}/5 chunk {} ({})",
+                                attempt + 1, chunk_idx + 1,
+                                last_error.as_deref().unwrap_or("unknown"));
+                        }
                         tokio::time::sleep(delay).await;
                     }
 
@@ -1176,16 +1178,8 @@ impl GitHubClient {
                             continue;
                         }
 
-                        // Log non-fatal errors (e.g., "Could not resolve to a Repository")
-                        // These are expected for deleted/renamed repos
-                        if gh_client.debug && !msgs.is_empty() {
-                            let not_found_count = errors.iter()
-                                .filter(|e| e.message.contains("Could not resolve"))
-                                .count();
-                            if not_found_count > 0 {
-                                eprintln!("  \x1b[90m({} repos not found)\x1b[0m", not_found_count);
-                            }
-                        }
+                        // Non-fatal errors (e.g., "Could not resolve to a Repository")
+                        // These are expected for deleted/renamed repos - no need to log
                     }
 
                     // Parse repos from dynamic JSON response
@@ -1202,25 +1196,13 @@ impl GitHubClient {
                             (cost, remaining)
                         });
 
-                    // Atomic debug output (single line, parallel-safe)
-                    let done = completed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    let with_readme = repos.iter().filter(|r| r.readme.is_some()).count();
-
-                    // Include rate limit info in debug output
-                    let rate_info = rate_limit_info
-                        .map(|(cost, remaining)| format!(", cost={} rem={}", cost, remaining))
-                        .unwrap_or_default();
-
-                    eprintln!("  \x1b[90m✓ [{}/{}] {}ms - {} repos ({} README){}{}\x1b[0m",
-                        done, total_chunks, req_elapsed.as_millis(),
-                        repos.len(), with_readme,
-                        if attempt > 0 { format!(", {} retries", attempt) } else { String::new() },
-                        rate_info);
+                    // Track completion for summary
+                    completed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                     // Warn if approaching rate limit (< 500 points remaining)
                     if let Some((cost, remaining)) = rate_limit_info {
                         if remaining < 500 {
-                            eprintln!("  \x1b[33m⚠ GraphQL quota low: {} points remaining (cost was {})\x1b[0m", remaining, cost);
+                            eprintln!("\x1b[33m[fetch]\x1b[0m ⚠ GraphQL quota low: {} remaining", remaining);
                         }
                     }
 
@@ -1251,17 +1233,18 @@ impl GitHubClient {
             }
         }
 
-        // Log batch summary
+        // Log batch summary - always show for visibility
         let batch_elapsed = batch_start.elapsed();
-        if batch_elapsed.as_secs() >= 2 || total_chunks > 1 {
-            let throughput = if batch_elapsed.as_secs_f32() > 0.0 {
-                (repo_names.len() as f32 / batch_elapsed.as_secs_f32()) as u32
-            } else {
-                0
-            };
-            eprintln!("  \x1b[90m⏱ GraphQL batch: {} repos in {:.1}s ({} chunks parallel, ~{} repos/s)\x1b[0m",
-                repo_names.len(), batch_elapsed.as_secs_f32(), total_chunks, throughput);
-        }
+        let throughput = if batch_elapsed.as_secs_f32() > 0.0 {
+            (repo_names.len() as f32 / batch_elapsed.as_secs_f32()) as u32
+        } else {
+            0
+        };
+        let now = chrono::Local::now().format("%H:%M:%S%.3f");
+        eprintln!(
+            "\x1b[90m[{}] POST https://api.github.com/graphql ({} repos, {} chunks) ... {}ms (~{}/s)\x1b[0m",
+            now, repo_names.len(), total_chunks, batch_elapsed.as_millis(), throughput
+        );
 
         if had_error && all_repos.is_empty() {
             anyhow::bail!("All chunks failed");

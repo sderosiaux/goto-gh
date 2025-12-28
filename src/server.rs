@@ -252,9 +252,15 @@ async fn run_fetch_cycle(state: &ServerState, shutdown: &AtomicBool) -> Result<b
         &db,
         &config,
         |progress| {
+            // Summary after each batch (similar to discover/embed)
+            let discovered_info = if progress.discovered_this_batch > 0 {
+                format!(", +{} discovered", progress.discovered_this_batch)
+            } else {
+                String::new()
+            };
             eprintln!(
-                "\x1b[36m[fetch]\x1b[0m Batch {}: {} repos...",
-                progress.batch_num, progress.batch_size
+                "\x1b[36m[fetch]\x1b[0m +{} repos{}",
+                progress.fetched_this_batch, discovered_info
             );
         },
         || shutdown.load(Ordering::SeqCst),
@@ -263,13 +269,11 @@ async fn run_fetch_cycle(state: &ServerState, shutdown: &AtomicBool) -> Result<b
 
     match result {
         Ok(run_result) => {
-            if run_result.total_fetched > 0 || run_result.total_gone > 0 {
+            if run_result.total_fetched > 0 && state.config.debug {
                 eprintln!(
                     "\x1b[36m[fetch]\x1b[0m Done: {} fetched, {} gone",
                     run_result.total_fetched, run_result.total_gone
                 );
-            } else if state.config.debug {
-                eprintln!("\x1b[36m[fetch]\x1b[0m \x1b[90mNo repos to fetch\x1b[0m");
             }
             Ok(run_result.total_fetched > 0 || run_result.total_gone > 0)
         }
