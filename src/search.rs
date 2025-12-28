@@ -2,11 +2,12 @@
 //!
 //! Combines semantic (vector), name matching, and keyword search for optimal results.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 
 use crate::db::Database;
 use crate::embedding::embed_query;
+use crate::openai::OPENAI_EMBEDDING_DIM;
 use crate::formatting::{format_repo_link, format_stars, truncate_str, Dots};
 
 /// Reciprocal Rank Fusion (RRF) weights for hybrid search
@@ -142,7 +143,48 @@ pub fn search(query: &str, limit: usize, semantic_only: bool, db: &Database) -> 
     let dots = Dots::start(&format!("Searching {} repos ({})", indexed, mode));
 
     // 1. Semantic search via embeddings
-    let query_embedding = embed_query(query)?;
+    // Detect provider from DB embedding dimension
+    let current_dim = db.get_embedding_dimension()?;
+    let query_embedding = match current_dim {
+        Some(dim) if dim == OPENAI_EMBEDDING_DIM => {
+            // OpenAI embeddings - no prefix needed, but we need to call OpenAI API
+            // For now, fall back to returning empty if OpenAI was used
+            // (sync search can't easily call async OpenAI API)
+            eprintln!("\x1b[33m!\x1b[0m OpenAI embeddings detected - semantic search requires OPENAI_API_KEY");
+            if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+                // Use blocking reqwest for sync context
+                let client = reqwest::blocking::Client::new();
+                let response = client
+                    .post("https://api.openai.com/v1/embeddings")
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("Content-Type", "application/json")
+                    .json(&serde_json::json!({
+                        "model": "text-embedding-3-small",
+                        "input": [query]
+                    }))
+                    .send()?;
+
+                if !response.status().is_success() {
+                    anyhow::bail!("OpenAI API error: {}", response.status());
+                }
+
+                let result: serde_json::Value = response.json()?;
+                let embedding: Vec<f32> = result["data"][0]["embedding"]
+                    .as_array()
+                    .context("Invalid OpenAI response")?
+                    .iter()
+                    .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                    .collect();
+                embedding
+            } else {
+                anyhow::bail!("OPENAI_API_KEY not set - required for searching OpenAI embeddings");
+            }
+        }
+        _ => {
+            // E5 embeddings - use query prefix
+            embed_query(query)?
+        }
+    };
     let vector_results = db.find_similar(&query_embedding, limit * 3)?;
 
     // 2. Name match search (strongest signal - repos with query in name)

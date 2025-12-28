@@ -341,6 +341,42 @@ impl Database {
         Ok(count)
     }
 
+    /// Recreate the embeddings table with a new dimension
+    /// This drops all existing embeddings!
+    pub fn recreate_embeddings_table(&self, dim: usize) -> Result<()> {
+        self.conn.execute("DROP TABLE IF EXISTS repo_embeddings", [])?;
+        self.conn.execute(
+            &format!(
+                "CREATE VIRTUAL TABLE repo_embeddings USING vec0(
+                    repo_id INTEGER PRIMARY KEY,
+                    embedding FLOAT[{}]
+                )",
+                dim
+            ),
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Get the current embedding dimension from the table
+    pub fn get_embedding_dimension(&self) -> Result<Option<usize>> {
+        // Try to get a sample embedding to check dimensions
+        let result: Option<Vec<u8>> = self.conn.query_row(
+            "SELECT embedding FROM repo_embeddings LIMIT 1",
+            [],
+            |row| row.get(0),
+        ).ok();
+
+        if let Some(bytes) = result {
+            // Each f32 is 4 bytes
+            Ok(Some(bytes.len() / 4))
+        } else {
+            // No embeddings yet, check table schema
+            // vec0 tables don't expose dimension easily, so return None if empty
+            Ok(None)
+        }
+    }
+
     /// Find most similar repos to a query embedding
     pub fn find_similar(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<(i64, f32)>> {
         let mut stmt = self.conn.prepare(

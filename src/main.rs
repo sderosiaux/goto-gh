@@ -5,11 +5,12 @@ mod embedding;
 mod formatting;
 mod github;
 mod http;
+mod openai;
 mod papers;
 mod proxy;
 mod search;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::time::Duration;
 
@@ -116,21 +117,29 @@ enum Commands {
 
     /// Generate embeddings for repos that don't have them yet
     Embed {
-        /// Batch size for embedding (default: 200)
-        #[arg(short, long, default_value = "200")]
-        batch_size: usize,
+        /// Batch size for embedding (default: 200 for local, 2000 for openai)
+        #[arg(short, long)]
+        batch_size: Option<usize>,
 
         /// Maximum repos to embed (default: all)
         #[arg(short, long)]
         limit: Option<usize>,
 
-        /// Delay between batches in seconds (default: 5)
-        #[arg(short, long, default_value = "5")]
+        /// Delay between batches in seconds (default: 0)
+        #[arg(short, long, default_value = "0")]
         delay: u64,
 
         /// Clear all existing embeddings first (re-embed everything)
         #[arg(long)]
         reset: bool,
+
+        /// Embedding provider: "local" (E5, default) or "openai" (text-embedding-3-small)
+        #[arg(long, default_value = "local")]
+        provider: String,
+
+        /// Show API calls for debugging
+        #[arg(long)]
+        debug: bool,
     },
 
     /// Print database file path
@@ -183,6 +192,9 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load .env file if present (silently ignore if missing)
+    let _ = dotenvy::dotenv();
+
     let cli = Cli::parse();
     let db = Database::open()?;
 
@@ -258,8 +270,8 @@ async fn run_main(cli: Cli, db: Database) -> Result<()> {
             let config = FetchConfig { limit, batch_size, concurrency, debug };
             fetch_from_db(&client, &db, &config).await
         }
-        Some(Commands::Embed { batch_size, limit, delay, reset }) => {
-            embed_missing(&db, batch_size, limit, delay, reset)
+        Some(Commands::Embed { batch_size, limit, delay, reset, provider, debug }) => {
+            embed_missing(&db, batch_size, limit, delay, reset, &provider, debug).await
         }
         Some(Commands::DbPath) => {
             println!("{}", Config::db_path()?.display());
@@ -685,10 +697,50 @@ async fn fetch_from_db(
 }
 
 /// Generate embeddings for repos that don't have them yet
-fn embed_missing(db: &Database, batch_size: usize, limit: Option<usize>, delay_secs: u64, reset: bool) -> Result<()> {
+async fn embed_missing(
+    db: &Database,
+    batch_size: Option<usize>,
+    limit: Option<usize>,
+    delay_secs: u64,
+    reset: bool,
+    provider: &str,
+    debug: bool,
+) -> Result<()> {
+    use crate::openai::{OpenAIClient, OPENAI_EMBEDDING_DIM};
+    use crate::embedding::EMBEDDING_DIM;
+
+    // Auto-detect provider from existing embeddings if not resetting
+    let current_dim = db.get_embedding_dimension()?;
+    let (provider, is_openai) = if !reset {
+        if let Some(dim) = current_dim {
+            if dim == OPENAI_EMBEDDING_DIM {
+                if provider == "local" {
+                    eprintln!("\x1b[36m..\x1b[0m Auto-detected OpenAI embeddings (1536d) - using --provider openai");
+                }
+                ("openai", true)
+            } else if dim == EMBEDDING_DIM {
+                if provider == "openai" {
+                    eprintln!("\x1b[36m..\x1b[0m Auto-detected local E5 embeddings (384d) - using --provider local");
+                }
+                ("local", false)
+            } else {
+                (provider, provider == "openai")
+            }
+        } else {
+            (provider, provider == "openai")
+        }
+    } else {
+        (provider, provider == "openai")
+    };
+
+    let target_dim = if is_openai { OPENAI_EMBEDDING_DIM } else { EMBEDDING_DIM };
+    let default_batch = if is_openai { 2000 } else { 200 };
+    let batch_size = batch_size.unwrap_or(default_batch);
+
+    // Recreate table if reset requested
     if reset {
-        let count = db.clear_all_embeddings()?;
-        eprintln!("\x1b[33m!\x1b[0m Cleared {} existing embeddings", count);
+        eprintln!("\x1b[33m!\x1b[0m Recreating embeddings table with {} dimensions ({})", target_dim, provider);
+        db.recreate_embeddings_table(target_dim)?;
     }
 
     let need_embed = db.count_repos_without_embeddings()?;
@@ -700,15 +752,37 @@ fn embed_missing(db: &Database, batch_size: usize, limit: Option<usize>, delay_s
 
     let to_process = limit.map(|l| l.min(need_embed)).unwrap_or(need_embed);
     eprintln!(
-        "\x1b[36m..\x1b[0m Generating embeddings for {} repos (batch size: {})",
-        to_process, batch_size
+        "\x1b[36m..\x1b[0m Generating embeddings for {} repos (provider: {}, batch: {})",
+        to_process, provider, batch_size
     );
 
+    // Estimate cost for OpenAI
+    if is_openai {
+        // Rough estimate: 500 tokens per repo average
+        let estimated_tokens = to_process as f64 * 500.0;
+        let estimated_cost = estimated_tokens / 1_000_000.0 * 0.02; // $0.02/1M tokens
+        eprintln!(
+            "    \x1b[33mEstimated cost: ${:.2}\x1b[0m (~{:.0}M tokens)",
+            estimated_cost,
+            estimated_tokens / 1_000_000.0
+        );
+    }
+
     let mut total_embedded = 0;
-    let mut offset = 0;
+    let mut total_tokens = 0u32;
+    let mut batch_num = 0;
+    let start_time = std::time::Instant::now();
+
+    // Initialize OpenAI client if needed
+    let openai_client = if is_openai {
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .context("OPENAI_API_KEY environment variable not set")?;
+        Some(OpenAIClient::new(api_key, debug))
+    } else {
+        None
+    };
 
     while total_embedded < to_process {
-        // Fetch a batch of repos without embeddings
         let remaining = to_process - total_embedded;
         let this_batch_size = remaining.min(batch_size);
 
@@ -719,18 +793,24 @@ fn embed_missing(db: &Database, batch_size: usize, limit: Option<usize>, delay_s
         }
 
         let batch_len = repos.len();
+        batch_num += 1;
         eprintln!(
             "\x1b[36m..\x1b[0m Batch {}: embedding {} repos...",
-            offset / batch_size + 1,
+            batch_num,
             batch_len
         );
 
-        // Extract texts for batch embedding
         let texts: Vec<String> = repos.iter().map(|(_, text)| text.clone()).collect();
         let repo_ids: Vec<i64> = repos.iter().map(|(id, _)| *id).collect();
 
-        // Generate embeddings in batch
-        let embeddings = embed_passages(&texts)?;
+        // Generate embeddings based on provider
+        let embeddings = if let Some(ref client) = openai_client {
+            let (embs, tokens) = client.embed_batch(&texts).await?;
+            total_tokens += tokens;
+            embs
+        } else {
+            embed_passages(&texts)?
+        };
 
         // Store embeddings
         for (repo_id, embedding) in repo_ids.into_iter().zip(embeddings) {
@@ -738,34 +818,68 @@ fn embed_missing(db: &Database, batch_size: usize, limit: Option<usize>, delay_s
         }
 
         total_embedded += batch_len;
-        offset += batch_len;
 
-        eprintln!(
-            "  ... embedded {} (total: {}/{})",
-            batch_len, total_embedded, to_process
-        );
+        // Calculate ETA
+        let elapsed = start_time.elapsed();
+        let eta = if total_embedded > 0 {
+            let rate = total_embedded as f64 / elapsed.as_secs_f64();
+            let remaining = to_process - total_embedded;
+            let eta_secs = remaining as f64 / rate;
+            format_duration(eta_secs as u64)
+        } else {
+            "calculating...".to_string()
+        };
 
-        // Pause between batches to avoid overloading the embedding API
-        // Note: embed_missing is sync, but this runs in tokio context via block_on
-        // Using std::thread::sleep is intentional here to not block other async tasks
+        if is_openai {
+            eprintln!(
+                "  ... embedded {} (total: {}/{}, tokens: {}, ETA: {})",
+                batch_len, total_embedded, to_process, total_tokens, eta
+            );
+        } else {
+            eprintln!(
+                "  ... embedded {} (total: {}/{}, ETA: {})",
+                batch_len, total_embedded, to_process, eta
+            );
+        }
+
         if total_embedded < to_process && delay_secs > 0 {
             eprintln!("  \x1b[90m⏳ Waiting {}s before next batch...\x1b[0m", delay_secs);
-            std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
         }
     }
 
-    eprintln!(
-        "\x1b[32mok\x1b[0m Generated embeddings for {} repos",
-        total_embedded
-    );
+    if is_openai {
+        let actual_cost = total_tokens as f64 / 1_000_000.0 * 0.02;
+        eprintln!(
+            "\x1b[32mok\x1b[0m Generated embeddings for {} repos ({} tokens, ${:.2})",
+            total_embedded, total_tokens, actual_cost
+        );
+    } else {
+        eprintln!(
+            "\x1b[32mok\x1b[0m Generated embeddings for {} repos",
+            total_embedded
+        );
+    }
 
-    // Show remaining
     let still_need = db.count_repos_without_embeddings()?;
     if still_need > 0 {
         eprintln!("\x1b[36m..\x1b[0m {} repos still awaiting embeddings", still_need);
     }
 
     Ok(())
+}
+
+/// Format seconds into human-readable duration (e.g., "1h 23m", "45m 12s")
+fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        format!("{}h {}m", hours, mins)
+    }
 }
 
 /// Discover and add repo stubs from a single README

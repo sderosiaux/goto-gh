@@ -108,7 +108,13 @@ pub fn build_embedding_text(
     let mut parts = vec![full_name.to_string()];
 
     if let Some(desc) = description {
-        parts.push(desc.to_string());
+        // Truncate description to 500 chars (GitHub UI limits to ~350, but API allows more)
+        if desc.len() > 500 {
+            let truncated: String = desc.chars().take(500).collect();
+            parts.push(truncated);
+        } else {
+            parts.push(desc.to_string());
+        }
     }
 
     if !topics.is_empty() {
