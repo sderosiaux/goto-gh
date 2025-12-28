@@ -14,6 +14,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Number of failures before a proxy is blacklisted
 const MAX_FAILURES: usize = 3;
 
+/// Known rotating proxy hostnames (each request uses different IP, never blacklist)
+const ROTATING_PROXY_HOSTS: &[&str] = &[
+    "superproxy.io",      // Bright Data
+    "oxylabs.io",         // Oxylabs
+    "smartproxy.com",     // Smartproxy
+    "proxy.webshare.io",  // Webshare
+    "iproyal.com",        // IPRoyal
+];
+
 /// Manages a pool of HTTP proxies with round-robin rotation and blacklisting.
 #[derive(Clone)]
 pub struct ProxyManager {
@@ -197,7 +206,13 @@ impl ProxyManager {
     }
 
     /// Mark a proxy as rate-limited until the given Unix timestamp
+    /// Rotating proxies are not rate-limited since each request uses different IP
     pub fn mark_rate_limited(&self, proxy: &str, reset_timestamp: u64) {
+        // Rotating proxies use different IP per request, no need to track rate limits
+        if Self::is_rotating_proxy(proxy) {
+            return;
+        }
+
         let mut inner = self.inner.lock().unwrap();
         inner.rate_limit_until.insert(proxy.to_string(), reset_timestamp);
     }
@@ -260,8 +275,20 @@ impl ProxyManager {
         inner.current_proxy = None;
     }
 
+    /// Check if a proxy is a rotating proxy (each request = different IP)
+    /// These should never be blacklisted since failures are transient
+    fn is_rotating_proxy(proxy: &str) -> bool {
+        ROTATING_PROXY_HOSTS.iter().any(|host| proxy.contains(host))
+    }
+
     /// Record a failure for a proxy. Returns true if the proxy was blacklisted.
+    /// Rotating proxies (Bright Data, etc.) are never blacklisted.
     pub fn record_failure(&self, proxy: &str) -> bool {
+        // Never blacklist rotating proxies - each request uses different IP
+        if Self::is_rotating_proxy(proxy) {
+            return false;
+        }
+
         let mut inner = self.inner.lock().unwrap();
 
         let count = inner.failures.entry(proxy.to_string()).or_insert(0);
