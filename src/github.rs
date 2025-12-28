@@ -943,7 +943,6 @@ impl GitHubClient {
         let repo_fragment = r#"
             nameWithOwner
             description
-            url
             stargazerCount
             primaryLanguage { name }
             repositoryTopics(first: 10) {
@@ -952,12 +951,6 @@ impl GitHubClient {
             pushedAt
             createdAt
             readme: object(expression: "HEAD:README.md") {
-              ... on Blob { text }
-            }
-            readme_lower: object(expression: "HEAD:readme.md") {
-              ... on Blob { text }
-            }
-            readme_rst: object(expression: "HEAD:README.rst") {
               ... on Blob { text }
             }
         "#;
@@ -987,7 +980,6 @@ impl GitHubClient {
     fn parse_repo_from_json(value: &serde_json::Value) -> Option<RepoWithReadme> {
         let name_with_owner = value.get("nameWithOwner")?.as_str()?.to_string();
         let description = value.get("description").and_then(|v| v.as_str()).map(String::from);
-        let url = value.get("url")?.as_str()?.to_string();
         let stars = value.get("stargazerCount")?.as_u64().unwrap_or(0);
         let language = value
             .get("primaryLanguage")
@@ -1011,29 +1003,19 @@ impl GitHubClient {
         let pushed_at = value.get("pushedAt").and_then(|v| v.as_str()).map(String::from);
         let created_at = value.get("createdAt").and_then(|v| v.as_str()).map(String::from);
 
-        // Try multiple README locations
         let readme = value
             .get("readme")
             .and_then(|v| v.get("text"))
             .and_then(|v| v.as_str())
-            .or_else(|| {
-                value
-                    .get("readme_lower")
-                    .and_then(|v| v.get("text"))
-                    .and_then(|v| v.as_str())
-            })
-            .or_else(|| {
-                value
-                    .get("readme_rst")
-                    .and_then(|v| v.get("text"))
-                    .and_then(|v| v.as_str())
-            })
             .map(String::from);
+
+        // Reconstruct URL from nameWithOwner
+        let html_url = format!("https://github.com/{}", name_with_owner);
 
         Some(RepoWithReadme {
             full_name: name_with_owner,
             description,
-            html_url: url,
+            html_url,
             stars,
             language,
             topics,
