@@ -199,6 +199,18 @@ enum Commands {
         force_proxy: bool,
     },
 
+    /// Extract linked repos from README content (discover new repos organically)
+    #[command(name = "extract-repos")]
+    ExtractRepos {
+        /// Maximum repos to process (default: all)
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Batch size for processing (default: 1000)
+        #[arg(short, long, default_value = "1000")]
+        batch_size: usize,
+    },
+
     /// Start HTTP server with SQL explorer interface
     #[command(hide = true)]
     Http {
@@ -385,6 +397,9 @@ async fn run_main(cli: Cli, db: Database) -> Result<()> {
 
             let client = GitHubClient::new_with_options(token.clone(), debug, proxy_manager, force_proxy);
             fetch_missing_readmes(&client, &db, limit, concurrency).await
+        }
+        Some(Commands::ExtractRepos { limit, batch_size }) => {
+            extract_repos(&db, limit, batch_size)
         }
         Some(Commands::Http { port }) => {
             http::start_server(db.path().to_path_buf(), port).await
@@ -1015,6 +1030,8 @@ async fn fetch_missing_readmes(
 
     let mut errors = 0;
 
+    let mut discovered = 0;
+
     while let Some((repo_id, full_name, result)) = result_stream.next().await {
         match result {
             ReadmeResult::Found(content) => {
@@ -1022,7 +1039,16 @@ async fn fetch_missing_readmes(
                 if let Err(e) = db.update_repo_readme(repo_id, &content) {
                     eprintln!("\x1b[31mx\x1b[0m {} - db error: {}", full_name, e);
                 } else {
-                    eprintln!("\x1b[32m✓\x1b[0m {} ({} bytes)", full_name, len);
+                    // Extract linked repos from README
+                    let found = fetch::discover_repos_from_readme(db, &content);
+                    discovered += found;
+                    let _ = db.mark_repos_extracted(repo_id);
+
+                    if found > 0 {
+                        eprintln!("\x1b[32m✓\x1b[0m {} ({} bytes, +{} repos)", full_name, len, found);
+                    } else {
+                        eprintln!("\x1b[32m✓\x1b[0m {} ({} bytes)", full_name, len);
+                    }
                     fetched += 1;
                 }
             }
@@ -1059,8 +1085,80 @@ async fn fetch_missing_readmes(
 
     if fetched > 0 {
         eprintln!("    {} repos now need re-embedding", fetched);
+        if discovered > 0 {
+            eprintln!("    {} new repos discovered from README links", discovered);
+        }
         eprintln!("    Run: goto-gh embed");
     }
+
+    Ok(())
+}
+
+/// Extract linked repos from README content (discover new repos organically)
+fn extract_repos(db: &Database, limit: Option<usize>, batch_size: usize) -> Result<()> {
+    use crate::fetch::discover_repos_from_readme;
+
+    let need_extraction = db.count_repos_needing_repo_extraction()?;
+
+    if need_extraction == 0 {
+        eprintln!("\x1b[32mok\x1b[0m All README content has been processed for repo discovery");
+        return Ok(());
+    }
+
+    let to_process = limit.map(|l| l.min(need_extraction)).unwrap_or(need_extraction);
+    eprintln!(
+        "\x1b[36m..\x1b[0m Extracting linked repos from {} READMEs (batch size: {})",
+        to_process, batch_size
+    );
+
+    let start = std::time::Instant::now();
+    let mut total_processed = 0;
+    let mut total_discovered = 0;
+
+    loop {
+        let remaining = limit.map(|l| l - total_processed).unwrap_or(batch_size);
+        if remaining == 0 {
+            break;
+        }
+
+        let repos = db.get_repos_needing_repo_extraction(Some(batch_size.min(remaining)))?;
+        if repos.is_empty() {
+            break;
+        }
+
+        let batch_count = repos.len();
+        let mut batch_discovered = 0;
+
+        for (repo_id, full_name, readme) in repos {
+            let discovered = discover_repos_from_readme(db, &readme);
+            batch_discovered += discovered;
+
+            db.mark_repos_extracted(repo_id)?;
+        }
+
+        total_processed += batch_count;
+        total_discovered += batch_discovered;
+
+        let elapsed = start.elapsed().as_secs_f64();
+        let rate = total_processed as f64 / elapsed;
+        eprintln!(
+            "  +{} repos from {} READMEs ({:.0}/s, {} total discovered)",
+            batch_discovered, batch_count, rate, total_discovered
+        );
+
+        if batch_count < batch_size {
+            break;
+        }
+    }
+
+    let elapsed = start.elapsed();
+    eprintln!(
+        "\x1b[32mok\x1b[0m Processed {} READMEs in {:.1}s",
+        total_processed,
+        elapsed.as_secs_f64()
+    );
+    eprintln!("    Discovered {} new repo stubs", total_discovered);
+    eprintln!("    Run: goto-gh fetch");
 
     Ok(())
 }

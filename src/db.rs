@@ -308,6 +308,16 @@ impl Database {
             self.conn.execute("ALTER TABLE repos ADD COLUMN papers_extracted_at TEXT", [])?;
         }
 
+        // Migration: add repos_extracted_at column for tracking README parsing for repo discovery
+        let has_repos_extracted: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('repos') WHERE name = 'repos_extracted_at'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_repos_extracted {
+            self.conn.execute("ALTER TABLE repos ADD COLUMN repos_extracted_at TEXT", [])?;
+        }
+
         Ok(())
     }
 
@@ -1437,6 +1447,64 @@ impl Database {
             params![readme, embedded_text, now, repo_id],
         )?;
 
+        Ok(())
+    }
+
+    // === Repo Extraction from READMEs ===
+
+    /// Get repos that need repo extraction from README
+    /// Returns (repo_id, full_name, readme_excerpt) for repos with README that haven't been parsed
+    pub fn get_repos_needing_repo_extraction(&self, limit: Option<usize>) -> Result<Vec<(i64, String, String)>> {
+        let sql = match limit {
+            Some(lim) => format!(
+                "SELECT id, full_name, readme_excerpt FROM repos
+                 WHERE readme_excerpt IS NOT NULL
+                   AND readme_excerpt != ''
+                   AND readme_excerpt != '[NO_README]'
+                   AND (repos_extracted_at IS NULL OR repos_extracted_at < last_indexed)
+                 LIMIT {}",
+                lim
+            ),
+            None => "SELECT id, full_name, readme_excerpt FROM repos
+                     WHERE readme_excerpt IS NOT NULL
+                       AND readme_excerpt != ''
+                       AND readme_excerpt != '[NO_README]'
+                       AND (repos_extracted_at IS NULL OR repos_extracted_at < last_indexed)".to_string(),
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let results = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Count repos needing repo extraction
+    pub fn count_repos_needing_repo_extraction(&self) -> Result<usize> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM repos
+             WHERE readme_excerpt IS NOT NULL
+               AND readme_excerpt != ''
+               AND readme_excerpt != '[NO_README]'
+               AND (repos_extracted_at IS NULL OR repos_extracted_at < last_indexed)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Mark a repo as having repos extracted from its README
+    pub fn mark_repos_extracted(&self, repo_id: i64) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE repos SET repos_extracted_at = ? WHERE id = ?",
+            params![now, repo_id],
+        )?;
         Ok(())
     }
 }

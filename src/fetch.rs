@@ -83,7 +83,7 @@ pub async fn fetch_batch(
 }
 
 /// Discover and add repo stubs from a README
-fn discover_repos_from_readme(db: &Database, readme: &str) -> usize {
+pub fn discover_repos_from_readme(db: &Database, readme: &str) -> usize {
     let linked = extract_github_repos(readme);
     if linked.is_empty() {
         return 0;
