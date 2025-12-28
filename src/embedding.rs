@@ -3,9 +3,58 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use std::sync::{Mutex, OnceLock};
 
 use crate::config::Config;
+use crate::openai::OPENAI_EMBEDDING_DIM;
 
 /// Vector dimension for MultilingualE5Small model
 pub const EMBEDDING_DIM: usize = 384;
+
+/// Embedding provider choice
+#[derive(Clone)]
+pub enum EmbedProvider {
+    /// Local E5 model (384 dimensions)
+    Local,
+    /// OpenAI text-embedding-3-small (1536 dimensions)
+    OpenAI { api_key: String },
+}
+
+impl EmbedProvider {
+    /// Parse provider from string, fetching API key from environment if needed
+    pub fn parse(provider: &str) -> Result<Self> {
+        if provider == "openai" {
+            let api_key = std::env::var("OPENAI_API_KEY")
+                .context("OPENAI_API_KEY environment variable required for --provider openai")?;
+            Ok(EmbedProvider::OpenAI { api_key })
+        } else {
+            Ok(EmbedProvider::Local)
+        }
+    }
+
+    /// Check if this is OpenAI provider
+    pub fn is_openai(&self) -> bool {
+        matches!(self, EmbedProvider::OpenAI { .. })
+    }
+
+    /// Get the embedding dimension for this provider
+    pub fn dimension(&self) -> usize {
+        match self {
+            EmbedProvider::Local => EMBEDDING_DIM,
+            EmbedProvider::OpenAI { .. } => OPENAI_EMBEDDING_DIM,
+        }
+    }
+
+    /// Get default batch size for this provider
+    pub fn default_batch_size(&self) -> usize {
+        match self {
+            EmbedProvider::Local => 200,
+            EmbedProvider::OpenAI { .. } => 2000,
+        }
+    }
+
+    /// Get batch size, using provider default if not specified
+    pub fn batch_size(&self, specified: Option<usize>) -> usize {
+        specified.unwrap_or_else(|| self.default_batch_size())
+    }
+}
 
 /// Global embedding model instance (lazy-loaded)
 static MODEL: OnceLock<Mutex<TextEmbedding>> = OnceLock::new();

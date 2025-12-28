@@ -19,8 +19,10 @@ const MAX_BATCH_SIZE: usize = 2048;
 /// Example: tiktoken estimated 279,801 but OpenAI counted 302,026 (8% higher)
 const MAX_TOKENS_PER_REQUEST: usize = 250_000;
 
-/// Maximum tokens per individual text (text-embedding-3-small context limit)
-const MAX_TOKENS_PER_TEXT: usize = 8191;
+/// Maximum tokens per individual text (text-embedding-3-small context limit is 8191)
+/// Using 6500 to account for tiktoken estimation variance (~20% margin)
+/// tiktoken can underestimate by 10-20% compared to actual OpenAI token count
+const MAX_TOKENS_PER_TEXT: usize = 6500;
 
 /// Singleton tokenizer for cl100k_base (used by text-embedding-3-small)
 static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();

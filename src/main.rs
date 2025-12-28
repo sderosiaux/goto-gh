@@ -1,7 +1,9 @@
 mod config;
 mod db;
 mod discovery;
+mod embed_core;
 mod embedding;
+mod fetch;
 mod formatting;
 mod github;
 mod http;
@@ -9,28 +11,20 @@ mod openai;
 mod papers;
 mod proxy;
 mod search;
+mod server;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::time::Duration;
 
 use config::Config;
 use db::Database;
 use discovery::{discover_from_owners, discover_owner_repos};
-use embedding::{build_embedding_text, embed_passage, embed_passages};
+use embedding::{build_embedding_text, embed_passage};
 use formatting::{format_repo_link, format_stars, truncate_str};
 use github::GitHubClient;
-use papers::extract_github_repos;
 use proxy::ProxyManager;
 use search::{expand_query, search};
 
-/// Configuration for fetching repo metadata from GitHub
-struct FetchConfig {
-    limit: Option<usize>,
-    batch_size: usize,
-    concurrency: usize,
-    debug: bool,
-}
 
 #[derive(Parser)]
 #[command(name = "goto-gh")]
@@ -188,6 +182,41 @@ enum Commands {
         #[arg(short, long, default_value = "3000")]
         port: u16,
     },
+
+    /// Run as daemon with concurrent fetch, discover, and embed workers
+    Server {
+        /// Fetch batch size (default: 300)
+        #[arg(long, default_value = "300")]
+        fetch_batch_size: usize,
+
+        /// Fetch concurrency (default: 2)
+        #[arg(long, default_value = "2")]
+        fetch_concurrency: usize,
+
+        /// Discover limit per cycle (default: 50)
+        #[arg(long, default_value = "50")]
+        discover_limit: usize,
+
+        /// Embed batch size (default: 200 for local, 2000 for openai)
+        #[arg(long)]
+        embed_batch_size: Option<usize>,
+
+        /// Embedding provider: "local" (E5) or "openai"
+        #[arg(long, default_value = "local")]
+        provider: String,
+
+        /// Path to proxy list file (one ip:port per line)
+        #[arg(long)]
+        proxy_file: Option<String>,
+
+        /// Force using proxies for all requests
+        #[arg(long)]
+        force_proxy: bool,
+
+        /// Show debug output
+        #[arg(long)]
+        debug: bool,
+    },
 }
 
 #[tokio::main]
@@ -267,8 +296,8 @@ async fn run_main(cli: Cli, db: Database) -> Result<()> {
         }
         Some(Commands::Fetch { limit, batch_size, concurrency, debug }) => {
             let client = GitHubClient::new_with_options(token.clone(), debug, None, false);
-            let config = FetchConfig { limit, batch_size, concurrency, debug };
-            fetch_from_db(&client, &db, &config).await
+            let config = fetch::FetchRunnerConfig { limit, batch_size, concurrency, debug, delay_ms: 50 };
+            fetch_from_db_cli(&client, &db, &config).await
         }
         Some(Commands::Embed { batch_size, limit, delay, reset, provider, debug }) => {
             embed_missing(&db, batch_size, limit, delay, reset, &provider, debug).await
@@ -311,6 +340,40 @@ async fn run_main(cli: Cli, db: Database) -> Result<()> {
         }
         Some(Commands::Http { port }) => {
             http::start_server(db.path().to_path_buf(), port).await
+        }
+        Some(Commands::Server {
+            fetch_batch_size,
+            fetch_concurrency,
+            discover_limit,
+            embed_batch_size,
+            provider,
+            proxy_file,
+            force_proxy,
+            debug,
+        }) => {
+            use server::ServerConfig;
+
+            // Auto-detect provider from existing embeddings if not explicitly specified
+            let embed_provider = embed_core::auto_detect_provider(&db, &provider)?;
+            if embed_provider.is_openai() && provider == "local" {
+                eprintln!("\x1b[36m..\x1b[0m Auto-detected OpenAI embeddings in database");
+            }
+
+            let config = ServerConfig {
+                fetch_batch_size,
+                fetch_concurrency,
+                discover_limit,
+                embed_batch_size: embed_provider.batch_size(embed_batch_size),
+                embed_delay_ms: 50,
+                embed_provider,
+                debug,
+                proxy_file,
+                force_proxy,
+            };
+
+            // Server manages its own DB connections
+            drop(db);
+            server::start_server(config).await
         }
         None => {
             use clap::CommandFactory;
@@ -547,11 +610,11 @@ fn load_user_stubs(db: &Database, file_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Fetch metadata from GitHub for repos in DB that don't have it yet
-async fn fetch_from_db(
+/// Fetch metadata from GitHub for repos in DB - CLI wrapper
+async fn fetch_from_db_cli(
     client: &GitHubClient,
     db: &Database,
-    config: &FetchConfig,
+    config: &fetch::FetchRunnerConfig,
 ) -> Result<()> {
     let need_fetch = db.count_repos_without_metadata()?;
 
@@ -566,129 +629,38 @@ async fn fetch_from_db(
         to_fetch, config.batch_size, config.concurrency
     );
 
-    let mut stored = 0;
-    let mut errors = 0;
-    let mut batch_num = 0;
-
-    while stored + errors < to_fetch {
-        batch_num += 1;
-        let remaining = to_fetch - stored - errors;
-        let this_batch_size = remaining.min(config.batch_size);
-
-        // Get next batch of repos without metadata
-        let repos_to_fetch = db.get_repos_without_metadata(Some(this_batch_size))?;
-
-        if repos_to_fetch.is_empty() {
-            break;
-        }
-
-        eprintln!(
-            "\x1b[36m..\x1b[0m Batch {}: fetching {} repos via GraphQL...",
-            batch_num, repos_to_fetch.len()
-        );
-
-        // Debug: show sample of repos being fetched
-        if config.debug {
-            eprintln!("  [DEBUG] Sample repos to fetch:");
-            for (i, name) in repos_to_fetch.iter().take(5).enumerate() {
-                eprintln!("    {}. {}", i + 1, name);
-            }
-            if repos_to_fetch.len() > 5 {
-                eprintln!("    ... and {} more", repos_to_fetch.len() - 5);
-            }
-        }
-
-        // Fetch via GraphQL
-        let fetched_repos = match client.fetch_repos_batch(&repos_to_fetch, config.concurrency).await {
-            Ok(repos) => repos,
-            Err(e) => {
-                eprintln!("\x1b[31mx\x1b[0m Batch {} failed: {}", batch_num, e);
-                errors += repos_to_fetch.len();
-                continue;
-            }
-        };
-
-        // Store metadata without embedding
-        let fetched_count = fetched_repos.len();
-        let fetched_names: std::collections::HashSet<_> = fetched_repos
-            .iter()
-            .map(|r| r.full_name.to_lowercase())
-            .collect();
-
-        let mut total_discovered = 0;
-
-        for repo in fetched_repos {
-            let text = build_embedding_text(
-                &repo.full_name,
-                repo.description.as_deref(),
-                &repo.topics,
-                repo.language.as_deref(),
-                repo.readme.as_deref(),
+    let result = fetch::run_fetch_loop(
+        client,
+        db,
+        config,
+        |progress| {
+            eprintln!(
+                "\x1b[36m..\x1b[0m Batch {}: fetching {} repos via GraphQL...",
+                progress.batch_num, progress.batch_size
             );
 
-            db.upsert_repo_metadata_only(&repo, &text)?;
-            stored += 1;
-
-            // Extract linked repos from README for organic growth (like a web scraper)
-            if let Some(readme) = &repo.readme {
-                total_discovered += discover_repos_from_readme(db, readme);
-            }
-        }
-
-        // Mark repos that weren't found as gone (deleted/renamed)
-        let missing: Vec<String> = repos_to_fetch
-            .iter()
-            .filter(|name| !fetched_names.contains(&name.to_lowercase()))
-            .cloned()
-            .collect();
-
-        if !missing.is_empty() {
-            let gone_count = db.mark_as_gone_bulk(&missing)?;
-            errors += gone_count;
-            let gone_pct = (gone_count as f64 / repos_to_fetch.len() as f64 * 100.0) as u32;
-            eprintln!("  ... marked {} repos as gone ({}% of batch)", gone_count, gone_pct);
-
-            // Warn if too many repos are gone
-            if gone_pct >= 80 {
-                eprintln!("  \x1b[33m⚠ Warning: {}% of batch is gone - queue may be mostly stale repos\x1b[0m", gone_pct);
-            }
-
-            // Debug: show sample of gone repos
-            if config.debug {
-                eprintln!("  [DEBUG] Sample gone repos:");
-                for (i, name) in missing.iter().take(5).enumerate() {
-                    eprintln!("    {}. {}", i + 1, name);
-                }
-                if missing.len() > 5 {
-                    eprintln!("    ... and {} more", missing.len() - 5);
+            if progress.gone_this_batch > 0 {
+                let gone_pct = (progress.gone_this_batch as f64 / progress.batch_size as f64 * 100.0) as u32;
+                eprintln!("  ... marked {} repos as gone ({}% of batch)", progress.gone_this_batch, gone_pct);
+                if gone_pct >= 80 {
+                    eprintln!("  \x1b[33m⚠ Warning: {}% of batch is gone - queue may be mostly stale repos\x1b[0m", gone_pct);
                 }
             }
-        }
 
-        eprintln!("  ... stored {} repos (total: {})", fetched_count, stored);
+            eprintln!("  ... stored {} repos (total: {})", progress.fetched_this_batch, progress.total_fetched);
 
-        if total_discovered > 0 {
-            eprintln!("  ... discovered {} new repos from READMEs", total_discovered);
-        }
-
-        // Checkpoint WAL periodically to prevent unbounded growth
-        if batch_num % 10 == 0 {
-            let _ = db.checkpoint();
-        }
-
-        // Small delay between batches to avoid rate limits
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // Final checkpoint before exit
-    let _ = db.checkpoint();
+            if progress.discovered_this_batch > 0 {
+                eprintln!("  ... discovered {} new repos from READMEs", progress.discovered_this_batch);
+            }
+        },
+        || false,
+    ).await?;
 
     eprintln!(
-        "\x1b[32mok\x1b[0m Fetched {} repos ({} errors) - ready for embedding",
-        stored, errors
+        "\x1b[32mok\x1b[0m Fetched {} repos ({} gone) - ready for embedding",
+        result.total_fetched, result.total_gone
     );
 
-    // Show how many need embedding
     let need_embed = db.count_repos_without_embeddings()?;
     eprintln!("\x1b[36m..\x1b[0m {} repos now awaiting embeddings", need_embed);
     eprintln!("    Run: goto-gh embed --batch-size 200 --delay 5");
@@ -696,7 +668,7 @@ async fn fetch_from_db(
     Ok(())
 }
 
-/// Generate embeddings for repos that don't have them yet
+/// Generate embeddings for repos that don't have them yet - CLI wrapper
 async fn embed_missing(
     db: &Database,
     batch_size: Option<usize>,
@@ -706,46 +678,39 @@ async fn embed_missing(
     provider: &str,
     debug: bool,
 ) -> Result<()> {
-    use crate::openai::{OpenAIClient, OPENAI_EMBEDDING_DIM};
     use crate::embedding::EMBEDDING_DIM;
+    use crate::openai::OPENAI_EMBEDDING_DIM;
 
-    // Auto-detect provider from existing embeddings if not resetting
-    let current_dim = db.get_embedding_dimension()?;
-    let (provider, is_openai) = if !reset {
-        if let Some(dim) = current_dim {
-            if dim == OPENAI_EMBEDDING_DIM {
-                if provider == "local" {
-                    eprintln!("\x1b[36m..\x1b[0m Auto-detected OpenAI embeddings (1536d) - using --provider openai");
-                }
-                ("openai", true)
-            } else if dim == EMBEDDING_DIM {
-                if provider == "openai" {
-                    eprintln!("\x1b[36m..\x1b[0m Auto-detected local E5 embeddings (384d) - using --provider local");
-                }
-                ("local", false)
-            } else {
-                (provider, provider == "openai")
-            }
-        } else {
-            (provider, provider == "openai")
-        }
+    // Auto-detect provider
+    let embed_provider = if reset {
+        embedding::EmbedProvider::parse(provider)?
     } else {
-        (provider, provider == "openai")
+        embed_core::auto_detect_provider(db, provider)?
     };
 
-    let target_dim = if is_openai { OPENAI_EMBEDDING_DIM } else { EMBEDDING_DIM };
-    let default_batch = if is_openai { 2000 } else { 200 };
-    let batch_size = batch_size.unwrap_or(default_batch);
+    let is_openai = embed_provider.is_openai();
+    let provider_name = if is_openai { "openai" } else { "local" };
+    let target_dim = embed_provider.dimension();
+    let batch_size = embed_provider.batch_size(batch_size);
 
-    // Recreate table if reset requested
+    // Log auto-detection
+    if !reset {
+        let current_dim = db.get_embedding_dimension()?;
+        if let Some(dim) = current_dim {
+            if dim == OPENAI_EMBEDDING_DIM && provider == "local" {
+                eprintln!("\x1b[36m..\x1b[0m Auto-detected OpenAI embeddings (1536d) - using --provider openai");
+            } else if dim == EMBEDDING_DIM && provider == "openai" {
+                eprintln!("\x1b[36m..\x1b[0m Auto-detected local E5 embeddings (384d) - using --provider local");
+            }
+        }
+    }
+
     if reset {
-        eprintln!("\x1b[33m!\x1b[0m Recreating embeddings table with {} dimensions ({})", target_dim, provider);
-        db.recreate_embeddings_table(target_dim)?;
+        eprintln!("\x1b[33m!\x1b[0m Recreating embeddings table with {} dimensions ({})", target_dim, provider_name);
     }
 
     let need_embed = db.count_repos_without_embeddings()?;
-
-    if need_embed == 0 {
+    if need_embed == 0 && !reset {
         eprintln!("\x1b[32mok\x1b[0m All repos already have embeddings");
         return Ok(());
     }
@@ -753,14 +718,13 @@ async fn embed_missing(
     let to_process = limit.map(|l| l.min(need_embed)).unwrap_or(need_embed);
     eprintln!(
         "\x1b[36m..\x1b[0m Generating embeddings for {} repos (provider: {}, batch: {})",
-        to_process, provider, batch_size
+        to_process, provider_name, batch_size
     );
 
     // Estimate cost for OpenAI
     if is_openai {
-        // Rough estimate: 500 tokens per repo average
         let estimated_tokens = to_process as f64 * 500.0;
-        let estimated_cost = estimated_tokens / 1_000_000.0 * 0.02; // $0.02/1M tokens
+        let estimated_cost = estimated_tokens / 1_000_000.0 * 0.02;
         eprintln!(
             "    \x1b[33mEstimated cost: ${:.2}\x1b[0m (~{:.0}M tokens)",
             estimated_cost,
@@ -768,106 +732,64 @@ async fn embed_missing(
         );
     }
 
-    let mut total_embedded = 0;
-    let mut total_tokens = 0u32;
-    let mut batch_num = 0;
     let start_time = std::time::Instant::now();
-
-    // Initialize OpenAI client if needed
-    let openai_client = if is_openai {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .context("OPENAI_API_KEY environment variable not set")?;
-        Some(OpenAIClient::new(api_key, debug))
-    } else {
-        None
+    let config = embed_core::EmbedRunnerConfig {
+        batch_size,
+        limit,
+        delay_ms: delay_secs * 1000,
+        provider: embed_provider,
+        debug,
+        reset,
     };
 
-    while total_embedded < to_process {
-        let remaining = to_process - total_embedded;
-        let this_batch_size = remaining.min(batch_size);
-
-        let repos = db.get_repos_without_embeddings(Some(this_batch_size))?;
-
-        if repos.is_empty() {
-            break;
-        }
-
-        let batch_len = repos.len();
-        batch_num += 1;
-        eprintln!(
-            "\x1b[36m..\x1b[0m Batch {}: embedding {} repos...",
-            batch_num,
-            batch_len
-        );
-
-        let texts: Vec<String> = repos.iter().map(|(_, text)| text.clone()).collect();
-        let repo_ids: Vec<i64> = repos.iter().map(|(id, _)| *id).collect();
-
-        // Generate embeddings based on provider
-        let embeddings = if let Some(ref client) = openai_client {
-            let (embs, tokens) = client.embed_batch(&texts).await?;
-            total_tokens += tokens;
-            embs
-        } else {
-            embed_passages(&texts)?
-        };
-
-        // Store embeddings
-        for (repo_id, embedding) in repo_ids.into_iter().zip(embeddings) {
-            db.upsert_embedding(repo_id, &embedding)?;
-        }
-
-        total_embedded += batch_len;
-
-        // Checkpoint WAL periodically to prevent unbounded growth
-        if batch_num % 10 == 0 {
-            let _ = db.checkpoint();
-        }
-
-        // Calculate ETA
-        let elapsed = start_time.elapsed();
-        let eta = if total_embedded > 0 {
-            let rate = total_embedded as f64 / elapsed.as_secs_f64();
-            let remaining = to_process - total_embedded;
-            let eta_secs = remaining as f64 / rate;
-            format_duration(eta_secs as u64)
-        } else {
-            "calculating...".to_string()
-        };
-
-        if is_openai {
+    let result = embed_core::run_embed_loop(
+        db,
+        &config,
+        |progress| {
             eprintln!(
-                "  ... embedded {} (total: {}/{}, tokens: {}, ETA: {})",
-                batch_len, total_embedded, to_process, total_tokens, eta
+                "\x1b[36m..\x1b[0m Batch {}: embedding {} repos...",
+                progress.batch_num, progress.batch_size
             );
-        } else {
-            eprintln!(
-                "  ... embedded {} (total: {}/{}, ETA: {})",
-                batch_len, total_embedded, to_process, eta
-            );
-        }
 
-        if total_embedded < to_process && delay_secs > 0 {
-            eprintln!("  \x1b[90m⏳ Waiting {}s before next batch...\x1b[0m", delay_secs);
-            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-        }
-    }
+            let elapsed = start_time.elapsed();
+            let eta = if progress.total_embedded > 0 {
+                let rate = progress.total_embedded as f64 / elapsed.as_secs_f64();
+                let remaining = progress.total_to_process - progress.total_embedded;
+                let eta_secs = remaining as f64 / rate;
+                format_duration(eta_secs as u64)
+            } else {
+                "calculating...".to_string()
+            };
 
-    if is_openai {
-        let actual_cost = total_tokens as f64 / 1_000_000.0 * 0.02;
+            if progress.total_tokens > 0 {
+                eprintln!(
+                    "  ... embedded {} (total: {}/{}, tokens: {}, ETA: {})",
+                    progress.embedded_this_batch, progress.total_embedded,
+                    progress.total_to_process, progress.total_tokens, eta
+                );
+            } else {
+                eprintln!(
+                    "  ... embedded {} (total: {}/{}, ETA: {})",
+                    progress.embedded_this_batch, progress.total_embedded,
+                    progress.total_to_process, eta
+                );
+            }
+        },
+        || false,
+    ).await?;
+
+    if result.total_tokens > 0 {
+        let actual_cost = result.total_tokens as f64 / 1_000_000.0 * 0.02;
         eprintln!(
             "\x1b[32mok\x1b[0m Generated embeddings for {} repos ({} tokens, ${:.2})",
-            total_embedded, total_tokens, actual_cost
+            result.total_embedded, result.total_tokens, actual_cost
         );
     } else {
         eprintln!(
             "\x1b[32mok\x1b[0m Generated embeddings for {} repos",
-            total_embedded
+            result.total_embedded
         );
     }
-
-    // Final checkpoint
-    let _ = db.checkpoint();
 
     let still_need = db.count_repos_without_embeddings()?;
     if still_need > 0 {
@@ -890,22 +812,6 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
-/// Discover and add repo stubs from a single README
-/// Returns the number of new repos added
-fn discover_repos_from_readme(db: &Database, readme: &str) -> usize {
-    let linked = extract_github_repos(readme);
-    if linked.is_empty() {
-        return 0;
-    }
-
-    let unique: std::collections::HashSet<_> = linked.into_iter().collect();
-    let repos_vec: Vec<String> = unique.into_iter().collect();
-
-    match db.add_repo_stubs_bulk(&repos_vec) {
-        Ok((added, _)) => added,
-        Err(_) => 0,
-    }
-}
 
 /// Extract paper links from READMEs
 fn extract_papers(db: &Database, limit: Option<usize>, batch_size: usize) -> Result<()> {

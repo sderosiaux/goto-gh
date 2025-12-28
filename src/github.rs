@@ -158,16 +158,12 @@ impl GitHubClient {
 
     /// Send REST request with optional debug timing (uses main token)
     async fn send_request(&self, url: &str) -> Result<reqwest::Response, reqwest::Error> {
-        use std::io::Write;
-        if self.debug {
-            let now = chrono::Local::now().format("%H:%M:%S%.3f");
-            eprint!("\x1b[90m[{}] GET {} ... \x1b[0m", now, url);
-            std::io::stderr().flush().ok();
-        }
         let start = std::time::Instant::now();
         let result = self.request(url).send().await;
         if self.debug {
-            eprintln!("\x1b[90m{}ms\x1b[0m", start.elapsed().as_millis());
+            let now = chrono::Local::now().format("%H:%M:%S%.3f");
+            // Single atomic line to avoid interleaving with other workers
+            eprintln!("\x1b[90m[{}] GET {} ... {}ms\x1b[0m", now, url, start.elapsed().as_millis());
         }
         result
     }
@@ -175,17 +171,9 @@ impl GitHubClient {
     /// Send REST request via proxy (no auth token - proxies are unauthenticated)
     /// If show_debug is false, suppresses per-request debug output (for parallel racing)
     async fn send_request_via_proxy_inner(&self, url: &str, proxy: &str, show_debug: bool) -> Result<reqwest::Response, String> {
-        use std::io::Write;
-
         let proxy_url = format!("http://{}", proxy);
         let proxy_client = Self::client_with_proxy(&proxy_url)
             .ok_or_else(|| format!("Failed to create proxy client for {}", proxy))?;
-
-        if self.debug && show_debug {
-            let now = chrono::Local::now().format("%H:%M:%S%.3f");
-            eprint!("\x1b[90m[{} PROXY {}] GET {} ... \x1b[0m", now, proxy, url);
-            std::io::stderr().flush().ok();
-        }
 
         let start = std::time::Instant::now();
 
@@ -198,7 +186,9 @@ impl GitHubClient {
             .await;
 
         if self.debug && show_debug {
-            eprintln!("\x1b[90m{}ms\x1b[0m", start.elapsed().as_millis());
+            let now = chrono::Local::now().format("%H:%M:%S%.3f");
+            // Single atomic line to avoid interleaving with other workers
+            eprintln!("\x1b[90m[{} PROXY {}] GET {} ... {}ms\x1b[0m", now, proxy, url, start.elapsed().as_millis());
         }
 
         result.map_err(|e| e.to_string())

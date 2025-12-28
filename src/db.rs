@@ -102,7 +102,8 @@ impl Database {
                 pushed_at TEXT,
                 created_at TEXT,
                 last_indexed TEXT NOT NULL,
-                gone INTEGER DEFAULT 0
+                gone INTEGER DEFAULT 0,
+                has_embedding INTEGER DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_repos_name ON repos(full_name);
@@ -118,17 +119,9 @@ impl Database {
             ",
         )?;
 
-        // Create vector table for embeddings
-        self.conn.execute(
-            &format!(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS repo_embeddings USING vec0(
-                    repo_id INTEGER PRIMARY KEY,
-                    embedding FLOAT[{}]
-                )",
-                EMBEDDING_DIM
-            ),
-            [],
-        )?;
+        // Note: repo_embeddings table is created lazily by recreate_embeddings_table()
+        // when the first embedding operation runs. This allows the dimension to be
+        // determined by the provider (local=384, OpenAI=1536) instead of hardcoding.
 
         // Migration: add gone column if it doesn't exist
         let has_gone: bool = self.conn.query_row(
@@ -157,6 +150,42 @@ impl Database {
             )?;
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_repos_owner ON repos(owner)", [])?;
             eprintln!("\x1b[32mok\x1b[0m Owner column migration complete");
+        }
+
+        // Migration: add has_embedding column for fast embedding status lookups
+        let has_embedding_col: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('repos') WHERE name = 'has_embedding'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_embedding_col {
+            eprintln!("\x1b[36m..\x1b[0m Adding has_embedding column (one-time migration)...");
+            self.conn.execute("ALTER TABLE repos ADD COLUMN has_embedding INTEGER DEFAULT 0", [])?;
+
+            // Populate from existing repo_embeddings table
+            // This may take a while for large databases but only runs once
+            let embedded_count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM repo_embeddings",
+                [],
+                |row| row.get(0),
+            ).unwrap_or(0);
+
+            if embedded_count > 0 {
+                eprintln!("\x1b[36m..\x1b[0m Syncing {} existing embeddings...", embedded_count);
+                self.conn.execute(
+                    "UPDATE repos SET has_embedding = 1 WHERE id IN (SELECT repo_id FROM repo_embeddings)",
+                    [],
+                )?;
+            }
+
+            // Create partial index for fast lookups
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_repos_needs_embedding ON repos(has_embedding, gone, embedded_text)
+                 WHERE has_embedding = 0 AND gone = 0 AND embedded_text IS NOT NULL",
+                [],
+            )?;
+
+            eprintln!("\x1b[32mok\x1b[0m has_embedding migration complete");
         }
 
         // Table to track explored owners (users/orgs) - avoid re-fetching their repos
@@ -336,12 +365,19 @@ impl Database {
             params![repo_id, embedding.as_bytes()],
         )?;
 
+        // Mark repo as having an embedding for fast lookups
+        self.conn.execute(
+            "UPDATE repos SET has_embedding = 1 WHERE id = ?",
+            [repo_id],
+        )?;
+
         Ok(())
     }
 
     /// Clear all embeddings from the database
     pub fn clear_all_embeddings(&self) -> Result<usize> {
         let count = self.conn.execute("DELETE FROM repo_embeddings", [])?;
+        self.conn.execute("UPDATE repos SET has_embedding = 0", [])?;
         Ok(count)
     }
 
@@ -352,6 +388,24 @@ impl Database {
         self.conn.execute(
             &format!(
                 "CREATE VIRTUAL TABLE repo_embeddings USING vec0(
+                    repo_id INTEGER PRIMARY KEY,
+                    embedding FLOAT[{}]
+                )",
+                dim
+            ),
+            [],
+        )?;
+        // Reset has_embedding flag since all embeddings are gone
+        self.conn.execute("UPDATE repos SET has_embedding = 0", [])?;
+        Ok(())
+    }
+
+    /// Ensure the embeddings table exists with the correct dimension
+    /// Creates it if it doesn't exist, does nothing if it already exists
+    pub fn ensure_embeddings_table(&self, dim: usize) -> Result<()> {
+        self.conn.execute(
+            &format!(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS repo_embeddings USING vec0(
                     repo_id INTEGER PRIMARY KEY,
                     embedding FLOAT[{}]
                 )",
@@ -497,17 +551,20 @@ impl Database {
     /// Get repos that have no embeddings yet (for separate embedding step)
     /// Returns (repo_id, embedded_text) pairs
     pub fn get_repos_without_embeddings(&self, limit: Option<usize>) -> Result<Vec<(i64, String)>> {
+        // Use has_embedding flag for fast lookups (indexed)
         let sql = match limit {
             Some(lim) => format!(
-                "SELECT r.id, r.embedded_text FROM repos r
-                 LEFT JOIN repo_embeddings e ON r.id = e.repo_id
-                 WHERE e.repo_id IS NULL AND r.embedded_text IS NOT NULL
+                "SELECT id, embedded_text FROM repos
+                 WHERE has_embedding = 0
+                   AND gone = 0
+                   AND embedded_text IS NOT NULL
                  LIMIT {}",
                 lim
             ),
-            None => "SELECT r.id, r.embedded_text FROM repos r
-                     LEFT JOIN repo_embeddings e ON r.id = e.repo_id
-                     WHERE e.repo_id IS NULL AND r.embedded_text IS NOT NULL".to_string(),
+            None => "SELECT id, embedded_text FROM repos
+                     WHERE has_embedding = 0
+                       AND gone = 0
+                       AND embedded_text IS NOT NULL".to_string(),
         };
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -591,12 +648,12 @@ impl Database {
 
     /// Count repos without embeddings (excluding gone repos)
     pub fn count_repos_without_embeddings(&self) -> Result<usize> {
+        // Use has_embedding flag for fast count (indexed)
         let count: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM repos r
-             LEFT JOIN repo_embeddings e ON r.id = e.repo_id
-             WHERE e.repo_id IS NULL
-               AND r.embedded_text IS NOT NULL
-               AND r.gone = 0",
+            "SELECT COUNT(*) FROM repos
+             WHERE has_embedding = 0
+               AND gone = 0
+               AND embedded_text IS NOT NULL",
             [],
             |row| row.get(0),
         )?;
@@ -853,25 +910,17 @@ impl Database {
     /// Get distinct owners that haven't been explored yet
     /// Combines owners from real repos and the owners_to_explore table
     pub fn get_unexplored_owners(&self, limit: Option<usize>) -> Result<Vec<String>> {
+        // Primary source: owners_to_explore table (already deduplicated, indexed)
+        // This is much faster than scanning millions of repos
         let sql = match limit {
             Some(lim) => format!(
-                "SELECT owner FROM (
-                    SELECT DISTINCT LOWER(substr(full_name, 1, instr(full_name, '/') - 1)) as owner
-                    FROM repos
-                    UNION
-                    SELECT owner FROM owners_to_explore
-                )
-                WHERE owner NOT IN (SELECT owner FROM explored_owners)
-                LIMIT {}",
+                "SELECT owner FROM owners_to_explore
+                 WHERE NOT EXISTS (SELECT 1 FROM explored_owners e WHERE e.owner = owners_to_explore.owner)
+                 LIMIT {}",
                 lim
             ),
-            None => "SELECT owner FROM (
-                        SELECT DISTINCT LOWER(substr(full_name, 1, instr(full_name, '/') - 1)) as owner
-                        FROM repos
-                        UNION
-                        SELECT owner FROM owners_to_explore
-                     )
-                     WHERE owner NOT IN (SELECT owner FROM explored_owners)".to_string(),
+            None => "SELECT owner FROM owners_to_explore
+                     WHERE NOT EXISTS (SELECT 1 FROM explored_owners e WHERE e.owner = owners_to_explore.owner)".to_string(),
         };
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -881,16 +930,10 @@ impl Database {
 
     /// Count unexplored owners
     pub fn count_unexplored_owners(&self) -> Result<usize> {
+        // Use owners_to_explore table (indexed, deduplicated)
         let count: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM (
-                SELECT owner FROM (
-                    SELECT DISTINCT LOWER(substr(full_name, 1, instr(full_name, '/') - 1)) as owner
-                    FROM repos
-                    UNION
-                    SELECT owner FROM owners_to_explore
-                )
-                WHERE owner NOT IN (SELECT owner FROM explored_owners)
-            )",
+            "SELECT COUNT(*) FROM owners_to_explore
+             WHERE NOT EXISTS (SELECT 1 FROM explored_owners e WHERE e.owner = owners_to_explore.owner)",
             [],
             |row| row.get(0),
         )?;
