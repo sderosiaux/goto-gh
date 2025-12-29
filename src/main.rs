@@ -1142,7 +1142,7 @@ fn extract_repos(db: &Database, limit: Option<usize>, batch_size: usize) -> Resu
         let batch_count = repos.len();
         let mut batch_discovered = 0;
 
-        for (repo_id, full_name, readme) in repos {
+        for (repo_id, _full_name, readme) in repos {
             let discovered = discover_repos_from_readme(db, &readme);
             batch_discovered += discovered;
 

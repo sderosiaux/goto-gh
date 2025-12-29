@@ -70,6 +70,7 @@ impl Default for DiscoveryConfig {
 
 /// Progress information during discovery
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DiscoveryProgress {
     pub owner: String,
     pub repos_inserted: usize,

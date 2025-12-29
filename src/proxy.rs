@@ -118,6 +118,7 @@ impl ProxyManager {
     /// - ip:port (simple proxy)
     /// - user:pass@host:port (authenticated proxy)
     /// - ip:port:user:pass (Webshare format, converted to user:pass@ip:port)
+    #[allow(dead_code)]
     fn is_valid_format(proxy: &str) -> bool {
         Self::normalize_proxy(proxy).is_some()
     }
@@ -163,6 +164,7 @@ impl ProxyManager {
     }
 
     /// Get current sticky proxy if set (without rotation fallback).
+    #[allow(dead_code)]
     pub fn get_current_proxy(&self) -> Option<String> {
         let inner = self.inner.lock().unwrap();
         inner.current_proxy.clone()
@@ -287,12 +289,14 @@ impl ProxyManager {
     }
 
     /// Mark a proxy as working (sticky - will be reused).
+    #[allow(dead_code)]
     pub fn mark_working(&self, proxy: &str) {
         let mut inner = self.inner.lock().unwrap();
         inner.current_proxy = Some(proxy.to_string());
     }
 
     /// Clear the sticky proxy (e.g., when it fails).
+    #[allow(dead_code)]
     pub fn clear_current(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.current_proxy = None;
@@ -352,6 +356,7 @@ impl ProxyManager {
     }
 
     /// Get number of blacklisted proxies
+    #[allow(dead_code)]
     pub fn blacklisted_count(&self) -> usize {
         let inner = self.inner.lock().unwrap();
         inner.blacklisted.len()

@@ -136,10 +136,12 @@ impl Default for FetchRunnerConfig {
 }
 
 /// Callback for fetch progress updates
+#[allow(dead_code)]
 pub type FetchProgressCallback = Box<dyn Fn(&FetchProgress) + Send>;
 
 /// Progress information during fetch
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FetchProgress {
     pub batch_num: usize,
     pub batch_size: usize,

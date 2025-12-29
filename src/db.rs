@@ -2,18 +2,11 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{ffi::sqlite3_auto_extension, params, Connection, OptionalExtension};
 use sqlite_vec::sqlite3_vec_init;
-use std::thread;
-use std::time::Duration;
 use zerocopy::AsBytes;
 
 use crate::config::Config;
-use crate::embedding::EMBEDDING_DIM;
 use crate::github::{DiscoveredRepo, GitHubRepo, RepoWithReadme};
 
-/// Check if an error is a "database is locked" error
-fn is_locked_error(e: &anyhow::Error) -> bool {
-    e.to_string().to_lowercase().contains("database is locked")
-}
 
 /// Stored repository with metadata
 #[derive(Debug, Clone)]
@@ -342,7 +335,7 @@ impl Database {
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?;
 
-        if let Some((id, canonical_name)) = existing {
+        if let Some((id, _canonical_name)) = existing {
             // Update existing row using canonical name
             self.conn.execute(
                 "UPDATE repos SET
@@ -414,6 +407,7 @@ impl Database {
     }
 
     /// Clear all embeddings from the database
+    #[allow(dead_code)]
     pub fn clear_all_embeddings(&self) -> Result<usize> {
         let count = self.conn.execute("DELETE FROM repo_embeddings", [])?;
         self.conn.execute("UPDATE repos SET has_embedding = 0", [])?;
@@ -713,6 +707,7 @@ impl Database {
     /// Add a repo stub (just the name) - no metadata, no embedding
     /// Used for bulk loading repo names before fetching metadata
     /// Preserves original case for GitHub API calls, uses case-insensitive dedup
+    #[allow(dead_code)]
     pub fn add_repo_stub(&self, full_name: &str) -> Result<bool> {
         // Check if repo already exists (case-insensitive)
         let exists: bool = self.conn.query_row(
@@ -928,6 +923,7 @@ impl Database {
     }
 
     /// Count repos that have README but still need GraphQL fetch for other metadata
+    #[allow(dead_code)]
     pub fn count_repos_with_readme_needing_metadata(&self) -> Result<usize> {
         let count: usize = self.conn.query_row(
             "SELECT COUNT(*) FROM repos

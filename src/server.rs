@@ -485,6 +485,7 @@ async fn run_readme_cycle(state: &ServerState, shutdown: &AtomicBool) -> Result<
     let concurrency = state.config.readme_concurrency;
 
     #[derive(Debug)]
+    #[allow(dead_code)]
     enum ReadmeResult {
         Found(String),
         NotFound,

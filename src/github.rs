@@ -15,17 +15,20 @@ use crate::proxy::ProxyManager;
 const GRAPHQL_CHUNK_SIZE: usize = 50;
 
 /// Retry configuration
+#[allow(dead_code)]
 pub struct RetryConfig {
     pub max_attempts: u32,
     pub base_delay_ms: u64,
 }
 
 /// Which rate limit API to check
+#[allow(dead_code)]
 pub enum RateLimitApi {
     Core,
     GraphQL,
 }
 
+#[allow(dead_code)]
 impl RateLimitApi {
     pub fn name(&self) -> &'static str {
         match self {
@@ -46,6 +49,7 @@ impl Default for RetryConfig {
 
 /// Execute an operation with exponential backoff retry
 /// Returns the last error if all attempts fail
+#[allow(dead_code)]
 pub async fn retry_with_backoff<F, Fut, T, E>(
     config: &RetryConfig,
     mut operation: F,
@@ -166,6 +170,7 @@ impl GitHubClient {
     }
 
     /// Clear token rate limit (it has reset)
+    #[allow(dead_code)]
     fn clear_token_rate_limit(&self) {
         let was_limited = self.token_rate_limited_until.swap(0, Ordering::SeqCst);
         if was_limited > 0 && self.debug {
@@ -377,7 +382,7 @@ impl GitHubClient {
     /// Only blacklists on connection errors, not rate limits (tracks reset time from headers)
     async fn try_with_proxies(&self, url: &str, pm: &ProxyManager) -> Result<(reqwest::Response, Option<String>), String> {
         // Try up to 3 rounds (with potential waiting between rounds)
-        for round in 0..3 {
+        for _round in 0..3 {
             // Check if we have any proxies left
             if pm.is_empty() {
                 return Err("All proxies blacklisted".to_string());
@@ -535,6 +540,7 @@ impl GitHubClient {
 
     /// Wait for rate limit reset if we're running low
     /// Returns true if we had to wait, false if we had enough quota
+    #[allow(dead_code)]
     async fn wait_for_rate_limit(&self, rate: &RateLimit, api_name: &str, min_remaining: u32) -> bool {
         if rate.remaining >= min_remaining {
             return false;
@@ -577,6 +583,7 @@ impl GitHubClient {
 
     /// Check rate limit and wait if necessary
     /// Returns true if we had to wait
+    #[allow(dead_code)]
     pub async fn check_and_wait_rate_limit(&self, api: RateLimitApi, min_remaining: u32) -> Result<bool> {
         let rates = self.rate_limit().await?;
         let rate = match api {
@@ -613,6 +620,7 @@ impl GitHubClient {
 
     /// List all public repos for a user or org (paginated, with retry)
     /// Returns just repo names (for backward compatibility)
+    #[allow(dead_code)]
     pub async fn list_owner_repos(&self, owner: &str) -> Result<Vec<String>> {
         let mut all = Vec::new();
         self.discover_owner_repos_streaming(owner, |repos, _progress| {
@@ -805,6 +813,7 @@ pub struct DiscoveredRepo {
     pub pushed_at: Option<String>,
     pub created_at: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub fork: bool,
 }
 
@@ -1067,7 +1076,7 @@ impl GitHubClient {
                     };
 
                     if let Some(errors) = &gql_response.errors {
-                        let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
+                        let _msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
 
                         // Check if any error is a rate limit error
                         let is_rate_limit = errors.iter().any(|e|

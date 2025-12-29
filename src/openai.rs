@@ -59,6 +59,7 @@ struct EmbeddingData {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct Usage {
     prompt_tokens: u32,
     total_tokens: u32,
