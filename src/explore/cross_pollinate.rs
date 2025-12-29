@@ -4,6 +4,7 @@
 //! fields, like "machine learning + music" or "rust + web assembly".
 
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 
 use crate::db::{Database, RepoDetails};
 use crate::embedding::embed_query;
@@ -100,9 +101,30 @@ pub fn find_cross_pollination(db: &Database, config: &CrossConfig) -> Result<Vec
 
     // Sort by cross score (higher = better)
     candidates.sort_by(|a, b| b.cross_score.partial_cmp(&a.cross_score).unwrap());
+
+    // Deduplicate by base name (keep first = highest score)
+    // This filters out forks that would otherwise clutter results
+    let mut seen_bases: HashSet<String> = HashSet::new();
+    candidates.retain(|c| {
+        let base = get_base_name(&c.repo.full_name);
+        if base.is_empty() {
+            return true;
+        }
+        seen_bases.insert(base)
+    });
+
     candidates.truncate(config.limit);
 
     Ok(candidates)
+}
+
+/// Extract base name from full_name (e.g., "react" from "facebook/react")
+fn get_base_name(full_name: &str) -> String {
+    full_name
+        .split('/')
+        .nth(1)
+        .unwrap_or("")
+        .to_lowercase()
 }
 
 /// Convert L2 distance to similarity (0-1)
