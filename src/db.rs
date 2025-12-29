@@ -116,6 +116,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_repos_name ON repos(full_name);
             CREATE INDEX IF NOT EXISTS idx_repos_name_lower ON repos(LOWER(full_name));
             CREATE INDEX IF NOT EXISTS idx_repos_stars ON repos(stars DESC);
+            CREATE INDEX IF NOT EXISTS idx_repos_owner_stars ON repos(owner, stars DESC);
 
             -- Composite indexes for discovery queries
             CREATE INDEX IF NOT EXISTS idx_repos_gone_embedded ON repos(gone, embedded_text) WHERE embedded_text IS NULL;
@@ -849,22 +850,31 @@ impl Database {
 
     /// Get repos that need metadata fetch (no stars/description/language = never fetched metadata)
     /// This targets repos that were added as stubs but never got their metadata from REST or GraphQL
+    /// Prioritizes repos from owners who already have high-star repos (better ROI)
     pub fn get_repos_without_metadata(&self, limit: Option<usize>) -> Result<Vec<String>> {
         let sql = match limit {
             Some(lim) => format!(
-                "SELECT full_name FROM repos
+                "SELECT full_name FROM repos r
                  WHERE gone = 0
                    AND (stars IS NULL OR stars = 0)
                    AND description IS NULL
                    AND language IS NULL
+                 ORDER BY (
+                   SELECT MAX(stars) FROM repos r2
+                   WHERE r2.owner = r.owner AND r2.stars > 0
+                 ) DESC NULLS LAST
                  LIMIT {}",
                 lim
             ),
-            None => "SELECT full_name FROM repos
+            None => "SELECT full_name FROM repos r
                      WHERE gone = 0
                        AND (stars IS NULL OR stars = 0)
                        AND description IS NULL
-                       AND language IS NULL".to_string(),
+                       AND language IS NULL
+                     ORDER BY (
+                       SELECT MAX(stars) FROM repos r2
+                       WHERE r2.owner = r.owner AND r2.stars > 0
+                     ) DESC NULLS LAST".to_string(),
         };
 
         let mut stmt = self.conn.prepare(&sql)?;
