@@ -1,3 +1,4 @@
+mod cluster;
 mod config;
 mod db;
 mod discovery;
@@ -319,6 +320,34 @@ enum Commands {
         #[arg(short, long, default_value = "20")]
         limit: usize,
     },
+
+    /// Generate interactive cluster map visualization using t-SNE
+    #[command(name = "cluster-map")]
+    ClusterMap {
+        /// Output HTML file
+        #[arg(short, long, default_value = "cluster_map.html")]
+        output: String,
+
+        /// Number of repos to sample
+        #[arg(short, long, default_value = "5000")]
+        sample: usize,
+
+        /// Minimum stars filter
+        #[arg(long, default_value = "0")]
+        min_stars: u64,
+
+        /// Filter by language
+        #[arg(long)]
+        language: Option<String>,
+
+        /// t-SNE perplexity parameter (default: 30)
+        #[arg(long, default_value = "30")]
+        perplexity: f32,
+
+        /// t-SNE epochs/iterations (default: 1000)
+        #[arg(long, default_value = "1000")]
+        epochs: usize,
+    },
 }
 
 #[tokio::main]
@@ -514,6 +543,9 @@ async fn run_main(cli: Cli, db: Database) -> Result<()> {
         }
         Some(Commands::Cross { topic1, topic2, min_each, limit }) => {
             run_cross(&db, &topic1, &topic2, min_each, limit)
+        }
+        Some(Commands::ClusterMap { output, sample, min_stars, language, perplexity, epochs }) => {
+            run_cluster_map(&db, &output, sample, min_stars, language.as_deref(), perplexity, epochs)
         }
         None => {
             use clap::CommandFactory;
@@ -1433,5 +1465,27 @@ fn run_cross(db: &Database, topic1: &str, topic2: &str, min_each: f32, limit: us
     println!("\x1b[36mFound {} repos\x1b[0m at the intersection", results.len());
 
     Ok(())
+}
+
+fn run_cluster_map(
+    db: &Database,
+    output: &str,
+    sample: usize,
+    min_stars: u64,
+    language: Option<&str>,
+    perplexity: f32,
+    epochs: usize,
+) -> Result<()> {
+    use cluster::{generate_cluster_map, ClusterConfig};
+
+    let config = ClusterConfig {
+        sample,
+        min_stars,
+        language: language.map(String::from),
+        perplexity,
+        epochs,
+    };
+
+    generate_cluster_map(db, &config, output)
 }
 

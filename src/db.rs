@@ -1805,6 +1805,70 @@ impl Database {
 
         results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    /// Export repos with embeddings for external tools (JSON format)
+    /// Returns (full_name, description, stars, language, topics, embedding)
+    pub fn export_embeddings(
+        &self,
+        sample: Option<usize>,
+        min_stars: u64,
+        language: Option<&str>,
+    ) -> Result<Vec<ExportedRepo>> {
+        let mut sql = String::from(
+            "SELECT r.full_name, r.description, r.stars, r.language, r.topics, e.embedding
+             FROM repos r
+             INNER JOIN repo_embeddings e ON r.id = e.repo_id
+             WHERE r.gone = 0 AND r.stars >= ?1"
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(min_stars as i64)];
+
+        if let Some(lang) = language {
+            sql.push_str(" AND r.language = ?2");
+            params.push(Box::new(lang.to_string()));
+        }
+
+        if sample.is_some() {
+            sql.push_str(" ORDER BY RANDOM()");
+        }
+
+        if let Some(limit) = sample {
+            sql.push_str(&format!(" LIMIT {}", limit));
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+        let results = stmt.query_map(param_refs.as_slice(), |row| {
+            let embedding_blob: Vec<u8> = row.get(5)?;
+            let embedding: Vec<f32> = embedding_blob
+                .chunks(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+
+            Ok(ExportedRepo {
+                full_name: row.get(0)?,
+                description: row.get(1)?,
+                stars: row.get::<_, i64>(2)? as u64,
+                language: row.get(3)?,
+                topics: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                embedding,
+            })
+        })?;
+
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+}
+
+/// Exported repo data for cluster visualization
+#[derive(Debug, Clone)]
+pub struct ExportedRepo {
+    pub full_name: String,
+    pub description: Option<String>,
+    pub stars: u64,
+    pub language: Option<String>,
+    pub topics: String,
+    pub embedding: Vec<f32>,
 }
 
 /// Extended repo details for exploration features

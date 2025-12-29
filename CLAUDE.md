@@ -247,30 +247,28 @@ goto-gh cross "rust systems programming" "webassembly browser" --limit 20
 
 **Use case:** Discovering innovative projects that bridge different domains
 
-## Python Scripts
+### Cluster Map - Visual Embedding Space
 
-### Cluster Map Visualization
-
-Visualize the embedding space using UMAP dimensionality reduction:
+Generate an interactive HTML visualization of repo embeddings using t-SNE dimensionality reduction.
 
 ```bash
-# Install dependencies
-pip install umap-learn plotly pandas numpy
+# Generate cluster map (default 5000 repos)
+goto-gh cluster-map -o clusters.html
 
-# Generate visualization
-python scripts/cluster_map.py --sample 10000 --output cluster_map.html
+# With filters
+goto-gh cluster-map -s 10000 --min-stars 100 -o popular_clusters.html
+goto-gh cluster-map -s 20000 --language Python -o python_clusters.html
 
-# Filter by stars or language
-python scripts/cluster_map.py --sample 50000 --min-stars 100 --output popular_clusters.html
-python scripts/cluster_map.py --sample 20000 --language Python --output python_clusters.html
+# Tune t-SNE parameters
+goto-gh cluster-map -s 5000 --perplexity 50 --epochs 500 -o tuned_clusters.html
 ```
 
 **Options:**
-- `--sample N` - Number of repos to sample (default: 10000)
-- `--min-stars N` - Minimum stars filter
+- `-s, --sample N` - Number of repos to sample (default: 5000)
+- `--min-stars N` - Minimum stars filter (default: 0)
 - `--language X` - Filter by language
-- `--n-neighbors N` - UMAP parameter (default: 15)
-- `--min-dist F` - UMAP parameter (default: 0.1)
-- `--output FILE` - Output HTML file
+- `--perplexity F` - t-SNE perplexity parameter (default: 30)
+- `--epochs N` - t-SNE iterations (default: 1000)
+- `-o, --output FILE` - Output HTML file (default: cluster_map.html)
 
 **Use case:** Visual exploration of repo clusters, finding thematic communities

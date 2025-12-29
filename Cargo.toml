@@ -62,6 +62,9 @@ dotenvy = "0.15"
 # Random number generation
 rand = "0.8"
 
+# t-SNE dimensionality reduction (Barnes-Hut)
+bhtsne = "0.5"
+
 [profile.release]
 opt-level = 3
 lto = true
