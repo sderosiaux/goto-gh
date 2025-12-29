@@ -20,9 +20,9 @@ const MAX_BATCH_SIZE: usize = 2048;
 const MAX_TOKENS_PER_REQUEST: usize = 250_000;
 
 /// Maximum tokens per individual text (text-embedding-3-small context limit is 8191)
-/// Using 6500 to account for tiktoken estimation variance (~20% margin)
-/// tiktoken can underestimate by 10-20% compared to actual OpenAI token count
-const MAX_TOKENS_PER_TEXT: usize = 6500;
+/// Using 5000 to account for tiktoken estimation variance, especially for CJK text
+/// tiktoken can underestimate significantly for Chinese/Japanese/Korean characters
+const MAX_TOKENS_PER_TEXT: usize = 5000;
 
 /// Singleton tokenizer for cl100k_base (used by text-embedding-3-small)
 static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
@@ -116,8 +116,10 @@ impl OpenAIClient {
                 let tokenizer = get_tokenizer();
                 let tokens = tokenizer.encode_with_special_tokens(text);
                 let truncated_tokens = &tokens[..MAX_TOKENS_PER_TEXT];
+                // Decode can fail for incomplete UTF-8 sequences at truncation boundary
+                // Fallback: use conservative character limit (1 char ≈ 1-3 tokens for CJK)
                 let truncated = tokenizer.decode(truncated_tokens.to_vec())
-                    .unwrap_or_else(|_| text.chars().take(MAX_TOKENS_PER_TEXT * 4).collect());
+                    .unwrap_or_else(|_| text.chars().take(MAX_TOKENS_PER_TEXT).collect());
                 (truncated, MAX_TOKENS_PER_TEXT)
             } else {
                 (text.clone(), text_tokens)
