@@ -335,19 +335,40 @@ impl Database {
         let topics_json = serde_json::to_string(&repo.topics)?;
         let owner = repo.full_name.split('/').next().unwrap_or("").to_lowercase();
 
+        // Check if repo exists (case-insensitive) and get the canonical name
+        let existing: Option<(i64, String)> = self.conn.query_row(
+            "SELECT id, full_name FROM repos WHERE LOWER(full_name) = LOWER(?1) LIMIT 1",
+            params![&repo.full_name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+
+        if let Some((id, canonical_name)) = existing {
+            // Update existing row using canonical name
+            self.conn.execute(
+                "UPDATE repos SET
+                    description = ?2, url = ?3, stars = ?4, language = ?5, topics = ?6,
+                    readme_excerpt = ?7, embedded_text = ?8, last_indexed = ?9, owner = ?10
+                 WHERE id = ?1",
+                params![
+                    id,
+                    repo.description,
+                    &repo.html_url,
+                    repo.stargazers_count as i64,
+                    repo.language,
+                    topics_json,
+                    readme_excerpt,
+                    embedded_text,
+                    &now,
+                    owner,
+                ],
+            )?;
+            return Ok(id);
+        }
+
+        // Insert new row
         self.conn.execute(
             "INSERT INTO repos (full_name, description, url, stars, language, topics, readme_excerpt, embedded_text, last_indexed, owner)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(full_name) DO UPDATE SET
-                 description = ?2,
-                 url = ?3,
-                 stars = ?4,
-                 language = ?5,
-                 topics = ?6,
-                 readme_excerpt = ?7,
-                 embedded_text = ?8,
-                 last_indexed = ?9,
-                 owner = ?10",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 repo.full_name,
                 repo.description,
@@ -732,17 +753,26 @@ impl Database {
         for name in names {
             // Extract owner from full_name (part before /)
             let owner = name.split('/').next().unwrap_or("").to_lowercase();
-            // Try INSERT OR IGNORE and check if it actually inserted
-            let result = self.conn.execute(
-                "INSERT OR IGNORE INTO repos (full_name, url, last_indexed, owner)
+
+            // Check if repo already exists (case-insensitive)
+            let exists: bool = self.conn.query_row(
+                "SELECT 1 FROM repos WHERE LOWER(full_name) = LOWER(?1) LIMIT 1",
+                params![name],
+                |_| Ok(true),
+            ).unwrap_or(false);
+
+            if exists {
+                skipped += 1;
+                continue;
+            }
+
+            // Insert new repo stub
+            self.conn.execute(
+                "INSERT INTO repos (full_name, url, last_indexed, owner)
                  VALUES (?1, ?2, '1970-01-01T00:00:00Z', ?3)",
                 params![name, format!("https://github.com/{}", name), owner],
             )?;
-            if result > 0 {
-                inserted += 1;
-            } else {
-                skipped += 1;
-            }
+            inserted += 1;
         }
 
         self.conn.execute("COMMIT", [])?;
