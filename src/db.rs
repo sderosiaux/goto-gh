@@ -760,7 +760,7 @@ impl Database {
         let mut inserted = 0;
         let mut updated = 0;
 
-        self.conn.execute("BEGIN TRANSACTION", [])?;
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
 
         for repo in repos {
             let owner = repo.full_name.split('/').next().unwrap_or("").to_lowercase();

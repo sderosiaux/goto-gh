@@ -268,7 +268,7 @@ async fn run_discover_worker_loop(state: Arc<ServerState>, shutdown: Arc<AtomicB
                 }
             }
             Err(e) => {
-                eprintln!("\x1b[35m[discover]\x1b[0m \x1b[31mError: {}\x1b[0m", e);
+                eprintln!("\x1b[35m[discover]\x1b[0m \x1b[31mError: {:#}\x1b[0m", e);
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
