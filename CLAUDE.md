@@ -178,10 +178,9 @@ OPENAI_API_KEY=sk-...               # For OpenAI embeddings
 
 ## GraphQL Query
 
-Current query fetches per repo:
+Current query fetches per repo (metadata only, no README):
 - `nameWithOwner`, `description`, `stargazerCount`
 - `primaryLanguage`, `repositoryTopics` (first 10)
 - `pushedAt`, `createdAt`
-- `README.md` content via `object(expression: "HEAD:README.md")`
 
-Note: Only fetches `README.md` (uppercase). Repos with other README names (readme.md, README, README.rst) will have null readme_excerpt.
+README is fetched separately via `fetch-missing-readmes` (REST API) which handles all README variants (README.md, readme.md, README.rst, etc.).
