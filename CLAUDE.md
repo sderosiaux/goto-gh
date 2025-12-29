@@ -184,3 +184,93 @@ Current query fetches per repo (metadata only, no README):
 - `pushedAt`, `createdAt`
 
 README is fetched separately via `fetch-missing-readmes` (REST API) which handles all README variants (README.md, readme.md, README.rst, etc.).
+
+## Exploration Commands
+
+Three commands for discovering repos through semantic similarity:
+
+### Walk - Random Walk Through Embedding Space
+
+Traverse the embedding space by hopping between semantically similar repos. Each step selects a weighted random neighbor, favoring closer repos but allowing exploration.
+
+```bash
+# Start from a specific repo
+goto-gh walk facebook/react --steps 5 --breadth 10
+
+# Start from a random repo
+goto-gh walk --random-start --steps 10
+```
+
+**Options:**
+- `--steps N` - Number of hops (default: 5)
+- `--breadth N` - Candidates to consider per step (default: 10)
+- `--random-start` - Start from a random embedded repo
+
+**Use case:** Serendipitous discovery, exploring semantic neighborhoods
+
+### Underrated - Find Hidden Gems
+
+Find repos semantically similar to popular ones but with fewer stars. Uses an "underrated score" = similarity / log(stars + 1) to surface overlooked projects.
+
+```bash
+# Find gems similar to a specific popular repo
+goto-gh underrated --reference facebook/react --max-stars 500
+
+# Sample from top popular repos and find their underrated alternatives
+goto-gh underrated --sample 50 --min-sim 0.5 --max-stars 1000
+```
+
+**Options:**
+- `--reference <repo>` - Specific popular repo to find alternatives for
+- `--sample N` - Number of popular repos to sample (default: 50)
+- `--min-sim F` - Minimum similarity threshold 0-1 (default: 0.75)
+- `--max-stars N` - Maximum stars for a repo to be "underrated" (default: 500)
+- `--limit N` - Results per reference (default: 5)
+
+**Use case:** Finding quality alternatives to well-known projects
+
+### Cross - Cross-Pollination Detector
+
+Find repos at the intersection of two topics/domains. Uses harmonic mean to reward balance between both topics.
+
+```bash
+# Find repos combining ML and music
+goto-gh cross "machine learning" "music" --min-each 0.2
+
+# Find Rust + WebAssembly projects
+goto-gh cross "rust systems programming" "webassembly browser" --limit 20
+```
+
+**Options:**
+- `--min-each F` - Minimum similarity to each topic (default: 0.5)
+- `--limit N` - Number of results (default: 20)
+
+**Use case:** Discovering innovative projects that bridge different domains
+
+## Python Scripts
+
+### Cluster Map Visualization
+
+Visualize the embedding space using UMAP dimensionality reduction:
+
+```bash
+# Install dependencies
+pip install umap-learn plotly pandas numpy
+
+# Generate visualization
+python scripts/cluster_map.py --sample 10000 --output cluster_map.html
+
+# Filter by stars or language
+python scripts/cluster_map.py --sample 50000 --min-stars 100 --output popular_clusters.html
+python scripts/cluster_map.py --sample 20000 --language Python --output python_clusters.html
+```
+
+**Options:**
+- `--sample N` - Number of repos to sample (default: 10000)
+- `--min-stars N` - Minimum stars filter
+- `--language X` - Filter by language
+- `--n-neighbors N` - UMAP parameter (default: 15)
+- `--min-dist F` - UMAP parameter (default: 0.1)
+- `--output FILE` - Output HTML file
+
+**Use case:** Visual exploration of repo clusters, finding thematic communities

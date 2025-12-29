@@ -59,6 +59,9 @@ tiktoken-rs = "0.6"
 # Environment file loading
 dotenvy = "0.15"
 
+# Random number generation
+rand = "0.8"
+
 [profile.release]
 opt-level = 3
 lto = true

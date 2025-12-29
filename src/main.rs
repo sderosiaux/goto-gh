@@ -3,6 +3,7 @@ mod db;
 mod discovery;
 mod embed_core;
 mod embedding;
+mod explore;
 mod fetch;
 mod formatting;
 mod github;
@@ -257,6 +258,67 @@ enum Commands {
         #[arg(long)]
         debug: bool,
     },
+
+    // ==================== Exploration Commands ====================
+
+    /// Semantic random walk through repos - discover by wandering
+    Walk {
+        /// Starting repo (owner/repo) or empty for random start
+        #[arg(default_value = "")]
+        repo: String,
+
+        /// Number of steps to take
+        #[arg(short, long, default_value = "5")]
+        steps: usize,
+
+        /// Number of candidates to consider at each step
+        #[arg(short, long, default_value = "10")]
+        breadth: usize,
+
+        /// Start from a random repo
+        #[arg(long)]
+        random_start: bool,
+    },
+
+    /// Find underrated gems similar to popular repos
+    Underrated {
+        /// Minimum similarity threshold (0-1)
+        #[arg(long, default_value = "0.6")]
+        min_sim: f32,
+
+        /// Maximum stars for "underrated" repos
+        #[arg(long, default_value = "500")]
+        max_stars: u64,
+
+        /// Reference repo to find alternatives for (optional)
+        #[arg(long)]
+        reference: Option<String>,
+
+        /// Number of popular repos to sample (if no reference)
+        #[arg(long, default_value = "20")]
+        sample: usize,
+
+        /// Gems to show per reference
+        #[arg(short, long, default_value = "5")]
+        limit: usize,
+    },
+
+    /// Find repos at the intersection of two topics
+    Cross {
+        /// First topic/domain
+        topic1: String,
+
+        /// Second topic/domain
+        topic2: String,
+
+        /// Minimum similarity to each topic (0-1)
+        #[arg(long, default_value = "0.4")]
+        min_each: f32,
+
+        /// Number of results
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
 }
 
 #[tokio::main]
@@ -443,6 +505,15 @@ async fn run_main(cli: Cli, db: Database) -> Result<()> {
             // Server manages its own DB connections
             drop(db);
             server::start_server(config).await
+        }
+        Some(Commands::Walk { repo, steps, breadth, random_start }) => {
+            run_walk(&db, &repo, steps, breadth, random_start)
+        }
+        Some(Commands::Underrated { min_sim, max_stars, reference, sample, limit }) => {
+            run_underrated(&db, min_sim, max_stars, reference, sample, limit)
+        }
+        Some(Commands::Cross { topic1, topic2, min_each, limit }) => {
+            run_cross(&db, &topic1, &topic2, min_each, limit)
         }
         None => {
             use clap::CommandFactory;
@@ -1172,6 +1243,194 @@ fn extract_repos(db: &Database, limit: Option<usize>, batch_size: usize) -> Resu
     );
     eprintln!("    Discovered {} new repo stubs", total_discovered);
     eprintln!("    Run: goto-gh fetch");
+
+    Ok(())
+}
+
+// ==================== Exploration Commands ====================
+
+/// Random walk through embedding space
+fn run_walk(db: &Database, repo: &str, steps: usize, breadth: usize, random_start: bool) -> Result<()> {
+    use explore::{random_walk, WalkConfig};
+
+    let config = WalkConfig {
+        steps,
+        breadth,
+        random_start: random_start || repo.is_empty(),
+    };
+
+    let result = random_walk(db, repo, &config)?;
+
+    if result.steps.is_empty() {
+        eprintln!("\x1b[31mx\x1b[0m Walk failed - no repos found");
+        return Ok(());
+    }
+
+    // Print starting point
+    let start = &result.steps[0];
+    println!(
+        "\x1b[36mRandom Walk\x1b[0m starting from: \x1b[1m{}\x1b[0m {}",
+        start.repo.full_name,
+        format_stars(start.repo.stars)
+    );
+    if let Some(desc) = &start.repo.description {
+        println!("  \x1b[90m{}\x1b[0m", truncate_str(desc, 70));
+    }
+    println!();
+
+    // Print each step
+    for step in result.steps.iter().skip(1) {
+        let lang = step.repo.language.as_deref().unwrap_or("?");
+        let similarity = (-step.distance).exp();
+
+        println!(
+            "\x1b[33mStep {}\x1b[0m → \x1b[1m{}\x1b[0m {} \x1b[90m[{}]\x1b[0m",
+            step.step_num,
+            step.repo.full_name,
+            format_stars(step.repo.stars),
+            lang
+        );
+        if let Some(desc) = &step.repo.description {
+            println!("         \x1b[90m{}\x1b[0m", truncate_str(desc, 65));
+        }
+        println!(
+            "         \x1b[90mSimilarity: {:.0}% (from {} candidates)\x1b[0m",
+            similarity * 100.0,
+            step.candidates_considered
+        );
+        println!();
+    }
+
+    println!(
+        "\x1b[36mWalk complete:\x1b[0m {} steps, total distance: {:.2}",
+        result.steps.len() - 1,
+        result.total_distance
+    );
+
+    Ok(())
+}
+
+/// Find underrated gems
+fn run_underrated(
+    db: &Database,
+    min_sim: f32,
+    max_stars: u64,
+    reference: Option<String>,
+    sample: usize,
+    limit: usize,
+) -> Result<()> {
+    use explore::{find_underrated, UnderratedConfig};
+
+    let config = UnderratedConfig {
+        min_similarity: min_sim,
+        max_stars,
+        reference: reference.clone(),
+        sample_popular: sample,
+        min_reference_stars: 5000,
+        limit_per_reference: limit,
+    };
+
+    eprintln!("\x1b[36m..\x1b[0m Finding underrated gems (min similarity: {:.0}%, max stars: {})",
+        min_sim * 100.0, max_stars);
+
+    let results = find_underrated(db, &config)?;
+
+    if results.is_empty() {
+        eprintln!("\x1b[33m!\x1b[0m No underrated gems found with current criteria");
+        eprintln!("    Try: --min-sim 0.5 or --max-stars 1000");
+        return Ok(());
+    }
+
+    println!();
+    println!("\x1b[36mUnderrated Gems\x1b[0m\n");
+
+    for result in &results {
+        println!(
+            "\x1b[1mSimilar to {}\x1b[0m {}",
+            result.reference.full_name,
+            format_stars(result.reference.stars)
+        );
+
+        for (i, gem) in result.gems.iter().enumerate() {
+            let lang = gem.repo.language.as_deref().unwrap_or("?");
+            println!(
+                "  {}. {} {} \x1b[90m[{}]\x1b[0m \x1b[32m{:.0}% similar\x1b[0m",
+                i + 1,
+                format_repo_link(&gem.repo.full_name, &gem.repo.url),
+                format_stars(gem.repo.stars),
+                lang,
+                gem.similarity * 100.0
+            );
+            if let Some(desc) = &gem.repo.description {
+                println!("     \x1b[90m{}\x1b[0m", truncate_str(desc, 65));
+            }
+        }
+        println!();
+    }
+
+    let total_gems: usize = results.iter().map(|r| r.gems.len()).sum();
+    println!(
+        "\x1b[36mFound {} gems\x1b[0m from {} reference repos",
+        total_gems,
+        results.len()
+    );
+
+    Ok(())
+}
+
+/// Find cross-pollination repos
+fn run_cross(db: &Database, topic1: &str, topic2: &str, min_each: f32, limit: usize) -> Result<()> {
+    use explore::{find_cross_pollination, CrossConfig};
+
+    let config = CrossConfig {
+        topic1: topic1.to_string(),
+        topic2: topic2.to_string(),
+        min_each,
+        limit,
+    };
+
+    eprintln!(
+        "\x1b[36m..\x1b[0m Finding repos at intersection of \"{}\" × \"{}\"",
+        topic1, topic2
+    );
+
+    let results = find_cross_pollination(db, &config)?;
+
+    if results.is_empty() {
+        eprintln!("\x1b[33m!\x1b[0m No cross-pollination repos found");
+        eprintln!("    Try: --min-each 0.3 or different topics");
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "\x1b[36mCross-Pollination:\x1b[0m \"{}\" × \"{}\"\n",
+        topic1, topic2
+    );
+
+    for (i, result) in results.iter().enumerate() {
+        let lang = result.repo.language.as_deref().unwrap_or("?");
+        println!(
+            "  {:>2}. {} {} \x1b[90m[{}]\x1b[0m",
+            i + 1,
+            format_repo_link(&result.repo.full_name, &result.repo.url),
+            format_stars(result.repo.stars),
+            lang
+        );
+        println!(
+            "      \x1b[32m{}: {:.0}%\x1b[0m  \x1b[34m{}: {:.0}%\x1b[0m",
+            truncate_str(topic1, 15),
+            result.sim_topic1 * 100.0,
+            truncate_str(topic2, 15),
+            result.sim_topic2 * 100.0
+        );
+        if let Some(desc) = &result.repo.description {
+            println!("      \x1b[90m{}\x1b[0m", truncate_str(desc, 65));
+        }
+        println!();
+    }
+
+    println!("\x1b[36mFound {} repos\x1b[0m at the intersection", results.len());
 
     Ok(())
 }

@@ -1651,6 +1651,172 @@ impl Database {
         )?;
         Ok(())
     }
+
+    // ==================== Exploration / Discovery Methods ====================
+
+    /// Get embedding vector for a specific repo by ID
+    /// Returns None if the repo doesn't have an embedding
+    pub fn get_embedding(&self, repo_id: i64) -> Result<Option<Vec<f32>>> {
+        let result: Option<Vec<u8>> = self.conn.query_row(
+            "SELECT embedding FROM repo_embeddings WHERE repo_id = ?",
+            [repo_id],
+            |row| row.get(0),
+        ).optional()?;
+
+        Ok(result.map(|bytes| {
+            bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect()
+        }))
+    }
+
+    /// Get repo ID by full_name (case-insensitive)
+    pub fn get_repo_id_by_name(&self, full_name: &str) -> Result<Option<i64>> {
+        let id: Option<i64> = self.conn.query_row(
+            "SELECT id FROM repos WHERE LOWER(full_name) = LOWER(?)",
+            [full_name],
+            |row| row.get(0),
+        ).optional()?;
+        Ok(id)
+    }
+
+    /// Get a random repo that has an embedding
+    /// Returns (repo_id, full_name)
+    pub fn random_embedded_repo(&self) -> Result<Option<(i64, String)>> {
+        let result: Option<(i64, String)> = self.conn.query_row(
+            "SELECT r.id, r.full_name FROM repos r
+             INNER JOIN repo_embeddings e ON r.id = e.repo_id
+             WHERE r.gone = 0
+             ORDER BY RANDOM()
+             LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        Ok(result)
+    }
+
+    /// Find similar repos excluding specific IDs
+    /// Returns (repo_id, distance) pairs sorted by distance
+    pub fn find_similar_excluding(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        exclude_ids: &[i64],
+    ) -> Result<Vec<(i64, f32)>> {
+        if exclude_ids.is_empty() {
+            return self.find_similar(query_embedding, limit);
+        }
+
+        // sqlite-vec requires k parameter in MATCH clause, so we can't filter in SQL
+        // Instead, fetch more results than needed and filter in memory
+        use std::collections::HashSet;
+        let exclude_set: HashSet<i64> = exclude_ids.iter().copied().collect();
+
+        // Fetch extra results to account for filtered items
+        let fetch_limit = limit + exclude_ids.len() + 10;
+        let all_results = self.find_similar(query_embedding, fetch_limit)?;
+
+        // Filter out excluded IDs and take only what we need
+        let filtered: Vec<(i64, f32)> = all_results
+            .into_iter()
+            .filter(|(id, _)| !exclude_set.contains(id))
+            .take(limit)
+            .collect();
+
+        Ok(filtered)
+    }
+
+    /// Get repos by star range that have embeddings
+    /// Returns (repo_id, full_name, stars)
+    pub fn get_repos_by_star_range(
+        &self,
+        min_stars: i64,
+        max_stars: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, i64)>> {
+        let (sql, params_vec): (&str, Vec<i64>) = match max_stars {
+            Some(max) => (
+                "SELECT r.id, r.full_name, r.stars FROM repos r
+                 INNER JOIN repo_embeddings e ON r.id = e.repo_id
+                 WHERE r.gone = 0 AND r.stars >= ?1 AND r.stars <= ?2
+                 ORDER BY r.stars DESC
+                 LIMIT ?3",
+                vec![min_stars, max, limit as i64],
+            ),
+            None => (
+                "SELECT r.id, r.full_name, r.stars FROM repos r
+                 INNER JOIN repo_embeddings e ON r.id = e.repo_id
+                 WHERE r.gone = 0 AND r.stars >= ?1
+                 ORDER BY r.stars DESC
+                 LIMIT ?2",
+                vec![min_stars, limit as i64],
+            ),
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let results = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Get repo details by ID (extended version with more fields)
+    pub fn get_repo_details(&self, id: i64) -> Result<Option<RepoDetails>> {
+        let result = self.conn.query_row(
+            "SELECT full_name, description, url, stars, language, topics FROM repos WHERE id = ?",
+            [id],
+            |row| {
+                let topics_json: Option<String> = row.get(5)?;
+                let topics: Vec<String> = topics_json
+                    .and_then(|t| serde_json::from_str(&t).ok())
+                    .unwrap_or_default();
+
+                Ok(RepoDetails {
+                    id,
+                    full_name: row.get(0)?,
+                    description: row.get(1)?,
+                    url: row.get(2)?,
+                    stars: row.get::<_, i64>(3)? as u64,
+                    language: row.get(4)?,
+                    topics,
+                })
+            },
+        ).optional()?;
+
+        Ok(result)
+    }
+
+    /// Sample random repos with embeddings
+    /// Returns (repo_id, full_name, stars)
+    pub fn sample_embedded_repos(&self, count: usize) -> Result<Vec<(i64, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.full_name, r.stars FROM repos r
+             INNER JOIN repo_embeddings e ON r.id = e.repo_id
+             WHERE r.gone = 0
+             ORDER BY RANDOM()
+             LIMIT ?"
+        )?;
+
+        let results = stmt.query_map([count as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+
+        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+}
+
+/// Extended repo details for exploration features
+#[derive(Debug, Clone)]
+pub struct RepoDetails {
+    pub id: i64,
+    pub full_name: String,
+    pub description: Option<String>,
+    pub url: String,
+    pub stars: u64,
+    pub language: Option<String>,
+    pub topics: Vec<String>,
 }
 
 #[cfg(test)]
