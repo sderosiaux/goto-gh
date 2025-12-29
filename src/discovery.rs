@@ -2,13 +2,40 @@
 //!
 //! Provides core discovery logic used by both CLI and server modes.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::cell::RefCell;
 use std::io::{IsTerminal, Write};
+use std::thread;
+use std::time::Duration;
 
 use crate::db::Database;
 use crate::formatting::format_owner_link;
 use crate::github::{DiscoveredRepo, GitHubClient};
+
+/// Retry a database operation on "database is locked" errors
+/// Uses exponential backoff: 100ms, 200ms, 400ms (3 attempts total)
+fn retry_on_locked<T, F: FnMut() -> Result<T>>(mut f: F) -> Result<T> {
+    let mut attempt = 0;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let is_locked = e.to_string().to_lowercase().contains("database is locked");
+                if is_locked && attempt < 3 {
+                    attempt += 1;
+                    let delay = Duration::from_millis(100 * (1 << (attempt - 1))); // 100, 200, 400ms
+                    eprintln!(
+                        "\x1b[33m[discover]\x1b[0m database locked, retry {}/3 in {:?}",
+                        attempt, delay
+                    );
+                    thread::sleep(delay);
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
 
 /// Result from discovering an owner's repos and followers
 #[derive(Debug, Default, Clone)]
@@ -65,11 +92,11 @@ pub async fn discover_owner_repos_core(
     db: &Database,
     owner: &str,
 ) -> Result<usize> {
-    if db.is_owner_repos_fetched(owner)? {
+    if retry_on_locked(|| db.is_owner_repos_fetched(owner))? {
         return Ok(0);
     }
 
-    db.mark_owner_in_progress(owner)?;
+    retry_on_locked(|| db.mark_owner_in_progress(owner))?;
 
     // Collect all repos with full metadata
     let mut all_repos: Vec<DiscoveredRepo> = Vec::new();
@@ -82,8 +109,11 @@ pub async fn discover_owner_repos_core(
 
     match result {
         Ok(count) => {
-            let (inserted, _) = db.save_discovered_repos(&all_repos)?;
-            db.mark_owner_explored(owner, count)?;
+            // Note: save_discovered_repos uses internal transaction, don't retry
+            // (would cause "cannot start transaction within transaction")
+            let (inserted, _) = db.save_discovered_repos(&all_repos)
+                .with_context(|| format!("save_discovered_repos for {}", owner))?;
+            retry_on_locked(|| db.mark_owner_explored(owner, count))?;
             Ok(inserted)
         }
         Err(e) => {
@@ -91,7 +121,7 @@ pub async fn discover_owner_repos_core(
             let err_str = e.to_string().to_lowercase();
             if err_str.contains("not found") || err_str.contains("404") {
                 // Owner doesn't exist, mark as explored with 0 repos
-                db.mark_owner_explored(owner, 0)?;
+                retry_on_locked(|| db.mark_owner_explored(owner, 0))?;
                 Ok(0)
             } else {
                 // Other error (rate limit, network, etc.) - don't mark, will retry
@@ -110,11 +140,11 @@ pub async fn discover_owner_followers_core(
     db: &Database,
     owner: &str,
 ) -> Result<usize> {
-    if db.is_owner_followers_fetched(owner)? {
+    if retry_on_locked(|| db.is_owner_followers_fetched(owner))? {
         return Ok(0);
     }
 
-    db.mark_owner_followers_in_progress(owner)?;
+    retry_on_locked(|| db.mark_owner_followers_in_progress(owner))?;
 
     // Collect all followers first (no callback to avoid RefCell issues)
     let mut all_followers: Vec<String> = Vec::new();
@@ -127,8 +157,10 @@ pub async fn discover_owner_followers_core(
 
     match result {
         Ok(count) => {
-            let (added, _) = db.add_followers_as_owners_bulk(&all_followers)?;
-            db.mark_owner_followers_fetched(owner, count)?;
+            // Note: add_followers_as_owners_bulk uses internal transaction, don't retry
+            let (added, _) = db.add_followers_as_owners_bulk(&all_followers)
+                .with_context(|| format!("add_followers_as_owners_bulk for {}", owner))?;
+            retry_on_locked(|| db.mark_owner_followers_fetched(owner, count))?;
             Ok(added)
         }
         Err(e) => {
@@ -136,7 +168,7 @@ pub async fn discover_owner_followers_core(
             let err_str = e.to_string().to_lowercase();
             if err_str.contains("not found") || err_str.contains("404") {
                 // Owner doesn't exist, mark as fetched with 0 followers
-                db.mark_owner_followers_fetched(owner, 0)?;
+                retry_on_locked(|| db.mark_owner_followers_fetched(owner, 0))?;
                 Ok(0)
             } else {
                 // Other error (rate limit, network, etc.) - don't mark, will retry

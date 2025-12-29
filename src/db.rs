@@ -2,11 +2,18 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{ffi::sqlite3_auto_extension, params, Connection, OptionalExtension};
 use sqlite_vec::sqlite3_vec_init;
+use std::thread;
+use std::time::Duration;
 use zerocopy::AsBytes;
 
 use crate::config::Config;
 use crate::embedding::EMBEDDING_DIM;
 use crate::github::{DiscoveredRepo, GitHubRepo, RepoWithReadme};
+
+/// Check if an error is a "database is locked" error
+fn is_locked_error(e: &anyhow::Error) -> bool {
+    e.to_string().to_lowercase().contains("database is locked")
+}
 
 /// Stored repository with metadata
 #[derive(Debug, Clone)]
