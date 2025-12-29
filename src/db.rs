@@ -783,16 +783,18 @@ impl Database {
             ).optional()?;
 
             if let Some(id) = existing_id {
-                // Update existing row with fresh metadata (but preserve readme_excerpt if present)
+                // Update existing row with fresh metadata
+                // Use COALESCE to preserve existing values when new value is NULL
+                // But always update stars (even to 0) since that's valid data
                 self.conn.execute(
                     "UPDATE repos SET
-                        description = ?2,
+                        description = COALESCE(?2, description),
                         url = ?3,
-                        stars = ?4,
-                        language = ?5,
-                        topics = ?6,
-                        pushed_at = ?7,
-                        created_at = ?8,
+                        stars = CASE WHEN ?4 > 0 THEN ?4 ELSE COALESCE(stars, ?4) END,
+                        language = COALESCE(?5, language),
+                        topics = COALESCE(?6, topics),
+                        pushed_at = COALESCE(?7, pushed_at),
+                        created_at = COALESCE(?8, created_at),
                         last_indexed = ?9,
                         owner = ?10,
                         embedded_text = COALESCE(
