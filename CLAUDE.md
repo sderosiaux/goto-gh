@@ -84,8 +84,10 @@ WHERE gone = 0
   AND embedded_text IS NOT NULL
   AND (readme_excerpt IS NULL OR readme_excerpt = '');
 
--- Repos needing metadata fetch
-SELECT COUNT(*) FROM repos WHERE gone = 0 AND embedded_text IS NULL;
+-- Repos needing metadata fetch (for GraphQL backfill)
+SELECT COUNT(*) FROM repos
+WHERE gone = 0 AND (stars IS NULL OR stars = 0)
+  AND description IS NULL AND language IS NULL;
 
 -- Repos needing embeddings
 SELECT COUNT(*) FROM repos
@@ -100,23 +102,71 @@ WHERE lower(full_name) LIKE '%query%'
 ORDER BY stars DESC LIMIT 10;
 ```
 
+## Data Flow
+
+### Commands & What They Do
+
+| Command | API | What it captures | Target |
+|---------|-----|------------------|--------|
+| `discover` | REST | Full metadata (stars, desc, lang, topics) | New repos from owners |
+| `fetch` | GraphQL | Metadata only (no README) | Old repos without metadata |
+| `fetch-missing-readmes` | REST | README only (rebuilds embedded_text) | Repos with metadata but no README |
+| `embed` | OpenAI | Vector embeddings | Repos with embedded_text but no embedding |
+
+### Pipeline
+
+```
+discover (REST)          fetch (GraphQL)
+     │                        │
+     ▼                        ▼
+┌─────────────────────────────────────┐
+│  repos with metadata (stars, desc)  │
+│  embedded_text = name|desc|topics   │
+└─────────────────────────────────────┘
+                  │
+                  ▼
+        fetch-missing-readmes (REST)
+                  │
+                  ▼
+┌─────────────────────────────────────┐
+│  repos with README                  │
+│  embedded_text = name|desc|...|README│
+└─────────────────────────────────────┘
+                  │
+                  ▼
+              embed (OpenAI)
+                  │
+                  ▼
+┌─────────────────────────────────────┐
+│  repos with vector embeddings       │
+│  has_embedding = 1                  │
+└─────────────────────────────────────┘
+```
+
+### Key Conditions
+
+- **`discover`**: Adds new repos OR updates existing repos without metadata
+- **`fetch` (GraphQL)**: Targets `WHERE stars IS NULL AND description IS NULL AND language IS NULL`
+- **`fetch-missing-readmes`**: Targets `WHERE embedded_text IS NOT NULL AND readme_excerpt IS NULL`
+- **`embed`**: Targets `WHERE has_embedding = 0 AND embedded_text IS NOT NULL`
+
 ## Architecture
 
 ### Server Mode (`goto-gh server`)
 
 Runs 3 concurrent workers:
-- **fetch**: Fetches repo metadata + README via GraphQL (1 worker per token)
-- **discover**: Explores owner profiles, finds new repos/followers
+- **fetch**: Fetches repo metadata via GraphQL (backfill old repos)
+- **discover**: Explores owner profiles, finds new repos with full metadata (REST)
 - **embed**: Generates vector embeddings for semantic search
 
 ### Key Modules
 
-- `src/github.rs` - GitHub API client (GraphQL + REST)
-- `src/db.rs` - SQLite operations
+- `src/github.rs` - GitHub API client (GraphQL + REST), includes `rest_get()` helper
+- `src/db.rs` - SQLite operations, `save_discovered_repos()` for full metadata
 - `src/server.rs` - Concurrent worker orchestration
 - `src/embed_core.rs` - Embedding generation
-- `src/discovery.rs` - Profile/repo discovery
-- `src/fetch.rs` - Metadata fetching
+- `src/discovery.rs` - Profile/repo discovery with full metadata capture
+- `src/fetch.rs` - GraphQL metadata fetching (backfill)
 
 ### Environment Variables
 
