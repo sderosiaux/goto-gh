@@ -938,6 +938,15 @@ impl Database {
         Ok(count)
     }
 
+    /// Mark a single repo as gone (deleted/private/legal takedown)
+    pub fn mark_as_gone(&self, full_name: &str) -> Result<bool> {
+        let rows = self.conn.execute(
+            "UPDATE repos SET gone = 1 WHERE LOWER(full_name) = LOWER(?)",
+            [full_name],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Mark multiple repos as gone (batch, case-insensitive match)
     pub fn mark_as_gone_bulk(&self, names: &[String]) -> Result<usize> {
         let mut count = 0;

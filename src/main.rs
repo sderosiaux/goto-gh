@@ -1174,9 +1174,19 @@ async fn fetch_missing_readmes(
                 not_found += 1;
             }
             ReadmeResult::Error(e) => {
-                eprintln!("\x1b[31m!\x1b[0m {} - {}", full_name, e);
-                errors += 1;
-                // Don't mark as no_readme, we'll retry later
+                // Check if repo is gone (legal takedown, blocked, etc.)
+                let is_gone = e.contains("451") || e.contains("403") ||
+                              e.contains("Unavailable") || e.contains("DMCA");
+
+                if is_gone {
+                    eprintln!("\x1b[33m⚠\x1b[0m {} - gone ({})", full_name, e);
+                    let _ = db.mark_as_gone(&full_name);
+                    not_found += 1; // Count as processed
+                } else {
+                    eprintln!("\x1b[31m!\x1b[0m {} - {}", full_name, e);
+                    errors += 1;
+                    // Don't mark as no_readme, we'll retry later
+                }
             }
         }
 
