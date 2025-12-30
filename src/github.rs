@@ -9,6 +9,20 @@ use tokio::sync::Semaphore;
 
 use crate::proxy::ProxyManager;
 
+// === Error Classification ===
+
+/// Check if an error indicates the resource is permanently gone (DMCA, geo-blocked, deleted).
+/// These errors should not be retried - mark the resource as gone instead.
+pub fn is_gone_error(error: &str) -> bool {
+    let err_lower = error.to_lowercase();
+    err_lower.contains("451")
+        || err_lower.contains("unavailable for legal reasons")
+        || err_lower.contains("dmca")
+        || err_lower.contains("403")
+        || err_lower.contains("not found")
+        || err_lower.contains("404")
+}
+
 // === Configuration Constants ===
 
 /// Maximum repos per GraphQL query chunk

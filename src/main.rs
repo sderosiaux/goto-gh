@@ -23,7 +23,7 @@ use db::Database;
 use discovery::{discover_from_owners, discover_owner_repos};
 use embedding::{build_embedding_text, embed_passage};
 use formatting::{format_repo_link, format_stars, truncate_str};
-use github::GitHubClient;
+use github::{is_gone_error, GitHubClient};
 use proxy::ProxyManager;
 use search::{expand_query, search};
 
@@ -1174,11 +1174,7 @@ async fn fetch_missing_readmes(
                 not_found += 1;
             }
             ReadmeResult::Error(e) => {
-                // Check if repo is gone (legal takedown, blocked, etc.)
-                let is_gone = e.contains("451") || e.contains("403") ||
-                              e.contains("Unavailable") || e.contains("DMCA");
-
-                if is_gone {
+                if is_gone_error(&e) {
                     eprintln!("\x1b[33m⚠\x1b[0m {} - gone ({})", full_name, e);
                     let _ = db.mark_as_gone(&full_name);
                     not_found += 1; // Count as processed

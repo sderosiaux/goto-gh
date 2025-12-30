@@ -14,7 +14,7 @@ use crate::discovery::{self, DiscoveryConfig};
 use crate::embed_core::{self, EmbedRunnerConfig};
 use crate::embedding::EmbedProvider;
 use crate::fetch::{self, FetchRunnerConfig};
-use crate::github::GitHubClient;
+use crate::github::{is_gone_error, GitHubClient};
 use crate::proxy::ProxyManager;
 
 /// Server configuration
@@ -550,8 +550,15 @@ async fn run_readme_cycle(state: &ServerState, shutdown: &AtomicBool) -> Result<
                 let _ = db.mark_repo_no_readme(repo_id);
                 not_found += 1;
             }
-            ReadmeResult::Error(_) => {
-                // Don't mark as no_readme, we'll retry later
+            ReadmeResult::Error(e) => {
+                if is_gone_error(&e) {
+                    if state.config.debug {
+                        eprintln!("\x1b[32m[readme]\x1b[0m \x1b[33m⚠ {} - gone ({})\x1b[0m", full_name, e);
+                    }
+                    let _ = db.mark_as_gone(&full_name);
+                    not_found += 1; // Count as processed
+                }
+                // Other errors: Don't mark as no_readme, we'll retry later
             }
         }
     }

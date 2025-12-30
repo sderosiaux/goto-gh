@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::db::Database;
 use crate::formatting::format_owner_link;
-use crate::github::{DiscoveredRepo, GitHubClient};
+use crate::github::{is_gone_error, DiscoveredRepo, GitHubClient};
 
 /// Retry a database operation on "database is locked" errors
 /// Uses exponential backoff: 100ms, 200ms, 400ms (3 attempts total)
@@ -118,10 +118,8 @@ pub async fn discover_owner_repos_core(
             Ok(inserted)
         }
         Err(e) => {
-            // Check if it's a "not found" error (owner doesn't exist)
-            let err_str = e.to_string().to_lowercase();
-            if err_str.contains("not found") || err_str.contains("404") {
-                // Owner doesn't exist, mark as explored with 0 repos
+            if is_gone_error(&e.to_string()) {
+                // Owner doesn't exist or is blocked, mark as explored with 0 repos
                 retry_on_locked(|| db.mark_owner_explored(owner, 0))?;
                 Ok(0)
             } else {
@@ -165,10 +163,8 @@ pub async fn discover_owner_followers_core(
             Ok(added)
         }
         Err(e) => {
-            // Check if it's a "not found" error (owner doesn't exist)
-            let err_str = e.to_string().to_lowercase();
-            if err_str.contains("not found") || err_str.contains("404") {
-                // Owner doesn't exist, mark as fetched with 0 followers
+            if is_gone_error(&e.to_string()) {
+                // Owner doesn't exist or is blocked, mark as fetched with 0 followers
                 retry_on_locked(|| db.mark_owner_followers_fetched(owner, 0))?;
                 Ok(0)
             } else {
