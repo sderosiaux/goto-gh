@@ -466,7 +466,16 @@ impl GitHubClient {
                         continue;
                     }
 
-                    // Other HTTP errors (5xx, etc.) - record failure
+                    // Resource is gone (451, 404, etc.) - don't retry with other proxies
+                    let status_str = status.to_string();
+                    if is_gone_error(&status_str) {
+                        if self.debug {
+                            eprintln!("\x1b[33m[proxy]\x1b[0m {} returned {}", proxy, status);
+                        }
+                        return Err(format!("{}", status));
+                    }
+
+                    // Other HTTP errors (5xx, etc.) - record failure and try next proxy
                     if self.debug {
                         eprintln!("\x1b[33m[proxy]\x1b[0m {} returned {}", proxy, status);
                     }
