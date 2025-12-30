@@ -1,3 +1,5 @@
 /target
 repos.db
 .env
+working-proxies.txt
+popular_clusters.html
