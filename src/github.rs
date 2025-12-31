@@ -11,16 +11,95 @@ use crate::proxy::ProxyManager;
 
 // === Error Classification ===
 
-/// Check if an error indicates the resource is permanently gone (DMCA, geo-blocked, deleted).
+/// Check if an error indicates the resource is permanently gone (DMCA, geo-blocked, deleted, blocked).
 /// These errors should not be retried - mark the resource as gone instead.
 pub fn is_gone_error(error: &str) -> bool {
     let err_lower = error.to_lowercase();
+    // Status codes
     err_lower.contains("451")
         || err_lower.contains("unavailable for legal reasons")
+        // Content blocks (DMCA, trademark, TOS violations)
         || err_lower.contains("dmca")
-        || err_lower.contains("403")
+        || err_lower.contains("repository access blocked")
+        || err_lower.contains("blocked")
+        || err_lower.contains("trademark")
+        // Not found / deleted
         || err_lower.contains("not found")
         || err_lower.contains("404")
+}
+
+/// Check if a response body indicates the resource is blocked (trademark, DMCA, TOS)
+fn is_blocked_response(body: &str) -> bool {
+    let body_lower = body.to_lowercase();
+    body_lower.contains("repository access blocked")
+        || body_lower.contains("\"blocked\"")
+        || (body_lower.contains("\"message\"") && body_lower.contains("blocked"))
+}
+
+/// Result of checking an HTTP response for errors
+#[derive(Debug)]
+enum ResponseCheck {
+    /// Resource is permanently gone (blocked, DMCA, etc.) - fail fast
+    Gone(String),
+    /// Rate limited - should retry after delay
+    RateLimited { reset_timestamp: u64 },
+    /// Transient error - should retry
+    Retry,
+    /// Success - continue processing
+    Success,
+}
+
+/// Check an HTTP response status and body for errors
+async fn check_response(response: reqwest::Response, status: reqwest::StatusCode) -> (ResponseCheck, Option<reqwest::Response>) {
+    // 451 Unavailable For Legal Reasons - fail fast
+    if status.as_u16() == 451 {
+        return (ResponseCheck::Gone("Resource unavailable for legal reasons (451)".to_string()), None);
+    }
+
+    // On 403, check if it's a block or rate limit
+    if status == reqwest::StatusCode::FORBIDDEN {
+        let body = response.text().await.unwrap_or_default();
+        if is_blocked_response(&body) {
+            return (ResponseCheck::Gone(format!("Repository access blocked: {}", body)), None);
+        }
+        // It's a rate limit
+        let reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() + 60;
+        return (ResponseCheck::RateLimited { reset_timestamp: reset }, None);
+    }
+
+    // 429 rate limit
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let reset_timestamp = response.headers()
+            .get("x-ratelimit-reset")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() + 60
+            });
+        return (ResponseCheck::RateLimited { reset_timestamp }, None);
+    }
+
+    // Transient server errors
+    if status == reqwest::StatusCode::BAD_GATEWAY
+        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
+        return (ResponseCheck::Retry, None);
+    }
+
+    // Success or 404
+    if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+        return (ResponseCheck::Success, Some(response));
+    }
+
+    // Other errors - retry
+    (ResponseCheck::Retry, Some(response))
 }
 
 // === Configuration Constants ===
@@ -300,6 +379,10 @@ impl GitHubClient {
                     match self.try_with_proxies(url, pm).await {
                         Ok((resp, _)) => resp,
                         Err(e) => {
+                            // Proxy already handles gone errors - propagate them
+                            if is_gone_error(&e) {
+                                anyhow::bail!("{}", e);
+                            }
                             if attempt == 4 {
                                 anyhow::bail!("Proxy failed: {}", e);
                             }
@@ -334,58 +417,41 @@ impl GitHubClient {
 
             let status = response.status();
 
-            // Success - return immediately
-            if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-                return Ok(response);
-            }
+            // Use shared response checking logic
+            match check_response(response, status).await {
+                (ResponseCheck::Success, Some(resp)) => return Ok(resp),
+                (ResponseCheck::Gone(msg), _) => anyhow::bail!("{}", msg),
+                (ResponseCheck::RateLimited { reset_timestamp }, _) => {
+                    self.mark_token_rate_limited(reset_timestamp);
 
-            // Retry on transient errors
-            if status == reqwest::StatusCode::BAD_GATEWAY
-                || status == reqwest::StatusCode::GATEWAY_TIMEOUT
-                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            {
-                continue;
-            }
+                    // If we have proxies, retry immediately
+                    if self.proxy_manager.is_some() {
+                        continue;
+                    }
 
-            // On rate limit, mark token and retry (will use proxy if available)
-            if status == reqwest::StatusCode::FORBIDDEN
-                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            {
-                let reset_timestamp = response.headers()
-                    .get("x-ratelimit-reset")
-                    .and_then(|h| h.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or_else(|| {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs() + 60
-                    });
-
-                self.mark_token_rate_limited(reset_timestamp);
-
-                // If we have proxies, retry immediately
-                if self.proxy_manager.is_some() {
+                    // No proxies - wait for reset (capped at 2 min)
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let wait_secs = if reset_timestamp > now {
+                        (reset_timestamp - now).min(120)
+                    } else {
+                        2
+                    };
+                    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
                     continue;
                 }
-
-                // No proxies - wait for reset (capped at 2 min)
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                let wait_secs = if reset_timestamp > now {
-                    (reset_timestamp - now).min(120)
-                } else {
-                    2
-                };
-                tokio::time::sleep(Duration::from_secs(wait_secs)).await;
-                continue;
-            }
-
-            // Other errors - retry
-            if attempt == 4 {
-                anyhow::bail!("GitHub API error {}", status);
+                (ResponseCheck::Retry, _) => {
+                    if attempt == 4 {
+                        anyhow::bail!("GitHub API error {}", status);
+                    }
+                    continue;
+                }
+                (ResponseCheck::Success, None) => {
+                    // Shouldn't happen, but retry
+                    continue;
+                }
             }
         }
 
@@ -424,63 +490,38 @@ impl GitHubClient {
                 Ok(response) => {
                     let status = response.status();
 
-                    // Success or expected errors (404, etc.) - proxy worked
-                    if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-                        pm.reset_failures(&proxy);
-                        return Ok((response, Some(proxy)));
-                    }
-
-                    // Rate limit - extract reset time from headers and mark proxy
-                    if status == reqwest::StatusCode::FORBIDDEN
-                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                    {
-                        // Try to get X-RateLimit-Reset header
-                        if let Some(reset_header) = response.headers().get("x-ratelimit-reset") {
-                            if let Ok(reset_str) = reset_header.to_str() {
-                                if let Ok(reset_timestamp) = reset_str.parse::<u64>() {
-                                    pm.mark_rate_limited(&proxy, reset_timestamp);
-                                    if self.debug {
-                                        let now = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_secs();
-                                        let wait = if reset_timestamp > now { reset_timestamp - now } else { 0 };
-                                        eprintln!(
-                                            "\x1b[33m[proxy]\x1b[0m {} rate limited for {}s",
-                                            proxy, wait
-                                        );
-                                    }
-                                    continue;
-                                }
+                    // Use shared response checking logic
+                    match check_response(response, status).await {
+                        (ResponseCheck::Success, Some(resp)) => {
+                            pm.reset_failures(&proxy);
+                            return Ok((resp, Some(proxy)));
+                        }
+                        (ResponseCheck::Gone(msg), _) => {
+                            if self.debug {
+                                eprintln!("\x1b[33m[proxy]\x1b[0m {} returned gone: {}", proxy, msg);
                             }
+                            return Err(msg);
                         }
-                        // No reset header, use default 60s
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs();
-                        pm.mark_rate_limited(&proxy, now + 60);
-                        if self.debug {
-                            eprintln!("\x1b[33m[proxy]\x1b[0m {} rate limited (default 60s)", proxy);
+                        (ResponseCheck::RateLimited { reset_timestamp }, _) => {
+                            pm.mark_rate_limited(&proxy, reset_timestamp);
+                            if self.debug {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs();
+                                let wait = if reset_timestamp > now { reset_timestamp - now } else { 0 };
+                                eprintln!("\x1b[33m[proxy]\x1b[0m {} rate limited for {}s", proxy, wait);
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-
-                    // Resource is gone (451, 404, etc.) - don't retry with other proxies
-                    let status_str = status.to_string();
-                    if is_gone_error(&status_str) {
-                        if self.debug {
-                            eprintln!("\x1b[33m[proxy]\x1b[0m {} returned {}", proxy, status);
+                        (ResponseCheck::Retry, _) | (ResponseCheck::Success, None) => {
+                            if self.debug {
+                                eprintln!("\x1b[33m[proxy]\x1b[0m {} returned {}", proxy, status);
+                            }
+                            pm.record_failure(&proxy);
+                            continue;
                         }
-                        return Err(format!("{}", status));
                     }
-
-                    // Other HTTP errors (5xx, etc.) - record failure and try next proxy
-                    if self.debug {
-                        eprintln!("\x1b[33m[proxy]\x1b[0m {} returned {}", proxy, status);
-                    }
-                    pm.record_failure(&proxy);
-                    continue;
                 }
                 Err(e) => {
                     // Connection error, timeout, etc. - THIS is a real failure
