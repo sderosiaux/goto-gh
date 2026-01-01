@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::process::Command;
 
 use crate::db::{Database, RepoDetails};
 use crate::embedding::embed_query;
@@ -114,15 +115,85 @@ fn embed_query_auto(db: &Database, query: &str) -> Result<Vec<f32>> {
     }
 }
 
+/// Expand a seed query using Claude CLI for better semantic matching
+fn expand_seed(seed: &str) -> Result<String> {
+    let prompt = format!(
+        r#"Expand this seed query into 10-15 specific keywords for finding GitHub repos.
+
+Seed: "{}"
+
+Rules:
+- Output ONLY space-separated keywords (no intro, no explanation, no commas)
+- Include the ORIGINAL terms from the seed
+- Add specific library names, tool names, and technical terms
+- Add synonyms and related concepts that are DIRECTLY relevant
+- Stay focused on the exact domain - don't drift to adjacent topics
+- Prefer concrete terms (library names, algorithms) over abstract concepts
+
+Example input: "LLM orchestration"
+Example output: LLM orchestration langchain langgraph autogen crewai agent workflow chain prompt routing multi-agent
+
+Example input: "database query engine"
+Example output: database query engine SQL parser optimizer planner executor B-tree index storage engine OLAP OLTP
+
+Keywords:"#,
+        seed
+    );
+
+    // Try to find claude in common locations
+    let claude_paths = [
+        "claude",
+        "/usr/local/bin/claude",
+        &format!(
+            "{}/.nvm/versions/node/v22.20.0/bin/claude",
+            std::env::var("HOME").unwrap_or_default()
+        ),
+    ];
+
+    for claude_path in &claude_paths {
+        let result = Command::new(claude_path)
+            .args(["--dangerously-skip-permissions", "--model", "haiku", "-p", &prompt])
+            .output();
+
+        if let Ok(out) = result {
+            if out.status.success() {
+                let expanded = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !expanded.is_empty() {
+                    return Ok(expanded);
+                }
+            }
+        }
+    }
+
+    // Fallback: return original seed
+    Ok(seed.to_string())
+}
+
 /// Find interesting profiles using embedding similarity
 pub fn find_interesting_profiles(
     db: &Database,
     config: &ProfilesConfig,
 ) -> Result<Vec<ProfileResult>> {
-    let seeds: Vec<&str> = if config.seeds.is_empty() {
-        DEFAULT_SEEDS.to_vec()
+    // Collect seeds (use defaults if none provided)
+    let raw_seeds: Vec<String> = if config.seeds.is_empty() {
+        DEFAULT_SEEDS.iter().map(|s| s.to_string()).collect()
     } else {
-        config.seeds.iter().map(|s| s.as_str()).collect()
+        config.seeds.clone()
+    };
+
+    // Expand seeds if requested
+    let seeds: Vec<String> = if config.expand {
+        eprintln!("\x1b[36m..\x1b[0m Expanding {} seed queries with Claude...", raw_seeds.len());
+        raw_seeds
+            .iter()
+            .map(|s| {
+                let expanded = expand_seed(s).unwrap_or_else(|_| s.clone());
+                eprintln!("\x1b[32m✓\x1b[0m {} → {}", s, &expanded[..expanded.len().min(60)]);
+                expanded
+            })
+            .collect()
+    } else {
+        raw_seeds
     };
 
     eprintln!(
@@ -134,10 +205,21 @@ pub fn find_interesting_profiles(
     // Collect repos matched by each seed: owner -> [(repo_id, similarity, seed)]
     let mut owner_repos: HashMap<String, Vec<(i64, f32, String)>> = HashMap::new();
 
+    // Keep track of original seeds for display (before expansion)
+    let display_seeds: Vec<String> = if config.expand && !config.seeds.is_empty() {
+        config.seeds.clone()
+    } else if config.seeds.is_empty() {
+        DEFAULT_SEEDS.iter().map(|s| s.to_string()).collect()
+    } else {
+        config.seeds.clone()
+    };
+
     for (i, seed) in seeds.iter().enumerate() {
+        // Use original seed for display
+        let display_seed = &display_seeds[i];
         eprintln!(
             "\x1b[36m..\x1b[0m [{}/{}] {}",
-            i + 1, seeds.len(), &seed[..seed.len().min(40)]
+            i + 1, seeds.len(), &display_seed[..display_seed.len().min(40)]
         );
         // Embed the seed query (auto-detects OpenAI vs local)
         let embedding = embed_query_auto(db, seed)?;
@@ -154,10 +236,11 @@ pub fn find_interesting_profiles(
                     continue;
                 }
                 let similarity = (-distance).exp(); // Convert L2 distance to similarity
+                // Store display seed (original) for output, not expanded
                 owner_repos
                     .entry(owner)
                     .or_default()
-                    .push((repo_id, similarity, seed.to_string()));
+                    .push((repo_id, similarity, display_seed.clone()));
             }
         }
     }

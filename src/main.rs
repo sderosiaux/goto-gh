@@ -366,6 +366,10 @@ enum Commands {
         /// Custom seed query (can repeat)
         #[arg(long, short)]
         seed: Vec<String>,
+
+        /// Expand seed queries using Claude for better semantic matching
+        #[arg(long, short = 'x')]
+        expand: bool,
     },
 }
 
@@ -566,8 +570,8 @@ async fn run_main(cli: Cli, db: Database) -> Result<()> {
         Some(Commands::ClusterMap { output, sample, min_stars, language, perplexity, epochs }) => {
             run_cluster_map(&db, &output, sample, min_stars, language.as_deref(), perplexity, epochs)
         }
-        Some(Commands::Profiles { limit, min_repos, per_seed, seed }) => {
-            run_profiles(&db, limit, min_repos, per_seed, seed)
+        Some(Commands::Profiles { limit, min_repos, per_seed, seed, expand }) => {
+            run_profiles(&db, limit, min_repos, per_seed, seed, expand)
         }
         None => {
             use clap::CommandFactory;
@@ -1524,6 +1528,7 @@ fn run_profiles(
     min_repos: usize,
     per_seed: usize,
     seeds: Vec<String>,
+    expand: bool,
 ) -> Result<()> {
     use explore::{find_interesting_profiles, ProfilesConfig};
 
@@ -1532,7 +1537,7 @@ fn run_profiles(
         per_seed,
         min_repos,
         limit,
-        expand: false,
+        expand,
     };
 
     let profiles = find_interesting_profiles(db, &config)?;
