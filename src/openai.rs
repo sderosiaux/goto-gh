@@ -11,6 +11,10 @@ use tiktoken_rs::CoreBPE;
 /// OpenAI embedding dimension for text-embedding-3-small
 pub const OPENAI_EMBEDDING_DIM: usize = 1536;
 
+/// Short embedding dimension for Matryoshka two-stage search
+/// First 256 dims of text-embedding-3-small are a valid lower-dimensional embedding
+pub const OPENAI_EMBEDDING_DIM_SHORT: usize = 256;
+
 /// Maximum texts per batch (OpenAI limit is 2048)
 const MAX_BATCH_SIZE: usize = 2048;
 

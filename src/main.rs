@@ -371,6 +371,14 @@ enum Commands {
         #[arg(long, short = 'x')]
         expand: bool,
     },
+
+    /// Backfill short embeddings from existing full embeddings (Matryoshka two-stage search)
+    #[command(name = "backfill-short-embeddings")]
+    BackfillShortEmbeddings {
+        /// Batch size for processing (default: 10000)
+        #[arg(short, long, default_value = "10000")]
+        batch_size: usize,
+    },
 }
 
 #[tokio::main]
@@ -572,6 +580,9 @@ async fn run_main(cli: Cli, db: Database) -> Result<()> {
         }
         Some(Commands::Profiles { limit, min_repos, per_seed, seed, expand }) => {
             run_profiles(&db, limit, min_repos, per_seed, seed, expand)
+        }
+        Some(Commands::BackfillShortEmbeddings { batch_size }) => {
+            backfill_short_embeddings(&db, batch_size)
         }
         None => {
             use clap::CommandFactory;
@@ -1587,6 +1598,84 @@ fn run_profiles(
     println!(
         "\x1b[36mFound {} interesting profiles\x1b[0m",
         profiles.len()
+    );
+
+    Ok(())
+}
+
+/// Backfill short embeddings from existing full embeddings (Matryoshka two-stage search)
+/// Truncates 1536-dim embeddings to first 256 dims for fast coarse filtering
+fn backfill_short_embeddings(db: &Database, batch_size: usize) -> Result<()> {
+    use crate::openai::OPENAI_EMBEDDING_DIM_SHORT;
+
+    let total_missing = db.count_embeddings_missing_short()?;
+
+    if total_missing == 0 {
+        println!("\x1b[32m✓\x1b[0m All embeddings already have short versions");
+        return Ok(());
+    }
+
+    println!(
+        "\x1b[36m..\x1b[0m Backfilling {} short embeddings ({}→{} dims) in batches of {}",
+        total_missing,
+        1536,
+        OPENAI_EMBEDDING_DIM_SHORT,
+        batch_size
+    );
+
+    let start = std::time::Instant::now();
+    let mut processed = 0usize;
+
+    loop {
+        // Always fetch from offset 0 since we're inserting as we go (LEFT JOIN excludes already-done)
+        let batch = db.get_embeddings_missing_short(batch_size, 0)?;
+
+        if batch.is_empty() {
+            break;
+        }
+
+        for (repo_id, embedding_bytes) in &batch {
+            // Convert bytes to f32 slice
+            let full_embedding: &[f32] = unsafe {
+                std::slice::from_raw_parts(
+                    embedding_bytes.as_ptr() as *const f32,
+                    embedding_bytes.len() / 4,
+                )
+            };
+
+            // Truncate to short embedding (first 256 dims)
+            if full_embedding.len() >= OPENAI_EMBEDDING_DIM_SHORT {
+                let short_embedding = &full_embedding[..OPENAI_EMBEDDING_DIM_SHORT];
+                db.insert_short_embedding(*repo_id, short_embedding)?;
+            }
+        }
+
+        processed += batch.len();
+
+        // Progress update every batch
+        let elapsed = start.elapsed();
+        let rate = processed as f64 / elapsed.as_secs_f64();
+        let remaining = total_missing.saturating_sub(processed);
+        let eta_secs = if rate > 0.0 { remaining as f64 / rate } else { 0.0 };
+
+        eprint!(
+            "\r\x1b[36m..\x1b[0m Processed {}/{} ({:.1}%) - {:.0}/s - ETA: {:.0}s    ",
+            processed,
+            total_missing,
+            (processed as f64 / total_missing as f64) * 100.0,
+            rate,
+            eta_secs
+        );
+    }
+
+    eprintln!(); // Newline after progress
+
+    let elapsed = start.elapsed();
+    println!(
+        "\x1b[32m✓\x1b[0m Backfilled {} short embeddings in {:.1}s ({:.0}/s)",
+        processed,
+        elapsed.as_secs_f64(),
+        processed as f64 / elapsed.as_secs_f64()
     );
 
     Ok(())
