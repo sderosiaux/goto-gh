@@ -348,6 +348,25 @@ enum Commands {
         #[arg(long, default_value = "1000")]
         epochs: usize,
     },
+
+    /// Find interesting profiles using semantic search
+    Profiles {
+        /// Number of profiles to show
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+
+        /// Minimum interesting repos per profile
+        #[arg(long, default_value = "2")]
+        min_repos: usize,
+
+        /// Repos to fetch per seed query
+        #[arg(long, default_value = "100")]
+        per_seed: usize,
+
+        /// Custom seed query (can repeat)
+        #[arg(long, short)]
+        seed: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -546,6 +565,9 @@ async fn run_main(cli: Cli, db: Database) -> Result<()> {
         }
         Some(Commands::ClusterMap { output, sample, min_stars, language, perplexity, epochs }) => {
             run_cluster_map(&db, &output, sample, min_stars, language.as_deref(), perplexity, epochs)
+        }
+        Some(Commands::Profiles { limit, min_repos, per_seed, seed }) => {
+            run_profiles(&db, limit, min_repos, per_seed, seed)
         }
         None => {
             use clap::CommandFactory;
@@ -1493,5 +1515,75 @@ fn run_cluster_map(
     };
 
     generate_cluster_map(db, &config, output)
+}
+
+/// Find interesting developer/org profiles
+fn run_profiles(
+    db: &Database,
+    limit: usize,
+    min_repos: usize,
+    per_seed: usize,
+    seeds: Vec<String>,
+) -> Result<()> {
+    use explore::{find_interesting_profiles, ProfilesConfig};
+
+    let config = ProfilesConfig {
+        seeds,
+        per_seed,
+        min_repos,
+        limit,
+        expand: false,
+    };
+
+    let profiles = find_interesting_profiles(db, &config)?;
+
+    if profiles.is_empty() {
+        eprintln!("\x1b[33m!\x1b[0m No interesting profiles found");
+        eprintln!("    Try: --min-repos 1 or --per-seed 200");
+        return Ok(());
+    }
+
+    println!();
+    println!("\x1b[36mInteresting Profiles\x1b[0m\n");
+
+    for (i, profile) in profiles.iter().enumerate() {
+        // Header: rank, owner name, stars, repo count
+        let github_url = format!("https://github.com/{}", profile.owner);
+        let owner_link = format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", github_url, profile.owner);
+
+        println!(
+            "\x1b[33m{:>2}.\x1b[0m \x1b[1m{}\x1b[0m {} \x1b[90m({} interesting repos, avg sim: {:.2})\x1b[0m",
+            i + 1,
+            owner_link,
+            format_stars(profile.total_stars),
+            profile.interesting_count,
+            profile.avg_similarity
+        );
+
+        // Show top repos with their matched seed
+        for repo in profile.repos.iter().take(3) {
+            let name = repo.details.full_name.split('/').nth(1).unwrap_or(&repo.details.full_name);
+            let seed_short: String = repo.matched_seed.chars().take(30).collect();
+            println!(
+                "    \x1b[90m└\x1b[0m {} \x1b[33m{}★\x1b[0m \x1b[90m← {}\x1b[0m",
+                name,
+                repo.details.stars,
+                seed_short
+            );
+        }
+
+        if profile.repos.len() > 3 {
+            println!("    \x1b[90m  ...and {} more\x1b[0m", profile.repos.len() - 3);
+        }
+
+        println!();
+    }
+
+    println!(
+        "\x1b[36mFound {} interesting profiles\x1b[0m",
+        profiles.len()
+    );
+
+    Ok(())
 }
 

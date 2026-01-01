@@ -1,17 +1,20 @@
 //! Exploration features for discovering repos through semantic similarity.
 //!
-//! This module provides three main discovery mechanisms:
+//! This module provides four main discovery mechanisms:
 //! - **Random Walk**: Traverse the embedding space by hopping between similar repos
 //! - **Underrated Gems**: Find repos semantically similar to popular ones but with fewer stars
 //! - **Cross-Pollination**: Discover repos at the intersection of two different domains
+//! - **Interesting Profiles**: Find developers/orgs working on advanced/low-level tech
 
 mod random_walk;
 mod underrated;
 mod cross_pollinate;
+mod profiles;
 
 pub use random_walk::{random_walk, WalkConfig};
 pub use underrated::{find_underrated, UnderratedConfig};
 pub use cross_pollinate::{find_cross_pollination, CrossConfig};
+pub use profiles::{find_interesting_profiles, ProfilesConfig, ProfileResult, InterestingRepo};
 
 use crate::db::{Database, RepoDetails};
 use anyhow::Result;

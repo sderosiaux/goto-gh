@@ -80,6 +80,11 @@ impl Database {
         Ok(())
     }
 
+    /// Get a reference to the underlying connection (for exploration queries)
+    pub fn conn_ref(&self) -> &Connection {
+        &self.conn
+    }
+
     fn init(&self) -> Result<()> {
         self.conn.execute_batch(
             "
@@ -1797,6 +1802,197 @@ impl Database {
         Ok(result)
     }
 
+    /// Get aggregated statistics for owners with embedded repos
+    /// Used for profile exploration - finds interesting developers/orgs
+    /// Returns owners sorted by total stars, with min_repos filter
+    pub fn get_owner_stats(
+        &self,
+        min_repos: usize,
+        min_embedded: usize,
+        limit: usize,
+    ) -> Result<Vec<OwnerStats>> {
+        // First, get owners with enough embedded repos
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                owner,
+                COUNT(*) as repo_count,
+                SUM(stars) as total_stars,
+                AVG(stars) as avg_stars,
+                SUM(has_embedding) as embedded_count
+             FROM repos
+             WHERE gone = 0 AND owner IS NOT NULL AND owner != ''
+             GROUP BY owner
+             HAVING COUNT(*) >= ?1 AND SUM(has_embedding) >= ?2
+             ORDER BY SUM(stars) DESC
+             LIMIT ?3"
+        )?;
+
+        let owners: Vec<(String, u64, u64, f64, u64)> = stmt
+            .query_map(params![min_repos as i64, min_embedded as i64, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, i64>(4)? as u64,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Pre-prepare statements for efficiency (reused across all owners)
+        let mut lang_stmt = self.conn.prepare(
+            "SELECT language, COUNT(*) as cnt
+             FROM repos
+             WHERE owner = ?1 AND gone = 0 AND language IS NOT NULL
+             GROUP BY language
+             ORDER BY cnt DESC"
+        )?;
+
+        let mut topics_stmt = self.conn.prepare(
+            "SELECT topics FROM repos
+             WHERE owner = ?1 AND gone = 0 AND topics IS NOT NULL AND topics != '[]'"
+        )?;
+
+        let mut embedded_stmt = self.conn.prepare(
+            "SELECT id FROM repos
+             WHERE owner = ?1 AND gone = 0 AND has_embedding = 1
+             ORDER BY stars DESC
+             LIMIT 20"
+        )?;
+
+        let mut results = Vec::with_capacity(owners.len());
+
+        for (owner, repo_count, total_stars, avg_stars, embedded_count) in owners {
+            // Get language distribution for this owner
+            let languages: Vec<(String, u64)> = lang_stmt
+                .query_map([&owner], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            // Get all topics for this owner
+            let topics_json: Vec<String> = topics_stmt
+                .query_map([&owner], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let mut all_topics: Vec<String> = topics_json
+                .iter()
+                .filter_map(|t| serde_json::from_str::<Vec<String>>(t).ok())
+                .flatten()
+                .collect();
+            all_topics.sort();
+            all_topics.dedup();
+
+            // Get sample of embedded repo IDs (up to 20 for semantic analysis)
+            let embedded_repo_ids: Vec<i64> = embedded_stmt
+                .query_map([&owner], |row| row.get::<_, i64>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            results.push(OwnerStats {
+                owner,
+                repo_count,
+                total_stars,
+                avg_stars,
+                embedded_count,
+                languages,
+                topics: all_topics,
+                embedded_repo_ids,
+            });
+        }
+
+        Ok(results)
+    }
+
+    /// Get owner stats for a specific owner
+    pub fn get_owner_stats_by_name(&self, owner: &str) -> Result<Option<OwnerStats>> {
+        let owner_lower = owner.to_lowercase();
+
+        // Get basic stats
+        let basic: Option<(u64, u64, f64, u64)> = self.conn
+            .query_row(
+                "SELECT
+                    COUNT(*) as repo_count,
+                    SUM(stars) as total_stars,
+                    AVG(stars) as avg_stars,
+                    SUM(has_embedding) as embedded_count
+                 FROM repos
+                 WHERE owner = ?1 AND gone = 0",
+                [&owner_lower],
+                |row| Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1).unwrap_or(0) as u64,
+                    row.get::<_, f64>(2).unwrap_or(0.0),
+                    row.get::<_, i64>(3).unwrap_or(0) as u64,
+                ))
+            )
+            .optional()?;
+
+        let (repo_count, total_stars, avg_stars, embedded_count) = match basic {
+            Some(b) if b.0 > 0 => b,
+            _ => return Ok(None),
+        };
+
+        // Get languages
+        let languages: Vec<(String, u64)> = self.conn
+            .prepare(
+                "SELECT language, COUNT(*) as cnt
+                 FROM repos
+                 WHERE owner = ?1 AND gone = 0 AND language IS NOT NULL
+                 GROUP BY language
+                 ORDER BY cnt DESC"
+            )?
+            .query_map([&owner_lower], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Get topics
+        let topics_json: Vec<String> = self.conn
+            .prepare(
+                "SELECT topics FROM repos
+                 WHERE owner = ?1 AND gone = 0 AND topics IS NOT NULL AND topics != '[]'"
+            )?
+            .query_map([&owner_lower], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut all_topics: Vec<String> = topics_json
+            .iter()
+            .filter_map(|t| serde_json::from_str::<Vec<String>>(t).ok())
+            .flatten()
+            .collect();
+        all_topics.sort();
+        all_topics.dedup();
+
+        // Get embedded repo IDs
+        let embedded_repo_ids: Vec<i64> = self.conn
+            .prepare(
+                "SELECT id FROM repos
+                 WHERE owner = ?1 AND gone = 0 AND has_embedding = 1
+                 ORDER BY stars DESC
+                 LIMIT 20"
+            )?
+            .query_map([&owner_lower], |row| row.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(Some(OwnerStats {
+            owner: owner_lower,
+            repo_count,
+            total_stars,
+            avg_stars,
+            embedded_count,
+            languages,
+            topics: all_topics,
+            embedded_repo_ids,
+        }))
+    }
+
     /// Sample random repos with embeddings
     /// Returns (repo_id, full_name, stars)
     pub fn sample_embedded_repos(&self, count: usize) -> Result<Vec<(i64, String, i64)>> {
@@ -1890,6 +2086,22 @@ pub struct RepoDetails {
     pub stars: u64,
     pub language: Option<String>,
     pub topics: Vec<String>,
+}
+
+/// Owner statistics for profile exploration
+#[derive(Debug, Clone)]
+pub struct OwnerStats {
+    pub owner: String,
+    pub repo_count: u64,
+    pub total_stars: u64,
+    pub avg_stars: f64,
+    pub embedded_count: u64,
+    /// Languages used by this owner (language -> repo count)
+    pub languages: Vec<(String, u64)>,
+    /// All topics across repos
+    pub topics: Vec<String>,
+    /// Sample of repo IDs with embeddings (for semantic analysis)
+    pub embedded_repo_ids: Vec<i64>,
 }
 
 #[cfg(test)]
