@@ -8,6 +8,20 @@ use crate::config::Config;
 use crate::github::{DiscoveredRepo, GitHubRepo, RepoWithReadme};
 use crate::openai::{OPENAI_EMBEDDING_DIM, OPENAI_EMBEDDING_DIM_SHORT};
 
+/// Truncate embedding to target dimensions and renormalize.
+///
+/// Critical: When manually truncating Matryoshka embeddings (not using API params),
+/// the vector magnitude changes. Without renormalization, cosine similarity is wrong.
+fn truncate_and_normalize(embedding: &[f32], target_dims: usize) -> Vec<f32> {
+    let truncated = &embedding[..target_dims.min(embedding.len())];
+    let norm: f32 = truncated.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        truncated.iter().map(|x| x / norm).collect()
+    } else {
+        truncated.to_vec()
+    }
+}
+
 
 /// Stored repository with metadata
 #[derive(Debug, Clone)]
@@ -412,9 +426,9 @@ impl Database {
             params![repo_id, embedding.as_bytes()],
         )?;
 
-        // Store short embedding (first 256 dims) for fast coarse search
+        // Store short embedding (first 256 dims, renormalized) for fast coarse search
         if embedding.len() >= OPENAI_EMBEDDING_DIM_SHORT {
-            let short_embedding = &embedding[..OPENAI_EMBEDDING_DIM_SHORT];
+            let short_embedding = truncate_and_normalize(embedding, OPENAI_EMBEDDING_DIM_SHORT);
             self.conn.execute(
                 "DELETE FROM repo_embeddings_short WHERE repo_id = ?",
                 [repo_id],
@@ -527,12 +541,12 @@ impl Database {
     }
 
     /// Two-stage Matryoshka search: coarse filter with 256-dim, rerank with full 1536-dim
-    /// 6x faster than full scan on OpenAI embeddings
+    /// 5x faster than full scan on OpenAI embeddings
     pub fn find_similar_two_stage(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<(i64, f32)>> {
-        // Stage 1: Coarse filter using short embeddings (256-dim)
+        // Stage 1: Coarse filter using short embeddings (256-dim, renormalized)
         // Fetch more candidates than needed for reranking
         let coarse_limit = (limit * 20).min(2000); // 20x oversampling, max 2000
-        let short_query = &query_embedding[..OPENAI_EMBEDDING_DIM_SHORT];
+        let short_query = truncate_and_normalize(query_embedding, OPENAI_EMBEDDING_DIM_SHORT);
 
         let mut coarse_stmt = self.conn.prepare(
             "SELECT repo_id, distance
