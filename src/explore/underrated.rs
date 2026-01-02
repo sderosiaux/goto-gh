@@ -54,8 +54,6 @@ pub struct GemResult {
     pub repo: RepoDetails,
     /// Similarity to reference (0-1)
     pub similarity: f32,
-    /// Distance in embedding space
-    pub distance: f32,
     /// "Underrated score" = similarity / log(stars + 1)
     pub underrated_score: f32,
 }
@@ -108,7 +106,6 @@ pub fn find_underrated(db: &Database, config: &UnderratedConfig) -> Result<Vec<U
                 GemResult {
                     repo: c.repo,
                     similarity,
-                    distance: c.distance,
                     underrated_score,
                 }
             })

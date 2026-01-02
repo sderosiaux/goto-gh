@@ -45,10 +45,6 @@ pub struct CrossResult {
     pub sim_topic2: f32,
     /// Cross-pollination score (higher = better balance between both topics)
     pub cross_score: f32,
-    /// Distance to topic1 embedding
-    pub dist_topic1: f32,
-    /// Distance to topic2 embedding
-    pub dist_topic2: f32,
 }
 
 /// Find repos at the intersection of two topics
@@ -92,8 +88,6 @@ pub fn find_cross_pollination(db: &Database, config: &CrossConfig) -> Result<Vec
                     sim_topic1: sim1,
                     sim_topic2: sim2,
                     cross_score,
-                    dist_topic1: dist1,
-                    dist_topic2: dist2,
                 });
             }
         }

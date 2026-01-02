@@ -14,7 +14,7 @@ mod profiles;
 pub use random_walk::{random_walk, WalkConfig};
 pub use underrated::{find_underrated, UnderratedConfig};
 pub use cross_pollinate::{find_cross_pollination, CrossConfig};
-pub use profiles::{find_interesting_profiles, ProfilesConfig, ProfileResult, InterestingRepo};
+pub use profiles::{find_interesting_profiles, ProfilesConfig};
 
 use crate::db::{Database, RepoDetails};
 use anyhow::Result;

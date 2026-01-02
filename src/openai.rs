@@ -151,10 +151,28 @@ impl OpenAIClient {
 
     /// Send a single batch to OpenAI (assumes it fits within limits)
     /// Retries on transient errors (502, 503, 504, 429) with exponential backoff
+    /// On context length errors, retries with aggressive character truncation
     async fn embed_single_batch(&self, texts: &[String]) -> Result<(Vec<Vec<f32>>, u32)> {
+        // Start with no char limit (None = use original texts)
+        self.embed_single_batch_inner(texts, None).await
+    }
+
+    /// Inner implementation that can retry with progressively smaller char limits
+    fn embed_single_batch_inner<'a>(
+        &'a self,
+        texts: &'a [String],
+        char_limit: Option<usize>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Vec<Vec<f32>>, u32)>> + Send + 'a>> {
+        Box::pin(async move {
+        // Apply char limit if set
+        let texts_to_send: Vec<String> = match char_limit {
+            Some(limit) => texts.iter().map(|t| t.chars().take(limit).collect()).collect(),
+            None => texts.to_vec(),
+        };
+
         let request = EmbeddingRequest {
             model: "text-embedding-3-small",
-            input: texts,
+            input: &texts_to_send,
         };
 
         // Retry with exponential backoff for transient errors
@@ -204,10 +222,18 @@ impl OpenAIClient {
                 // Log in same style as discover: [timestamp] URL ... timing
                 if self.debug {
                     let now = chrono::Local::now().format("%H:%M:%S%.3f");
-                    let retry_info = if attempt > 0 { format!(" (retry {})", attempt) } else { String::new() };
+                    let retry_info = if attempt > 0 {
+                        format!(" (retry {})", attempt)
+                    } else {
+                        String::new()
+                    };
+                    let trunc_info = match char_limit {
+                        Some(limit) => format!(" [truncated to {}]", limit),
+                        None => String::new(),
+                    };
                     eprintln!(
-                        "\x1b[90m[{}] POST https://api.openai.com/v1/embeddings ({} repos) ... {}ms{}\x1b[0m",
-                        now, texts.len(), elapsed.as_millis(), retry_info
+                        "\x1b[90m[{}] POST https://api.openai.com/v1/embeddings ({} repos) ... {}ms{}{}\x1b[0m",
+                        now, texts.len(), elapsed.as_millis(), retry_info, trunc_info
                     );
                 }
 
@@ -215,6 +241,28 @@ impl OpenAIClient {
             }
 
             let body = response.text().await.unwrap_or_default();
+
+            // Check for context length error - retry with halved char limit
+            if status == reqwest::StatusCode::BAD_REQUEST
+                && body.contains("maximum context length")
+            {
+                // Calculate next limit: start at 16k, then halve each time
+                // Stop at 1k chars minimum (can't meaningfully embed less)
+                let max_len = texts.iter().map(|t| t.chars().count()).max().unwrap_or(0);
+                let next_limit = match char_limit {
+                    None => max_len / 2,           // First truncation: halve current size
+                    Some(l) => l / 2,              // Subsequent: halve again
+                };
+
+                if next_limit >= 1000 {
+                    eprintln!(
+                        "\x1b[33m[embed]\x1b[0m Context length exceeded, retrying with {} chars...",
+                        next_limit
+                    );
+                    return self.embed_single_batch_inner(texts, Some(next_limit)).await;
+                }
+                // If we've gone below 1k chars, give up
+            }
 
             // Retry on transient errors
             let is_transient = status == reqwest::StatusCode::BAD_GATEWAY
@@ -235,6 +283,7 @@ impl OpenAIClient {
             max_retries,
             last_error.unwrap_or_else(|| "unknown error".to_string())
         ))
+        })
     }
 
 }
